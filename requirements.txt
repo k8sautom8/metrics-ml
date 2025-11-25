@@ -1,0 +1,6 @@
+requests
+pandas
+matplotlib
+prophet
+scikit-learn
+statsmodels
