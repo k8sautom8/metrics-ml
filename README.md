@@ -1,6 +1,6 @@
-# Metrics AI - Kubernetes Infrastructure Forecasting & Anomaly Detection
+# Metrics AI - Infrastructure Resource Forecasting & Anomaly Detection
 
-A comprehensive AI-powered forecasting and anomaly detection system for Kubernetes infrastructure, providing real-time predictions for CPU, Memory, Disk, I/O, and Network metrics using ensemble models (Prophet, ARIMA, LSTM).
+A comprehensive ML-powered forecasting and anomaly detection system for Kubernetes infrastructure, providing real-time predictions for CPU, Memory, Disk, I/O, and Network metrics using ensemble models (Prophet, ARIMA, LSTM).
 
 ## Features
 
@@ -17,30 +17,30 @@ A comprehensive AI-powered forecasting and anomaly detection system for Kubernet
 
 ```mermaid
 flowchart LR
-    subgraph Metrics Plane
-        P[Prometheus / VictoriaMetrics]
+    subgraph Metrics["Metrics Plane"]
+        P["Prometheus/VictoriaMetrics"]
     end
 
-    subgraph Forecast Engine
-        F[metrics.py]
-        C[(Model Artifacts)]
-        M[(Manifests & Plots)]
+    subgraph Forecast["Forecast Engine"]
+        F["metrics.py"]
+        C[("Model Artifacts")]
+        M[("Manifests & Plots")]
     end
 
-    subgraph Alerting Plane
-        W[Webhook Endpoint(s)]
-        G[Prometheus Pushgateway]
+    subgraph Alerting["Alerting Plane"]
+        W["Webhook Endpoints"]
+        G["Prometheus Pushgateway"]
     end
 
-    P -->|Query API| F
-    F -->|Minimal Updates| C
-    F -->|Forecast + Crisis Data| M
-    F -->|JSON Alerts| W
-    F -->|metrics_ai_* gauges| G
+    P -->|"Query API"| F
+    F -->|"Minimal Updates"| C
+    F -->|"Forecast + Crisis Data"| M
+    F -->|"JSON Alerts"| W
+    F -->|"metrics_ai_* gauges"| G
 
-    subgraph Ops Consumers
-        S[SRE Dashboards / Alertmanager]
-        O[Ops SME / Technical Architects]
+    subgraph Ops["Ops Consumers"]
+        S["SRE Dashboards/Alertmanager"]
+        O["Ops SME/Technical Architects"]
     end
 
     G --> S
