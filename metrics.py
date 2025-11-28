@@ -2012,23 +2012,47 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                         # Update forecast with minimal update
                         over = forecast[forecast['yhat'] >= threshold_pct/100]
                         if not over.empty:
-                            updated_prophet_days = (over.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400
+                            updated_prophet_days_calc = (over.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400
+                            # If already exceeded (negative or very close to 0), set to 0
+                            if updated_prophet_days_calc <= 0:
+                                updated_prophet_days = 0.0
+                            else:
+                                updated_prophet_days = updated_prophet_days_calc
+                        else:
+                            # No forecast point exceeds threshold, keep existing value
+                            updated_prophet_days = cached_record.get('days_to_90pct', 9999.0)
                         # Update linear forecast too
                         daily_increase = train_ts.diff().resample('1D').mean().mean()
-                        if daily_increase > 0.0001:
-                            current_pct = ts.iloc[-1] * 100
-                            updated_linear_days = (threshold_pct - current_pct) / (daily_increase * 100)
-                            updated_linear_days = max(0.1, updated_linear_days)
+                        current_pct = ts.iloc[-1] * 100
+                        
+                        # Check if already exceeded threshold
+                        if current_pct >= threshold_pct:
+                            updated_linear_days = 0.0
+                            updated_prophet_days = 0.0
+                            updated_hybrid_days = 0.0
                         else:
-                            updated_linear_days = 9999.0
-                        # Update hybrid forecast (min of linear and prophet)
-                        updated_hybrid_days = min(updated_linear_days, updated_prophet_days)
+                            if daily_increase > 0.0001:
+                                updated_linear_days = (threshold_pct - current_pct) / (daily_increase * 100)
+                                updated_linear_days = max(0.1, updated_linear_days)
+                            else:
+                                updated_linear_days = 9999.0
+                            # Update hybrid forecast (min of linear and prophet)
+                            updated_hybrid_days = min(updated_linear_days, updated_prophet_days)
+                            
+                            # Ensure prophet_days is not negative
+                            if updated_prophet_days < 0:
+                                updated_prophet_days = 0.0
+                                updated_hybrid_days = min(updated_linear_days, 0.0)
                         # Update cached record with fresh forecast
                         cached_record['days_to_90pct'] = round(updated_hybrid_days, 1)
                         cached_record['ensemble_eta'] = round(updated_hybrid_days, 1)
                         cached_record['linear_eta'] = round(updated_linear_days, 1)
                         cached_record['prophet_eta'] = round(updated_prophet_days, 1)
-                        cached_record['alert'] = "CRITICAL" if updated_hybrid_days < 3 else "WARNING" if updated_hybrid_days < 7 else "SOON" if updated_hybrid_days < 30 else "OK"
+                        # Set alert severity - if already exceeded (0 days), mark as CRITICAL
+                        if updated_hybrid_days <= 0:
+                            cached_record['alert'] = "CRITICAL"
+                        else:
+                            cached_record['alert'] = "CRITICAL" if updated_hybrid_days < 3 else "WARNING" if updated_hybrid_days < 7 else "SOON" if updated_hybrid_days < 30 else "OK"
                         manifest[key] = cached_record
                         manifest_changed = True
                         log_verbose(f"  → Disk forecast updated with minimal update: {node} | {mountpoint} → {updated_hybrid_days:.1f} days")
@@ -2105,13 +2129,26 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
             
         current_pct = ts.iloc[-1] * 100
         
-        # Linear ETA (fast & reliable)
-        daily_increase = train_ts.diff().resample('1D').mean().mean()
-        if daily_increase > 0.0001:  # 0.01% per day
-            linear_days = (threshold_pct - current_pct) / (daily_increase * 100)
-            linear_days = max(0.1, linear_days)
+        # Check if already exceeded threshold
+        if current_pct >= threshold_pct:
+            # Already exceeded - set to 0 days
+            linear_days = 0.0
+            prophet_days = 0.0
+            hybrid_days = 0.0
+            severity = "CRITICAL"
+            # Skip Prophet calculation since already exceeded
+            prophet_model = None
+            prophet_forecast_df = None
+            prophet_mae = None
+            prophet_pred = None
         else:
-            linear_days = 9999.0
+            # Linear ETA (fast & reliable)
+            daily_increase = train_ts.diff().resample('1D').mean().mean()
+            if daily_increase > 0.0001:  # 0.01% per day
+                linear_days = (threshold_pct - current_pct) / (daily_increase * 100)
+                linear_days = max(0.1, linear_days)
+            else:
+                linear_days = 9999.0
         
         # Compute linear MAE on test set (only when retraining)
         linear_pred = None
@@ -2122,55 +2159,61 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
             linear_mae = mean_absolute_error(test_ts.values, linear_pred.values)
             all_mae_linear.append(linear_mae)
 
-        # Prophet ETA (seasonal correction)
-        pdf = train_ts.reset_index()
-        pdf.columns = ['ds', 'y']
-        pdf['y'] = pdf['y'].clip(upper=0.99)
-        
-        prophet_days = 9999.0
-        prophet_mae = None
-        prophet_pred = None
-        prophet_model = None
-        prophet_forecast_df = None
-        try:
-            # For retraining: use minimal update (recent data) if not first-time training
-            # For first-time training: use all data to learn patterns
-            if needs_retrain and key in manifest:
-                # Minimal update: use recent data (last 7 days) to incorporate latest trends
-                fit_pdf = pdf.tail(min(len(pdf), 7*24*6))  # Last 7 days
-                log_verbose(f"  → Disk model minimal update (recent 7 days): {node} | {mountpoint}")
-            else:
-                # First-time training: use all data to learn patterns
-                fit_pdf = pdf
-            # Add node and mountpoint metadata to CSV
-            if dump_csv_dir:
-                fit_pdf_for_csv = fit_pdf.copy()
-                fit_pdf_for_csv['node'] = node
-                fit_pdf_for_csv['mountpoint'] = mountpoint
-                dump_dataframe_to_csv(fit_pdf_for_csv, dump_csv_dir, dump_label)
-            else:
-                dump_dataframe_to_csv(fit_pdf.copy(), dump_csv_dir, dump_label)
-            m = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=False)
-            m.fit(fit_pdf)
-            prophet_model = m  # Store for plotting
+        # Prophet ETA (seasonal correction) - only if not already exceeded
+        if current_pct < threshold_pct:
+            pdf = train_ts.reset_index()
+            pdf.columns = ['ds', 'y']
+            pdf['y'] = pdf['y'].clip(upper=0.99)
             
-            # Compute Prophet MAE on test set (only when retraining)
-            if needs_retrain and len(test_ts) > 0:
-                test_df = test_ts.reset_index()
-                test_df.columns = ['ds', 'y']
-                test_forecast = m.predict(test_df[['ds']])
-                prophet_pred = test_forecast['yhat'].values
-                prophet_mae = mean_absolute_error(test_df['y'].values, prophet_pred)
-                all_mae_prophet.append(prophet_mae)
-            
-            future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
-            forecast = m.predict(future)
-            prophet_forecast_df = forecast  # Store for plotting
-            over = forecast[forecast['yhat'] >= threshold_pct/100]
-            if not over.empty:
-                prophet_days = (over.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400
-        except:
-            prophet_days = linear_days
+            prophet_days = 9999.0
+            prophet_mae = None
+            prophet_pred = None
+            prophet_model = None
+            prophet_forecast_df = None
+            try:
+                # For retraining: use minimal update (recent data) if not first-time training
+                # For first-time training: use all data to learn patterns
+                if needs_retrain and key in manifest:
+                    # Minimal update: use recent data (last 7 days) to incorporate latest trends
+                    fit_pdf = pdf.tail(min(len(pdf), 7*24*6))  # Last 7 days
+                    log_verbose(f"  → Disk model minimal update (recent 7 days): {node} | {mountpoint}")
+                else:
+                    # First-time training: use all data to learn patterns
+                    fit_pdf = pdf
+                # Add node and mountpoint metadata to CSV
+                if dump_csv_dir:
+                    fit_pdf_for_csv = fit_pdf.copy()
+                    fit_pdf_for_csv['node'] = node
+                    fit_pdf_for_csv['mountpoint'] = mountpoint
+                    dump_dataframe_to_csv(fit_pdf_for_csv, dump_csv_dir, dump_label)
+                else:
+                    dump_dataframe_to_csv(fit_pdf.copy(), dump_csv_dir, dump_label)
+                m = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=False)
+                m.fit(fit_pdf)
+                prophet_model = m  # Store for plotting
+                
+                # Compute Prophet MAE on test set (only when retraining)
+                if needs_retrain and len(test_ts) > 0:
+                    test_df = test_ts.reset_index()
+                    test_df.columns = ['ds', 'y']
+                    test_forecast = m.predict(test_df[['ds']])
+                    prophet_pred = test_forecast['yhat'].values
+                    prophet_mae = mean_absolute_error(test_df['y'].values, prophet_pred)
+                    all_mae_prophet.append(prophet_mae)
+                
+                future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
+                forecast = m.predict(future)
+                prophet_forecast_df = forecast  # Store for plotting
+                over = forecast[forecast['yhat'] >= threshold_pct/100]
+                if not over.empty:
+                    prophet_days_calc = (over.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400
+                    # If already exceeded (negative or very close to 0), set to 0
+                    if prophet_days_calc <= 0:
+                        prophet_days = 0.0
+                    else:
+                        prophet_days = prophet_days_calc
+            except:
+                prophet_days = linear_days
 
         # Compute ensemble MAE (min of linear and prophet) - only when retraining
         if needs_retrain:
@@ -2185,8 +2228,10 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                 # Fallback to linear if prophet not available
                 all_mae_ensemble.append(linear_mae)
 
-        hybrid_days = min(linear_days, prophet_days)
-        severity = "CRITICAL" if hybrid_days < 3 else "WARNING" if hybrid_days < 7 else "SOON" if hybrid_days < 30 else "OK"
+        # Only calculate hybrid_days if not already exceeded
+        if current_pct < threshold_pct:
+            hybrid_days = min(linear_days, prophet_days)
+            severity = "CRITICAL" if hybrid_days < 3 else "WARNING" if hybrid_days < 7 else "SOON" if hybrid_days < 30 else "OK"
 
         if should_verbose():
             logger.info("Disk forecast done → node=%s mount=%s", node, mountpoint)
@@ -2463,11 +2508,21 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
         # CRITICAL FIX: align to actual test timestamps (10m data has gaps!)
         prophet_full = mb.predict(fut_b).set_index('ds')
         p_back = prophet_full.reindex(test_ts.index, method='nearest')['yhat']
+        # Ensure p_back is numeric and has no NaN/inf
+        p_back = pd.to_numeric(p_back, errors='coerce').replace([np.inf, -np.inf], np.nan)
 
         # ARIMA — use original timestamps
         train_ts = train.set_index('ds')['y']
-        a_model = ARIMA(train_ts, order=(2,1,0)).fit()
-        a_pred = pd.Series(a_model.forecast(steps=len(test_ts)), index=test_ts.index)
+        try:
+            a_model = ARIMA(train_ts, order=(2,1,0)).fit()
+            a_pred = pd.Series(a_model.forecast(steps=len(test_ts)), index=test_ts.index)
+            # Ensure a_pred is numeric and has no NaN/inf
+            a_pred = pd.to_numeric(a_pred, errors='coerce').replace([np.inf, -np.inf], np.nan)
+        except Exception as e:
+            log_verbose(f"ARIMA backtest failed: {e}")
+            # Fallback: use mean of test_ts or 0
+            fallback_value = test_ts.mean() if not test_ts.empty and not test_ts.isna().all() else 0.0
+            a_pred = pd.Series([fallback_value] * len(test_ts), index=test_ts.index)
 
         # LSTM backtest
         l_back = a_pred.copy()  # fallback
@@ -2494,55 +2549,98 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
                     last_seq = scaled_b[-LSTM_SEQ_LEN:].reshape(1, LSTM_SEQ_LEN, 1)
                     l_pred = model_b.predict(last_seq, verbose=0)
                     l_back = pd.Series(scaler_b.inverse_transform(l_pred)[0], index=test_ts.index)
+                    # Ensure l_back is numeric and has no NaN/inf
+                    l_back = pd.to_numeric(l_back, errors='coerce').replace([np.inf, -np.inf], np.nan)
             except Exception as e:
                 print(f"LSTM backtest failed: {e}")
                 l_back = a_pred.copy()
+                # Ensure l_back is numeric
+                l_back = pd.to_numeric(l_back, errors='coerce').replace([np.inf, -np.inf], np.nan)
 
         # Ensemble - handle NaN values gracefully
-        # Fill NaN values in predictions with the mean of test data (or 0 if test is empty)
+        # First, ensure all predictions are Series with proper index alignment
+        # Convert to numeric and replace inf with NaN, then fill NaN
         test_mean = test_ts.mean() if not test_ts.empty and not test_ts.isna().all() else 0.0
-        p_back_clean = p_back.fillna(test_mean)
-        a_pred_clean = a_pred.fillna(test_mean)
-        l_back_clean = l_back.fillna(test_mean)
+        if pd.isna(test_mean) or np.isinf(test_mean):
+            test_mean = 0.0
         
+        # Clean predictions: replace inf, fill NaN, ensure numeric
+        p_back_clean = pd.to_numeric(p_back, errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(test_mean)
+        a_pred_clean = pd.to_numeric(a_pred, errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(test_mean)
+        l_back_clean = pd.to_numeric(l_back, errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(test_mean)
+        
+        # Ensure all have same index as test_ts
+        p_back_clean = p_back_clean.reindex(test_ts.index, fill_value=test_mean)
+        a_pred_clean = a_pred_clean.reindex(test_ts.index, fill_value=test_mean)
+        l_back_clean = l_back_clean.reindex(test_ts.index, fill_value=test_mean)
+        
+        # Calculate ensemble (ensure no NaN or inf in result)
         ens_pred = (p_back_clean + a_pred_clean + l_back_clean) / 3
+        ens_pred = pd.to_numeric(ens_pred, errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(test_mean)
         
-        # Calculate metrics with NaN handling
-        # Align all series and drop rows where either test or prediction has NaN
-        aligned_df = pd.DataFrame({
-            'test': test_ts,
-            'ensemble': ens_pred,
-            'prophet': p_back_clean,
-            'arima': a_pred_clean,
-            'lstm': l_back_clean
-        }).dropna()
+        # Clean test_ts as well
+        test_ts_clean = pd.to_numeric(test_ts, errors='coerce').replace([np.inf, -np.inf], np.nan)
         
-        if len(aligned_df) > 0:
-            try:
-                mae_ens = mean_absolute_error(aligned_df['test'], aligned_df['ensemble'])
-            except (ValueError, Exception) as e:
-                log_verbose(f"Warning: Failed to calculate ensemble MAE: {e}")
+        # Align all series and drop rows where test has NaN (but keep predictions)
+        valid_mask = ~test_ts_clean.isna()
+        if valid_mask.sum() > 0:
+            test_valid = test_ts_clean[valid_mask]
+            ens_valid = ens_pred[valid_mask]
+            p_back_valid = p_back_clean[valid_mask]
+            a_pred_valid = a_pred_clean[valid_mask]
+            l_back_valid = l_back_clean[valid_mask]
+            
+            # Final check: ensure no NaN or inf in any array before calling mean_absolute_error
+            if (not ens_valid.isna().any() and not np.isinf(ens_valid).any() and 
+                not test_valid.isna().any() and not np.isinf(test_valid).any() and
+                len(ens_valid) == len(test_valid) and len(ens_valid) > 0):
+                try:
+                    mae_ens = mean_absolute_error(test_valid, ens_valid)
+                    if pd.isna(mae_ens) or np.isinf(mae_ens):
+                        mae_ens = np.nan
+                except (ValueError, Exception) as e:
+                    log_verbose(f"Warning: Failed to calculate ensemble MAE: {e}")
+                    mae_ens = np.nan
+            else:
                 mae_ens = np.nan
             
-            try:
-                mae_prophet = mean_absolute_error(aligned_df['test'], aligned_df['prophet'])
-            except (ValueError, Exception) as e:
-                log_verbose(f"Warning: Failed to calculate Prophet MAE: {e}")
+            if (not p_back_valid.isna().any() and not np.isinf(p_back_valid).any() and
+                len(p_back_valid) == len(test_valid) and len(p_back_valid) > 0):
+                try:
+                    mae_prophet = mean_absolute_error(test_valid, p_back_valid)
+                    if pd.isna(mae_prophet) or np.isinf(mae_prophet):
+                        mae_prophet = np.nan
+                except (ValueError, Exception) as e:
+                    log_verbose(f"Warning: Failed to calculate Prophet MAE: {e}")
+                    mae_prophet = np.nan
+            else:
                 mae_prophet = np.nan
                 
-            try:
-                mae_arima = mean_absolute_error(aligned_df['test'], aligned_df['arima'])
-            except (ValueError, Exception) as e:
-                log_verbose(f"Warning: Failed to calculate ARIMA MAE: {e}")
+            if (not a_pred_valid.isna().any() and not np.isinf(a_pred_valid).any() and
+                len(a_pred_valid) == len(test_valid) and len(a_pred_valid) > 0):
+                try:
+                    mae_arima = mean_absolute_error(test_valid, a_pred_valid)
+                    if pd.isna(mae_arima) or np.isinf(mae_arima):
+                        mae_arima = np.nan
+                except (ValueError, Exception) as e:
+                    log_verbose(f"Warning: Failed to calculate ARIMA MAE: {e}")
+                    mae_arima = np.nan
+            else:
                 mae_arima = np.nan
                 
-            try:
-                mae_lstm = mean_absolute_error(aligned_df['test'], aligned_df['lstm'])
-            except (ValueError, Exception) as e:
-                log_verbose(f"Warning: Failed to calculate LSTM MAE: {e}")
+            if (not l_back_valid.isna().any() and not np.isinf(l_back_valid).any() and
+                len(l_back_valid) == len(test_valid) and len(l_back_valid) > 0):
+                try:
+                    mae_lstm = mean_absolute_error(test_valid, l_back_valid)
+                    if pd.isna(mae_lstm) or np.isinf(mae_lstm):
+                        mae_lstm = np.nan
+                except (ValueError, Exception) as e:
+                    log_verbose(f"Warning: Failed to calculate LSTM MAE: {e}")
+                    mae_lstm = np.nan
+            else:
                 mae_lstm = np.nan
         else:
-            # No valid data after alignment
+            # No valid test data
             mae_ens = np.nan
             mae_prophet = np.nan
             mae_arima = np.nan
