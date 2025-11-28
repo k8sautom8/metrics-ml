@@ -2498,12 +2498,55 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
                 print(f"LSTM backtest failed: {e}")
                 l_back = a_pred.copy()
 
-        # Ensemble
-        ens_pred = (p_back + a_pred + l_back) / 3
-        mae_ens = mean_absolute_error(test_ts, ens_pred)
-        mae_prophet = mean_absolute_error(test_ts, p_back)
-        mae_arima = mean_absolute_error(test_ts, a_pred)
-        mae_lstm = mean_absolute_error(test_ts, l_back)
+        # Ensemble - handle NaN values gracefully
+        # Fill NaN values in predictions with the mean of test data (or 0 if test is empty)
+        test_mean = test_ts.mean() if not test_ts.empty and not test_ts.isna().all() else 0.0
+        p_back_clean = p_back.fillna(test_mean)
+        a_pred_clean = a_pred.fillna(test_mean)
+        l_back_clean = l_back.fillna(test_mean)
+        
+        ens_pred = (p_back_clean + a_pred_clean + l_back_clean) / 3
+        
+        # Calculate metrics with NaN handling
+        # Align all series and drop rows where either test or prediction has NaN
+        aligned_df = pd.DataFrame({
+            'test': test_ts,
+            'ensemble': ens_pred,
+            'prophet': p_back_clean,
+            'arima': a_pred_clean,
+            'lstm': l_back_clean
+        }).dropna()
+        
+        if len(aligned_df) > 0:
+            try:
+                mae_ens = mean_absolute_error(aligned_df['test'], aligned_df['ensemble'])
+            except (ValueError, Exception) as e:
+                log_verbose(f"Warning: Failed to calculate ensemble MAE: {e}")
+                mae_ens = np.nan
+            
+            try:
+                mae_prophet = mean_absolute_error(aligned_df['test'], aligned_df['prophet'])
+            except (ValueError, Exception) as e:
+                log_verbose(f"Warning: Failed to calculate Prophet MAE: {e}")
+                mae_prophet = np.nan
+                
+            try:
+                mae_arima = mean_absolute_error(aligned_df['test'], aligned_df['arima'])
+            except (ValueError, Exception) as e:
+                log_verbose(f"Warning: Failed to calculate ARIMA MAE: {e}")
+                mae_arima = np.nan
+                
+            try:
+                mae_lstm = mean_absolute_error(aligned_df['test'], aligned_df['lstm'])
+            except (ValueError, Exception) as e:
+                log_verbose(f"Warning: Failed to calculate LSTM MAE: {e}")
+                mae_lstm = np.nan
+        else:
+            # No valid data after alignment
+            mae_ens = np.nan
+            mae_prophet = np.nan
+            mae_arima = np.nan
+            mae_lstm = np.nan
 
         metrics = {
             'mae_ensemble': mae_ens,
