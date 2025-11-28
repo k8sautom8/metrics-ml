@@ -166,6 +166,12 @@ python3 metrics.py --forecast \
   --interval 15 \
   --alert-webhook https://hooks.slack.com/services/... \
   --pushgateway http://pushgateway.monitoring:9091
+
+# Skip plot generation for faster execution
+python3 metrics.py --forecast --interval 15
+
+# Generate plots (slower but includes visualizations)
+python3 metrics.py --forecast --interval 15 --plot
 ```
 
 **Command-Line Options:**
@@ -173,6 +179,7 @@ python3 metrics.py --forecast \
 - `--interval <seconds>`: Run continuously with specified interval (default: 15). Set to `0` for single run.
 - `--alert-webhook <URL>`: HTTP webhook URL for alert delivery (Slack, Teams, PagerDuty, etc.)
 - `--pushgateway <URL>`: Prometheus Pushgateway URL for metrics export
+- `--plot`: Generate and save plot files (PNG images). If not specified, plots are skipped to save time.
 - `--plot-history-hours <hours>`: Override plot history window (default: 168 = 7 days)
 - `--plot-forecast-hours <hours>`: Override plot forecast window (default: 168 = 7 days)
 - `-v, --verbose`: Increase verbosity (repeatable: `-vv`, `-vvv`)
@@ -181,12 +188,14 @@ python3 metrics.py --forecast \
 
 **Output:**
 - Updates models with latest data (minimal updates)
-- Generates forecast plots for all metrics
+- Generates forecast plots for all metrics (only when `--plot` flag is provided)
 - Displays predictions and anomalies in tabular format
 - Saves updated models to disk
 - Dispatches alerts via webhook/Pushgateway when actionable issues detected
 - **No backtest plots or metrics** (optimized for speed)
 - Runs continuously every `--interval` seconds when `--interval > 0`
+
+**Note:** Plot generation can be time-consuming. Use `--plot` only when you need visualizations. For production monitoring focused on alerts, omit `--plot` for faster execution.
 
 **Use Case:** 
 - **Single run**: Use `--interval 0` for one-time forecasts or testing

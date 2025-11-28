@@ -1,0 +1,142 @@
+# SLI/SLO Configuration for Metrics AI
+# Service Level Indicators (SLIs) and Service Level Objectives (SLOs)
+# Based on Google SRE best practices
+
+# Global settings
+settings:
+  # Time window for SLO evaluation (days)
+  evaluation_window_days: 30
+  # Error budget alert threshold (percentage remaining)
+  error_budget_alert_threshold: 20  # Alert when < 20% budget remaining
+  # SLI calculation window (minutes)
+  sli_calculation_window_minutes: 5
+
+# SLI Definitions
+slis:
+  # Disk Availability SLI
+  - name: disk_availability
+    description: "Percentage of disks with usage < 90% across all nodes"
+    type: "availability"
+    query_type: "internal"  # Calculated from disk_alerts
+    aggregation: "mean"
+    good_threshold: 0.90  # 90% of disks must be < 90% full
+    slo_target: 99.9
+    error_budget_percent: 0.1
+    alert_severity: "P1"
+
+  # Host CPU Performance SLI
+  - name: host_cpu_performance
+    description: "Percentage of nodes with host CPU utilization < 80%"
+    type: "latency"
+    query_type: "internal"  # Calculated from host CPU data
+    aggregation: "mean"
+    good_threshold: 0.80  # 80% of nodes must have CPU < 80%
+    slo_target: 99.5
+    error_budget_percent: 0.5
+    alert_severity: "P1"
+
+  # Host Memory Performance SLI
+  - name: host_memory_performance
+    description: "Percentage of nodes with host memory utilization < 85%"
+    type: "availability"
+    query_type: "internal"  # Calculated from host memory data
+    aggregation: "mean"
+    good_threshold: 0.85  # 85% of nodes must have memory < 85%
+    slo_target: 99.5
+    error_budget_percent: 0.5
+    alert_severity: "P1"
+
+  # I/O Performance SLI (from crisis/anomaly detection)
+  - name: io_performance
+    description: "Percentage of nodes without I/O crisis or anomalies"
+    type: "latency"
+    query_type: "internal"  # Calculated from I/O crisis/anomaly data
+    aggregation: "mean"
+    good_threshold: 0.95  # 95% of nodes must be free of I/O issues
+    slo_target: 99.5
+    error_budget_percent: 0.5
+    alert_severity: "P1"
+
+  # Network Performance SLI (from crisis/anomaly detection)
+  - name: network_performance
+    description: "Percentage of nodes without network crisis or anomalies"
+    type: "throughput"
+    query_type: "internal"  # Calculated from network crisis/anomaly data
+    aggregation: "mean"
+    good_threshold: 0.90  # 90% of nodes must be free of network issues
+    slo_target: 99.9
+    error_budget_percent: 0.1
+    alert_severity: "P1"
+
+  # Pod CPU Performance SLI
+  - name: pod_cpu_performance
+    description: "Percentage of nodes with pod CPU utilization < 80%"
+    type: "latency"
+    query_type: "internal"  # Calculated from pod CPU data
+    aggregation: "mean"
+    good_threshold: 0.80  # 80% of nodes must have pod CPU < 80%
+    slo_target: 99.5
+    error_budget_percent: 0.5
+    alert_severity: "P2"
+
+  # Pod Memory Performance SLI
+  - name: pod_memory_performance
+    description: "Percentage of nodes with pod memory utilization < 85%"
+    type: "availability"
+    query_type: "internal"  # Calculated from pod memory data
+    aggregation: "mean"
+    good_threshold: 0.85  # 85% of nodes must have pod memory < 85%
+    slo_target: 99.5
+    error_budget_percent: 0.5
+    alert_severity: "P2"
+
+  # Node Health SLI
+  - name: node_health
+    description: "Percentage of nodes without critical anomalies"
+    type: "availability"
+    query_type: "internal"  # Calculated internally from anomaly detection
+    # This SLI is calculated from classification anomalies and golden signals
+    # No Prometheus query needed - uses internal anomaly detection results
+    aggregation: "mean"
+    good_threshold: 0.95  # 95% of nodes should be healthy
+    slo_target: 99.95
+    error_budget_percent: 0.05
+    alert_severity: "P0"
+
+  # Disk Capacity Forecast Accuracy SLI
+  - name: disk_forecast_accuracy
+    description: "Accuracy of disk capacity forecasts (MAE < 2 days)"
+    type: "error_rate"
+    query_type: "internal"  # Calculated from forecast vs actual
+    aggregation: "mean"
+    good_threshold: 0.90  # 90% of forecasts within 2 days accuracy
+    slo_target: 95.0
+    error_budget_percent: 5.0
+    alert_severity: "P2"
+
+  # Alert Accuracy SLI
+  - name: alert_accuracy
+    description: "Percentage of alerts that required action (true positives)"
+    type: "error_rate"
+    query_type: "internal"  # Requires feedback mechanism
+    aggregation: "mean"
+    good_threshold: 0.80  # 80% of alerts should be actionable
+    slo_target: 90.0
+    error_budget_percent: 10.0
+    alert_severity: "P2"
+
+# SLO Reporting
+reporting:
+  # Generate SLO reports
+  enabled: true
+  # Report frequency (daily, weekly, monthly)
+  frequency: "daily"
+  # Include error budget burn rate
+  include_burn_rate: true
+  # Include trend analysis
+  include_trends: true
+  # Output format (console, json, csv)
+  output_formats: ["console", "json"]
+  # Output directory for reports
+  output_directory: "slo_reports"
+

@@ -32,6 +32,14 @@ from datetime import datetime, timedelta
 import joblib
 import warnings
 
+# --- YAML support (optional) ---
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    print("PyYAML not found. SLI/SLO config disabled. Install with: pip install pyyaml")
+    YAML_AVAILABLE = False
+
 # --- LSTM (CPU-only) ---
 try:
     from tensorflow.keras.models import Sequential
@@ -660,6 +668,17 @@ def parse_cli_args():
         default=None,
         help="Directory to dump training datasets as CSV files (created if missing)"
     )
+    parser.add_argument(
+        "--sli-slo-config",
+        type=str,
+        default=None,
+        help="Path to SLI/SLO configuration YAML file (default: sli_slo_config.yaml in current directory)"
+    )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        help="Generate and save plot files (PNG images). If not specified, plots are skipped to save time."
+    )
     return parser.parse_args()
 
 def persist_model_metadata(model_path, metadata):
@@ -754,7 +773,7 @@ def load_cached_ensemble(model_path):
 
     return None
 
-def generate_forecast_plots_from_cache(df_cpu, df_mem, cached_result, horizon_min, model_path):
+def generate_forecast_plots_from_cache(df_cpu, df_mem, cached_result, horizon_min, model_path, enable_plots=True):
     """Generate forecast plots from cached model results (simple version for normal mode)."""
     if not isinstance(cached_result, tuple) or len(cached_result) < 3:
         return
@@ -818,13 +837,14 @@ def generate_forecast_plots_from_cache(df_cpu, df_mem, cached_result, horizon_mi
     else:
         model_type = "MODEL"
     plt.title(f"{model_type} Layer – 24h Historical + 3h Forecast")
-    plot_filename = f"{model_type.lower()}_layer_forecast.png"
-    plot_path = os.path.join(FORECAST_PLOTS_DIR, plot_filename)
-    plt.savefig(plot_path, dpi=180, bbox_inches='tight')
+    if enable_plots:
+        plot_filename = f"{model_type.lower()}_layer_forecast.png"
+        plot_path = os.path.join(FORECAST_PLOTS_DIR, plot_filename)
+        plt.savefig(plot_path, dpi=180, bbox_inches='tight')
+        log_verbose(f"Generated forecast plot from cache: {plot_path}")
     plt.close()
-    log_verbose(f"Generated forecast plot from cache: {plot_path}")
 
-def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_min, model_path, dump_csv_dir=None, context=None):
+def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_min, model_path, dump_csv_dir=None, context=None, enable_plots=True):
     """Generate fresh forecasts from cached model using latest data."""
     if not isinstance(cached_result, tuple) or len(cached_result) < 3:
         return None
@@ -1173,29 +1193,29 @@ def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_m
     forecast_dir = os.path.abspath(FORECAST_PLOTS_DIR)
     os.makedirs(forecast_dir, exist_ok=True)
     
-    plot_filename = f"{model_type.lower()}_layer_forecast.png"
-    plot_path = os.path.join(forecast_dir, plot_filename)
-    plot_path = os.path.abspath(plot_path)  # Ensure absolute path
-    try:
-        plt.savefig(plot_path, dpi=180, bbox_inches='tight')
-        plt.close()
-        if os.path.exists(plot_path):
-            file_size = os.path.getsize(plot_path)
-            print(f"✓ Saved forecast plot: {plot_path} ({file_size} bytes)")
-        else:
-            print(f"✗ Warning: Plot file not found after save: {plot_path}")
-    except Exception as e:
-        plt.close()
-        print(f"✗ Error saving plot to {plot_path}: {e}")
-        import traceback
-        traceback.print_exc()
-        raise
+    if enable_plots:
+        plot_filename = f"{model_type.lower()}_layer_forecast.png"
+        plot_path = os.path.join(forecast_dir, plot_filename)
+        plot_path = os.path.abspath(plot_path)  # Ensure absolute path
+        try:
+            plt.savefig(plot_path, dpi=180, bbox_inches='tight')
+            if os.path.exists(plot_path):
+                file_size = os.path.getsize(plot_path)
+                print(f"✓ Saved forecast plot: {plot_path} ({file_size} bytes)")
+            else:
+                print(f"✗ Warning: Plot file not found after save: {plot_path}")
+        except Exception as e:
+            print(f"✗ Error saving plot to {plot_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+    plt.close()
     
     return (prophet_model, out, metrics)
 
 def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrain=False,
                            generate_fresh_forecast=False, show_backtest=False,
-                           dump_csv_dir=None, context=None):
+                           dump_csv_dir=None, context=None, enable_plots=True):
     if not force_retrain:
         cached = load_cached_ensemble(model_path)
         if cached is not None:
@@ -1203,7 +1223,7 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
             # Generate fresh forecasts from latest data if requested (forecast mode)
             if generate_fresh_forecast:
                 try:
-                    result = generate_forecast_from_cached_model(df_cpu, df_mem, cached, horizon_min, model_path, dump_csv_dir=dump_csv_dir, context=context)
+                    result = generate_forecast_from_cached_model(df_cpu, df_mem, cached, horizon_min, model_path, dump_csv_dir=dump_csv_dir, context=context, enable_plots=enable_plots)
                     if result is not None:
                         # Save updated model after minimal update
                         try:
@@ -1218,7 +1238,7 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
                         print(f"   Falling back to cached forecast plot generation...")
                         # Fall back to generating plot from cached forecast
                         try:
-                            generate_forecast_plots_from_cache(df_cpu, df_mem, cached, horizon_min, model_path)
+                            generate_forecast_plots_from_cache(df_cpu, df_mem, cached, horizon_min, model_path, enable_plots=enable_plots)
                         except Exception as e2:
                             print(f"✗ Error generating plot from cache: {e2}")
                 except Exception as e:
@@ -1228,7 +1248,7 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
                     # Try to generate plot from cached forecast as fallback
                     try:
                         print(f"   Attempting fallback to cached forecast plot...")
-                        generate_forecast_plots_from_cache(df_cpu, df_mem, cached, horizon_min, model_path)
+                        generate_forecast_plots_from_cache(df_cpu, df_mem, cached, horizon_min, model_path, enable_plots=enable_plots)
                     except Exception as e2:
                         print(f"✗ Fallback also failed: {e2}")
             # Generate backtest plots when show_backtest is True (even with cached models)
@@ -1259,7 +1279,8 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
         horizon_min=horizon_min,
         model_path=model_path,
         context=context,
-        dump_csv_dir=dump_csv_dir
+        dump_csv_dir=dump_csv_dir,
+        enable_plots=enable_plots
     )
     try:
         joblib.dump(result, model_path)
@@ -1275,6 +1296,424 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
 # ----------------------------------------------------------------------
 # 1. FETCH & PREPROCESS
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# SLI/SLO Framework
+# ----------------------------------------------------------------------
+
+def load_sli_slo_config(config_path=None):
+    """Load SLI/SLO configuration from YAML file."""
+    if not YAML_AVAILABLE:
+        return None
+    
+    if config_path is None:
+        # Try default locations
+        default_paths = [
+            os.path.join(os.getcwd(), "sli_slo_config.yaml"),
+            os.path.join(os.path.dirname(__file__), "sli_slo_config.yaml"),
+            os.getenv("SLI_SLO_CONFIG_PATH", "")
+        ]
+        for path in default_paths:
+            if path and os.path.exists(path):
+                config_path = path
+                break
+    
+    if not config_path or not os.path.exists(config_path):
+        if should_verbose():
+            print(f"SLI/SLO config not found at {config_path or 'default locations'}. SLI/SLO tracking disabled.")
+        return None
+    
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+        log_verbose(f"Loaded SLI/SLO config from {config_path}")
+        return config
+    except Exception as exc:
+        print(f"Warning: Failed to load SLI/SLO config from {config_path}: {exc}")
+        return None
+
+def calculate_sli_value(sli_config, disk_alerts=None, classification_anomalies_df=None, 
+                        host_pressure_df=None, golden_anomalies_df=None,
+                        df_hcpu=None, df_hmem=None, df_pcpu=None, df_pmem=None,
+                        crisis_df=None, anomaly_df=None):
+    """Calculate current SLI value based on configuration."""
+    if sli_config['query_type'] == 'internal':
+        # Internal SLIs calculated from anomaly detection results
+        if sli_config['name'] == 'node_health':
+            # Calculate percentage of nodes without critical anomalies
+            all_nodes = set()
+            unhealthy_nodes = set()
+            
+            # Collect all nodes from various sources
+            if disk_alerts is not None and not disk_alerts.empty and 'instance' in disk_alerts.columns:
+                all_nodes.update(disk_alerts['instance'].unique())
+            
+            # Collect unhealthy nodes from various sources
+            if classification_anomalies_df is not None and not classification_anomalies_df.empty:
+                if 'instance' in classification_anomalies_df.columns:
+                    unhealthy_nodes.update(classification_anomalies_df['instance'].unique())
+            
+            if host_pressure_df is not None and not host_pressure_df.empty:
+                if 'instance' in host_pressure_df.columns:
+                    unhealthy_nodes.update(host_pressure_df['instance'].unique())
+            
+            if golden_anomalies_df is not None and not golden_anomalies_df.empty:
+                if 'node' in golden_anomalies_df.columns:
+                    unhealthy_nodes.update(golden_anomalies_df['node'].unique())
+                # Also check 'instance' column if present
+                if 'instance' in golden_anomalies_df.columns:
+                    unhealthy_nodes.update(golden_anomalies_df['instance'].unique())
+            
+            # Healthy nodes = all nodes minus unhealthy nodes
+            healthy_nodes = all_nodes - unhealthy_nodes
+            total_nodes = len(all_nodes) if all_nodes else len(unhealthy_nodes)
+            
+            if total_nodes == 0:
+                return 1.0  # No nodes = 100% healthy (edge case)
+            
+            return len(healthy_nodes) / total_nodes
+        
+        elif sli_config['name'] == 'disk_availability':
+            # Calculate percentage of disks below 90% usage
+            if disk_alerts is None or disk_alerts.empty:
+                return 1.0  # No disk data = assume 100% available
+            
+            # Count disks (instance + mountpoint combinations)
+            total_disks = len(disk_alerts)
+            # Disks with current_% < 90% are "good"
+            if 'current_%' in disk_alerts.columns:
+                good_disks = (disk_alerts['current_%'] < 90).sum()
+                return good_disks / total_disks if total_disks > 0 else 1.0
+            
+            return 1.0
+        
+        elif sli_config['name'] == 'host_cpu_performance':
+            # Calculate percentage of nodes with host CPU < 80%
+            if df_hcpu is None or df_hcpu.empty:
+                return None
+            
+            # Get latest CPU values per instance
+            if 'instance' in df_hcpu.columns and 'y' in df_hcpu.columns:
+                latest_cpu = df_hcpu.groupby('instance')['y'].last()
+                total_nodes = len(latest_cpu)
+                good_nodes = (latest_cpu < 0.80).sum()
+                return good_nodes / total_nodes if total_nodes > 0 else 1.0
+            
+            return None
+        
+        elif sli_config['name'] == 'host_memory_performance':
+            # Calculate percentage of nodes with host memory < 85%
+            if df_hmem is None or df_hmem.empty:
+                return None
+            
+            # Get latest memory values per instance
+            if 'instance' in df_hmem.columns and 'y' in df_hmem.columns:
+                latest_mem = df_hmem.groupby('instance')['y'].last()
+                total_nodes = len(latest_mem)
+                good_nodes = (latest_mem < 0.85).sum()
+                return good_nodes / total_nodes if total_nodes > 0 else 1.0
+            
+            return None
+        
+        elif sli_config['name'] == 'pod_cpu_performance':
+            # Calculate percentage of nodes with pod CPU < 80%
+            if df_pcpu is None or df_pcpu.empty:
+                return None
+            
+            # Get latest pod CPU values per instance
+            if 'instance' in df_pcpu.columns and 'y' in df_pcpu.columns:
+                latest_cpu = df_pcpu.groupby('instance')['y'].last()
+                total_nodes = len(latest_cpu)
+                good_nodes = (latest_cpu < 0.80).sum()
+                return good_nodes / total_nodes if total_nodes > 0 else 1.0
+            
+            return None
+        
+        elif sli_config['name'] == 'pod_memory_performance':
+            # Calculate percentage of nodes with pod memory < 85%
+            if df_pmem is None or df_pmem.empty:
+                return None
+            
+            # Get latest pod memory values per instance
+            if 'instance' in df_pmem.columns and 'y' in df_pmem.columns:
+                latest_mem = df_pmem.groupby('instance')['y'].last()
+                total_nodes = len(latest_mem)
+                good_nodes = (latest_mem < 0.85).sum()
+                return good_nodes / total_nodes if total_nodes > 0 else 1.0
+            
+            return None
+        
+        elif sli_config['name'] == 'io_performance':
+            # Calculate percentage of nodes without I/O crisis or anomalies
+            all_nodes = set()
+            problematic_nodes = set()
+            
+            # Collect all nodes from disk alerts or other sources
+            if disk_alerts is not None and not disk_alerts.empty and 'instance' in disk_alerts.columns:
+                all_nodes.update(disk_alerts['instance'].unique())
+            
+            # Collect nodes with I/O issues
+            if crisis_df is not None and not crisis_df.empty:
+                if 'instance' in crisis_df.columns:
+                    problematic_nodes.update(crisis_df['instance'].unique())
+            
+            if anomaly_df is not None and not anomaly_df.empty:
+                if 'instance' in anomaly_df.columns:
+                    problematic_nodes.update(anomaly_df['instance'].unique())
+            
+            # If no nodes found, try to infer from other sources
+            if not all_nodes and df_hcpu is not None and not df_hcpu.empty:
+                if 'instance' in df_hcpu.columns:
+                    all_nodes.update(df_hcpu['instance'].unique())
+            
+            healthy_nodes = all_nodes - problematic_nodes
+            total_nodes = len(all_nodes) if all_nodes else len(problematic_nodes)
+            
+            if total_nodes == 0:
+                return 1.0  # No nodes = 100% healthy (edge case)
+            
+            return len(healthy_nodes) / total_nodes
+        
+        elif sli_config['name'] == 'network_performance':
+            # Calculate percentage of nodes without network crisis or anomalies
+            # Network issues are typically in the same crisis_df/anomaly_df but filtered by signal
+            all_nodes = set()
+            problematic_nodes = set()
+            
+            # Collect all nodes
+            if disk_alerts is not None and not disk_alerts.empty and 'instance' in disk_alerts.columns:
+                all_nodes.update(disk_alerts['instance'].unique())
+            
+            # Collect nodes with network issues (filter by signal type if available)
+            if crisis_df is not None and not crisis_df.empty:
+                if 'instance' in crisis_df.columns:
+                    # Filter for network-related signals if signal column exists
+                    if 'signal' in crisis_df.columns:
+                        network_crisis = crisis_df[crisis_df['signal'].str.contains('NET', case=False, na=False)]
+                        problematic_nodes.update(network_crisis['instance'].unique())
+                    else:
+                        problematic_nodes.update(crisis_df['instance'].unique())
+            
+            if anomaly_df is not None and not anomaly_df.empty:
+                if 'instance' in anomaly_df.columns:
+                    if 'signal' in anomaly_df.columns:
+                        network_anomaly = anomaly_df[anomaly_df['signal'].str.contains('NET', case=False, na=False)]
+                        problematic_nodes.update(network_anomaly['instance'].unique())
+                    else:
+                        problematic_nodes.update(anomaly_df['instance'].unique())
+            
+            # If no nodes found, try to infer from other sources
+            if not all_nodes and df_hcpu is not None and not df_hcpu.empty:
+                if 'instance' in df_hcpu.columns:
+                    all_nodes.update(df_hcpu['instance'].unique())
+            
+            healthy_nodes = all_nodes - problematic_nodes
+            total_nodes = len(all_nodes) if all_nodes else len(problematic_nodes)
+            
+            if total_nodes == 0:
+                return 1.0  # No nodes = 100% healthy (edge case)
+            
+            return len(healthy_nodes) / total_nodes
+        
+        elif sli_config['name'] == 'disk_forecast_accuracy':
+            # This requires historical forecast vs actual data
+            # For now, return None (needs implementation with historical tracking)
+            return None
+        
+        elif sli_config['name'] == 'alert_accuracy':
+            # This requires feedback mechanism (which alerts were true positives)
+            # For now, return None (needs implementation with alert feedback)
+            return None
+        
+        # Default: return None if we can't calculate
+        return None
+    
+    elif sli_config['query_type'] == 'prometheus':
+        # Prometheus-based SLIs - would need to execute query
+        # For now, return None to indicate it needs Prometheus query
+        return None
+    
+    return None
+
+def calculate_slo_compliance(sli_value, slo_target):
+    """
+    Calculate SLO compliance percentage.
+    
+    Args:
+        sli_value: Current SLI value (0.0 to 1.0, e.g., 0.6667 for 66.67%)
+        slo_target: SLO target percentage (e.g., 99.95)
+    
+    Returns:
+        Compliance percentage (100.0 if SLI meets target, 0.0 otherwise)
+    
+    Note: This is a simplified implementation. In production, compliance
+    would be calculated over a time window (e.g., 30 days) as the percentage
+    of time the SLI met the target.
+    
+    Example:
+        SLI = 66.67% (0.6667), Target = 99.95% (0.9995)
+        Since 0.6667 < 0.9995, compliance = 0.0%
+    """
+    if sli_value is None:
+        return None
+    
+    # Convert SLO target from percentage to ratio (99.95% -> 0.9995)
+    target_ratio = slo_target / 100.0
+    
+    # Binary compliance: either 100% (meets target) or 0% (doesn't meet target)
+    # In production, this would be: (time_meeting_target / total_time) * 100
+    return 100.0 if sli_value >= target_ratio else 0.0
+
+def calculate_error_budget(slo_target, compliance_percent):
+    """
+    Calculate error budget remaining.
+    
+    Error Budget Formula:
+        1. Total Budget = 100% - SLO Target
+        2. Budget Consumed = 100% - Compliance %
+        3. Budget Remaining = Total Budget - Budget Consumed
+    
+    Args:
+        slo_target: SLO target percentage (e.g., 99.95)
+        compliance_percent: Current compliance percentage (0.0 to 100.0)
+    
+    Returns:
+        Error budget remaining as percentage (clamped to 0.0 minimum)
+    
+    Example (NODE HEALTH):
+        SLO Target = 99.95%
+        Total Budget = 100% - 99.95% = 0.05%
+        
+        If Compliance = 0% (SLI below target):
+            Budget Consumed = 100% - 0% = 100%
+            Budget Remaining = 0.05% - 100% = -99.95% → Clamped to 0.00%
+        
+        If Compliance = 100% (SLI meets target):
+            Budget Consumed = 100% - 100% = 0%
+            Budget Remaining = 0.05% - 0% = 0.05% ✓
+    
+    Note: In production, budget would be calculated over a time window
+    (e.g., 30 days) and would recover gradually as compliance improves.
+    """
+    if compliance_percent is None:
+        return None
+    
+    # Step 1: Calculate total error budget
+    # This is the maximum "unreliability" you can tolerate
+    # Example: 99.95% SLO = 0.05% error budget
+    total_budget = 100.0 - slo_target
+    
+    # Step 2: Calculate how much budget has been consumed
+    # If compliance is 0%, you've consumed 100% of your budget
+    # If compliance is 100%, you've consumed 0% of your budget
+    budget_consumed = 100.0 - compliance_percent
+    
+    # Step 3: Calculate remaining budget
+    # This can be negative if you've exceeded your budget
+    budget_remaining = total_budget - budget_consumed
+    
+    # Clamp to 0.0 minimum (can't have negative budget remaining)
+    # Negative values indicate budget exhaustion
+    return max(0.0, budget_remaining)
+
+def track_sli_slo(config, disk_alerts=None, classification_anomalies_df=None,
+                  host_pressure_df=None, golden_anomalies_df=None,
+                  df_hcpu=None, df_hmem=None, df_pcpu=None, df_pmem=None,
+                  crisis_df=None, anomaly_df=None):
+    """Track SLI/SLO metrics and return summary."""
+    if config is None:
+        return None
+    
+    slis = config.get('slis', [])
+    settings = config.get('settings', {})
+    
+    results = []
+    
+    for sli_config in slis:
+        sli_name = sli_config.get('name', 'unknown')
+        slo_target = sli_config.get('slo_target', 99.9)
+        error_budget_percent = sli_config.get('error_budget_percent', 0.1)
+        alert_severity = sli_config.get('alert_severity', 'P2')
+        
+        # Calculate current SLI value
+        sli_value = calculate_sli_value(
+            sli_config,
+            disk_alerts=disk_alerts,
+            classification_anomalies_df=classification_anomalies_df,
+            host_pressure_df=host_pressure_df,
+            golden_anomalies_df=golden_anomalies_df,
+            df_hcpu=df_hcpu,
+            df_hmem=df_hmem,
+            df_pcpu=df_pcpu,
+            df_pmem=df_pmem,
+            crisis_df=crisis_df,
+            anomaly_df=anomaly_df
+        )
+        
+        if sli_value is None:
+            continue  # Skip if we can't calculate
+        
+        # Calculate compliance (simplified - in production would use historical data)
+        compliance = calculate_slo_compliance(sli_value, slo_target)
+        error_budget_remaining = calculate_error_budget(slo_target, compliance) if compliance is not None else None
+        
+        # Check if error budget is at risk
+        error_budget_threshold = settings.get('error_budget_alert_threshold', 20)
+        budget_at_risk = False
+        if error_budget_remaining is not None:
+            budget_percent_remaining = (error_budget_remaining / (100.0 - slo_target)) * 100 if (100.0 - slo_target) > 0 else 0
+            budget_at_risk = budget_percent_remaining < error_budget_threshold
+        
+        results.append({
+            'sli_name': sli_name,
+            'description': sli_config.get('description', ''),
+            'sli_value': sli_value,
+            'slo_target': slo_target,
+            'compliance_percent': compliance,
+            'error_budget_remaining': error_budget_remaining,
+            'budget_at_risk': budget_at_risk,
+            'alert_severity': alert_severity
+        })
+    
+    return results
+
+def format_sli_slo_report(sli_slo_results):
+    """Format SLI/SLO results for console output."""
+    if not sli_slo_results:
+        return ""
+    
+    lines = ["=" * 80]
+    lines.append("SLI/SLO STATUS")
+    lines.append("=" * 80)
+    
+    for result in sli_slo_results:
+        sli_name = result['sli_name']
+        description = result['description']
+        sli_value = result['sli_value']
+        slo_target = result['slo_target']
+        compliance = result['compliance_percent']
+        budget_remaining = result['error_budget_remaining']
+        budget_at_risk = result['budget_at_risk']
+        severity = result['alert_severity']
+        
+        lines.append(f"\n{sli_name.upper().replace('_', ' ')}")
+        lines.append(f"  Description: {description}")
+        lines.append(f"  Current SLI: {sli_value:.2%}")
+        lines.append(f"  SLO Target: {slo_target}%")
+        
+        if compliance is not None:
+            status = "✓ COMPLIANT" if compliance >= slo_target else "✗ NON-COMPLIANT"
+            lines.append(f"  Compliance: {compliance:.2f}% {status}")
+        
+        if budget_remaining is not None:
+            budget_status = "⚠️  AT RISK" if budget_at_risk else "✓ OK"
+            lines.append(f"  Error Budget Remaining: {budget_remaining:.2f}% {budget_status}")
+        
+        if budget_at_risk:
+            lines.append(f"  ⚠️  ALERT: Error budget below threshold ({severity})")
+    
+    lines.append("=" * 80)
+    return "\n".join(lines)
+
 def fetch_victoriametrics_metrics(query, start, end, step=STEP):
     params = {'query': query, 'start': start, 'end': end, 'step': step}
     try:
@@ -1374,7 +1813,7 @@ def fetch_and_preprocess_data(query, start_hours_ago=START_HOURS_AGO, step=STEP)
 # ----------------------------------------------------------------------
 def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                            manifest=None, retrain_targets=None, show_backtest=False,
-                           forecast_mode=False, dump_csv_dir=None):
+                           forecast_mode=False, dump_csv_dir=None, enable_plots=True):
     """
     Returns a DataFrame with full ETA for every node/mountpoint
     Uses hybrid linear trend + Prophet for maximum accuracy
@@ -1641,10 +2080,11 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                     plt.legend()
                     plt.grid(alpha=0.3)
                     plt.tight_layout()
-                    plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_forecast.png")
-                    plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                    if enable_plots:
+                        plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_forecast.png")
+                        plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                        print(f"  → Disk plot saved: {plot_file}")
                     plt.close()
-                    print(f"  → Disk plot saved: {plot_file}")
                 except Exception as e:
                     print(f"  ✗ Failed to save disk plot for cached model: {e}")
                     import traceback
@@ -1800,10 +2240,11 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                 plt.legend()
                 plt.grid(alpha=0.3)
                 plt.tight_layout()
-                plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_forecast.png")
-                plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                if enable_plots:
+                    plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_forecast.png")
+                    plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                    print(f"  → Disk plot saved: {plot_file}")
                 plt.close()
-                print(f"  → Disk plot saved: {plot_file}")
             except Exception as e:
                 log_verbose(f"  → Failed to save disk plot: {e}")
                 try:
@@ -1841,7 +2282,11 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
 def build_ensemble_forecast_model(df_cpu, df_mem=None,
                                  horizon_min=HORIZON_MIN, model_path='model.pkl', context=None,
                                  save_forecast_plot=True, save_backtest_plot=True, print_backtest_metrics=True,
-                                 save_model=True, dump_csv_dir=None):
+                                 save_model=True, dump_csv_dir=None, enable_plots=True):
+    # Override plot saving flags if enable_plots is False
+    if not enable_plots:
+        save_forecast_plot = False
+        save_backtest_plot = False
     # Extract instance metadata before aggregation
     instances_included = []
     if 'instance' in df_cpu.columns:
@@ -2260,7 +2705,7 @@ def extract_instance_features(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, 
 
 def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
                         lookback_hours=LOOKBACK_HOURS, contamination=CONTAMINATION, forecast_mode=False,
-                        dump_csv_dir=None):
+                        dump_csv_dir=None, enable_plots=True):
     feats = extract_instance_features(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, lookback_hours)
     feats['instance_label'] = feats.apply(
         lambda row: canonical_node_label(row['entity'], with_ip=True, raw_label=row.get('raw_instance')),
@@ -2301,8 +2746,8 @@ def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
     plt.ylabel('Pod Memory (norm)')
     plt.title('Classification: Host vs Pod – Red = non-K8s')
     plt.grid(alpha=0.3); plt.tight_layout()
-    # Save plot only in forecast mode or when training
-    if forecast_mode or FORCE_TRAINING_RUN:
+    # Save plot only in forecast mode or when training, and if enable_plots is True
+    if enable_plots and (forecast_mode or FORCE_TRAINING_RUN):
         plot_path = os.path.join(FORECAST_PLOTS_DIR, "classification_host_vs_pod.png")
         plt.savefig(plot_path, dpi=180, bbox_inches='tight')
     plt.close()
@@ -2436,7 +2881,8 @@ def predict_io_and_network_crisis_with_backtest(
     retrain_targets: set | None = None,
     show_backtest: bool = False,
     forecast_mode: bool = False,
-    dump_csv_dir: str | None = None
+    dump_csv_dir: str | None = None,
+    enable_plots: bool = True
 ):
     """
     FINAL PRODUCTION VERSION — NO MORE ERRORS
@@ -2671,12 +3117,13 @@ def predict_io_and_network_crisis_with_backtest(
                 plt.title(f"{node} — {name.replace('_', ' ')}\n"
                           f"MAE: {mae:.6f} | RMSE: {rmse:.6f} | Hybrid ETA: {hybrid_eta:.1f} days → {severity}")
                 plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
-                # Sanitize node name for filename
-                safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
-                plot_file = os.path.join(plot_dir, f"{safe_node}_{name.lower().replace(' ', '_')}_backtest.png")
-                plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                if enable_plots:
+                    # Sanitize node name for filename
+                    safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
+                    plot_file = os.path.join(plot_dir, f"{safe_node}_{name.lower().replace(' ', '_')}_backtest.png")
+                    plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                    log_verbose(f"  → Plot saved: {plot_file}")
                 plt.close()
-                log_verbose(f"  → Plot saved: {plot_file}")
             
             # Save forecast plot in forecast mode (showing future predictions, not backtest)
             if forecast_mode:
@@ -2700,12 +3147,13 @@ def predict_io_and_network_crisis_with_backtest(
                 plt.xlabel('Time')
                 plt.ylabel('Value')
                 plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
-                # Sanitize node name for filename
-                safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
-                plot_file = os.path.join(plot_dir, f"{safe_node}_{name.lower().replace(' ', '_')}_forecast.png")
-                plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                if enable_plots:
+                    # Sanitize node name for filename
+                    safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
+                    plot_file = os.path.join(plot_dir, f"{safe_node}_{name.lower().replace(' ', '_')}_forecast.png")
+                    plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                    log_verbose(f"  → Forecast plot saved: {plot_file}")
                 plt.close()
-                log_verbose(f"  → Forecast plot saved: {plot_file}")
 
             if show_backtest or should_verbose():
                 print(f"\nBacktest complete → {node} | {name.replace('_', ' ')}")
@@ -2743,7 +3191,7 @@ def predict_io_and_network_crisis_with_backtest(
 # ----------------------------------------------------------------------
 def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forecast_plots", force_retrain: bool | None = None,
                                     manifest: dict | None = None, retrain_targets: set | None = None, show_backtest: bool = False,
-                                    forecast_mode: bool = False, dump_csv_dir: str | None = None):
+                                    forecast_mode: bool = False, dump_csv_dir: str | None = None, enable_plots: bool = True):
     """
     DISK I/O + NETWORK — FULL ENSEMBLE FORECAST (same brain as CPU/Memory)
     - Uses manifest for model storage (single file instead of per-node files)
@@ -2949,7 +3397,8 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
                             save_forecast_plot=True,  # Save forecast plots in forecast mode
                             save_backtest_plot=False,  # Don't save backtest plots in forecast mode
                             print_backtest_metrics=False,  # Don't print backtest metrics in forecast mode
-                            dump_csv_dir=dump_csv_dir
+                            dump_csv_dir=dump_csv_dir,
+                            enable_plots=enable_plots
                         )
                         if forecast_result is not None:
                             manifest[key] = {'model': forecast_result}
@@ -2973,7 +3422,8 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
                                 save_backtest_plot=False,  # Don't save backtest plots when computing metrics for cached models
                                 print_backtest_metrics=False,  # Don't print backtest metrics when computing for cached models
                                 save_model=False,  # Don't save model files in show_backtest mode
-                                dump_csv_dir=dump_csv_dir
+                                dump_csv_dir=dump_csv_dir,
+                                enable_plots=enable_plots
                             )
                             # Don't update manifest in show_backtest mode - only use for display
                             # manifest[key] = {'model': forecast_result}
@@ -2999,7 +3449,8 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
                         save_forecast_plot=False,  # Don't save forecast plots when retraining in forecast mode
                         save_backtest_plot=False,  # Don't save backtest plots when retraining in forecast mode
                         print_backtest_metrics=False,  # Don't print backtest metrics when retraining in forecast mode
-                        dump_csv_dir=dump_csv_dir
+                        dump_csv_dir=dump_csv_dir,
+                        enable_plots=enable_plots
                     )
                 else:
                     log_verbose(f"   No cached model → FULL TRAINING...")
@@ -3012,6 +3463,7 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
                         context={'node': node, 'signal': res['name']},
                         save_forecast_plot=False,  # Don't save forecast plots when first-time training in forecast mode
                         save_backtest_plot=False,  # Don't save backtest plots when first-time training in forecast mode
+                        enable_plots=enable_plots,
                         print_backtest_metrics=False,  # Don't print backtest metrics when first-time training in forecast mode
                         dump_csv_dir=dump_csv_dir
                 )
@@ -3395,7 +3847,7 @@ def push_to_pushgateway(pushgateway_url, summary):
         print(f"✗ Pushgateway push failed → {pushgateway_url}: {e}")
         return False
 
-def dispatch_alerts(disk_alerts, crisis_df, anomaly_df, anomalies_df, classification_anomalies_df=None, host_pressure_df=None, alert_webhook=None, pushgateway_url=None):
+def dispatch_alerts(disk_alerts, crisis_df, anomaly_df, anomalies_df, classification_anomalies_df=None, host_pressure_df=None, alert_webhook=None, pushgateway_url=None, sli_slo_results=None):
     """Dispatch alerts to webhook and/or Pushgateway."""
     if alert_webhook is None and pushgateway_url is None:
         return
@@ -3413,6 +3865,14 @@ def dispatch_alerts(disk_alerts, crisis_df, anomaly_df, anomalies_df, classifica
     
     summary = summarize_alert_counts(disk_alerts, crisis_df, anomaly_df, anomalies_df, classification_anomalies_df, host_pressure_df)
     
+    # Add SLI/SLO results to summary if available
+    if sli_slo_results:
+        summary['sli_slo'] = {
+            'results': sli_slo_results,
+            'budget_at_risk_count': sum(1 for r in sli_slo_results if r.get('budget_at_risk', False)),
+            'non_compliant_count': sum(1 for r in sli_slo_results if r.get('compliance_percent', 100) < r.get('slo_target', 100))
+        }
+    
     total_alerts = (
         summary['disk']['total'] +
         summary['io_network_crisis']['total'] +
@@ -3421,6 +3881,12 @@ def dispatch_alerts(disk_alerts, crisis_df, anomaly_df, anomalies_df, classifica
         summary['classification_anomaly']['total'] +
         summary['host_pressure']['total']
     )
+    
+    # Add SLI/SLO budget at risk to total alerts if applicable
+    if sli_slo_results:
+        budget_at_risk_count = sum(1 for r in sli_slo_results if r.get('budget_at_risk', False))
+        if budget_at_risk_count > 0:
+            print(f"SLI/SLO Error Budgets at Risk: {budget_at_risk_count}")
     
     # Always print summary for debugging
     print(f"\n{'='*80}")
@@ -3449,12 +3915,15 @@ def dispatch_alerts(disk_alerts, crisis_df, anomaly_df, anomalies_df, classifica
 # ----------------------------------------------------------------------
 # 8.5. FORECAST MODE (lightweight, frequent runs)
 # ----------------------------------------------------------------------
-def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=None):
+def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=None, sli_slo_config_path=None, enable_plots=False):
     """Forecast mode: generate forecasts using latest Prometheus data and cached models.
     Runs all forecasting models (CPU, Memory, Disk, I/O, Network) and displays predictions and anomalies.
     Optimized for frequent runs (e.g., every 15 seconds via external scheduler).
     
-    Generates forecast plots for all models and displays:
+    Args:
+        enable_plots: If True, generates and saves plot files (PNG images). If False, plots are skipped.
+    
+    Generates forecast plots for all models (when enable_plots=True) and displays:
     - Host and Pod layer forecasts
     - Disk full predictions
     - I/O and Network crisis predictions
@@ -3501,7 +3970,8 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
             force_retrain=False,
             generate_fresh_forecast=True,
             dump_csv_dir=csv_dump_dir,
-            context={'node': 'host'}
+            context={'node': 'host'},
+            enable_plots=enable_plots
         )
     
     # ====================== POD LAYER ======================
@@ -3532,7 +4002,8 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
             force_retrain=False,
             generate_fresh_forecast=True,
             dump_csv_dir=csv_dump_dir,
-            context={'node': 'pod'}
+            context={'node': 'pod'},
+            enable_plots=enable_plots
         )
     
     # ====================== DIVERGENCE & ANOMALY ======================
@@ -3550,7 +4021,8 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
         lookback_hours=LOOKBACK_HOURS,
         contamination=CONTAMINATION,
         forecast_mode=True,
-        dump_csv_dir=csv_dump_dir
+        dump_csv_dir=csv_dump_dir,
+        enable_plots=enable_plots
     )
     
     # ====================== DISK FULL PREDICTION ======================
@@ -3595,7 +4067,8 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
             retrain_targets=None,
             show_backtest=False,
             forecast_mode=True,
-            dump_csv_dir=csv_dump_dir
+            dump_csv_dir=csv_dump_dir,
+            enable_plots=enable_plots
         )
         if manifest_changed:
             save_disk_manifest(DISK_MODEL_MANIFEST_PATH, disk_manifest)
@@ -3640,7 +4113,8 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
         retrain_targets=None,
         show_backtest=False,
         forecast_mode=True,
-        dump_csv_dir=csv_dump_dir
+        dump_csv_dir=csv_dump_dir,
+        enable_plots=enable_plots
     )
     if io_net_manifest_changed:
         save_io_net_manifest(IO_NET_MODEL_MANIFEST_PATH, io_net_manifest)
@@ -3659,7 +4133,8 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
         retrain_targets=None,
         show_backtest=False,
         forecast_mode=True,
-        dump_csv_dir=csv_dump_dir
+        dump_csv_dir=csv_dump_dir,
+        enable_plots=enable_plots
     )
     if io_net_manifest_changed:
         save_io_net_manifest(IO_NET_MODEL_MANIFEST_PATH, io_net_manifest)
@@ -3671,14 +4146,42 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
     
     anomalies_df = detect_golden_anomaly_signals(hours=1)
     
+    # ====================== SLI/SLO TRACKING ======================
+    if sli_slo_config_path or YAML_AVAILABLE:
+        sli_slo_config = load_sli_slo_config(sli_slo_config_path)
+        sli_slo_results = None
+        if sli_slo_config:
+            sli_slo_results = track_sli_slo(
+                sli_slo_config,
+                disk_alerts=disk_alerts,
+                classification_anomalies_df=classification_anomalies_df,
+                host_pressure_df=host_pressure_df,
+                golden_anomalies_df=anomalies_df,
+                df_hcpu=df_hcpu,
+                df_hmem=df_hmem,
+                df_pcpu=df_pcpu,
+                df_pmem=df_pmem,
+                crisis_df=crisis_df,
+                anomaly_df=anomaly_df
+            )
+            if sli_slo_results:
+                print("\n" + format_sli_slo_report(sli_slo_results))
+        elif sli_slo_config_path:
+            print(f"\n⚠️  SLI/SLO config file not found or invalid: {sli_slo_config_path}")
+    elif sli_slo_config_path:
+        print(f"\n⚠️  PyYAML not installed. SLI/SLO tracking disabled. Install with: pip install pyyaml")
+    
     # ====================== DISPATCH ALERTS ======================
-    dispatch_alerts(disk_alerts, crisis_df, anomaly_df, anomalies_df, classification_anomalies_df, host_pressure_df, alert_webhook, pushgateway_url)
+    dispatch_alerts(disk_alerts, crisis_df, anomaly_df, anomalies_df, classification_anomalies_df, host_pressure_df, alert_webhook, pushgateway_url, sli_slo_results)
     
     # ====================== SUMMARY ======================
     print("\n" + "="*80)
     print("FORECAST MODE COMPLETE")
     print("="*80)
-    print(f"All forecast plots saved → {FORECAST_PLOTS_DIR}")
+    if enable_plots:
+        print(f"All forecast plots saved → {FORECAST_PLOTS_DIR}")
+    else:
+        print("Plots skipped (use --plot flag to generate plots)")
     print(f"Forecast timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("\n✓ All models executed with latest Prometheus data")
     print("✓ Forecasts generated for: Host, Pod, Disk, I/O, Network")
@@ -3709,7 +4212,7 @@ if __name__ == "__main__":
                     print(f"\n{'='*80}")
                     print(f"Forecast Run #{iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                     print(f"{'='*80}")
-                    run_forecast_mode(alert_webhook=args.alert_webhook, pushgateway_url=args.pushgateway, csv_dump_dir=csv_dump_dir)
+                    run_forecast_mode(alert_webhook=args.alert_webhook, pushgateway_url=args.pushgateway, csv_dump_dir=csv_dump_dir, sli_slo_config_path=args.sli_slo_config, enable_plots=args.plot)
                     if args.interval > 0:
                         print(f"\nWaiting {args.interval} seconds until next run...")
                         time.sleep(args.interval)
@@ -3718,7 +4221,7 @@ if __name__ == "__main__":
                 sys.exit(0)
         else:
             # Single run
-            run_forecast_mode(alert_webhook=args.alert_webhook, pushgateway_url=args.pushgateway, csv_dump_dir=csv_dump_dir)
+            run_forecast_mode(alert_webhook=args.alert_webhook, pushgateway_url=args.pushgateway, csv_dump_dir=csv_dump_dir, sli_slo_config_path=args.sli_slo_config, enable_plots=args.plot)
         sys.exit(0)
     
     # Normal mode: training or pre-trained with full analysis

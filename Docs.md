@@ -158,6 +158,7 @@ python3 metrics.py --training
   - Golden anomaly signals
 - **No backtest metrics or plots**
 - Respects global plot-window configuration. Supports per-run overrides via `--plot-history-hours` and `--plot-forecast-hours` for visual span control.
+- Plot generation is optional: use `--plot` flag to generate PNG files. Without `--plot`, plots are skipped for faster execution.
 - Runs continuously at the cadence specified by `--interval` (default: 15 seconds). Use `--interval 0` for a single-shot execution.
 - Optional alert sinks: `--alert-webhook <URL>` (POST JSON payload when actionable alerts fire) and `--pushgateway <URL>` (publish Prometheus gauges for Alertmanager).
 - Optional dataset export: `--dump-csv <DIR>` writes the training data for host/pod/disk/I/O models to the specified directory for audit or offline experimentation.
@@ -171,11 +172,13 @@ python3 metrics.py --training
 
 **Output**:
 - Updated model files (with latest timestamp)
-- Forecast plots: `*_forecast.png`
+- Forecast plots: `*_forecast.png` (only when `--plot` flag is provided)
 - Tabular predictions and anomalies in console (disk alerts, classification anomalies, host pressure, I/O+Network crises, golden signals)
 - Alert webhook payloads (when `--alert-webhook` specified and actionable alerts present)
 - Pushgateway metrics (when `--pushgateway` specified)
 - No backtest plots or metrics
+
+**Note:** Plot generation can be time-consuming. Use `--plot` only when visualizations are needed. For production monitoring focused on alerts, omit `--plot` for faster execution.
 
 **Example**:
 ```bash
@@ -770,6 +773,7 @@ Both alert channels leverage the `--interval` loop (default 15 seconds) so a sin
 - Plot window overrides: `PLOT_HISTORY_HOURS`, `PLOT_FORECAST_HOURS`
 
 #### CLI Overrides
+- `--plot`: Generate and save plot files (PNG images). If not specified, plots are skipped to save time.
 - `--plot-history-hours <int>`: Override history window for the run
 - `--plot-forecast-hours <int>`: Override forecast window for the run
 - `--interval <int>`: Seconds between forecast iterations (default 15; set 0 to run once)

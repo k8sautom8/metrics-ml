@@ -1,0 +1,131 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: metrics-ai
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: metrics-ai-models
+  namespace: metrics-ai
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: metrics-ai-plots
+  namespace: metrics-ai
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-ai
+  namespace: metrics-ai
+spec:
+  replicas: 1
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app: metrics-ai
+  template:
+    metadata:
+      labels:
+        app: metrics-ai
+    spec:
+      serviceAccountName: default
+      containers:
+        - name: metrics-ai
+          image: ghcr.io/your-org/metrics-ai:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--forecast"
+            - "--interval"
+            - "15"
+            - "--alert-webhook"
+            - "$(ALERT_WEBHOOK_URL)"
+            - "--pushgateway"
+            - "$(PUSHGATEWAY_URL)"
+          env:
+            - name: VM_URL
+              value: "http://prometheus.monitoring:8428/api/v1/query_range"
+            - name: START_HOURS_AGO
+              value: "360"
+            - name: ALERT_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: metrics-ai-alerts
+                  key: webhook-url
+            - name: PUSHGATEWAY_URL
+              value: "http://pushgateway.monitoring:9091"
+            - name: MODEL_FILES_DIR
+              value: "/data/models"
+            - name: FORECAST_PLOTS_DIR
+              value: "/data/plots"
+            - name: VERBOSE_LEVEL
+              value: "0"
+          volumeMounts:
+            - name: models
+              mountPath: /data/models
+            - name: plots
+              mountPath: /data/plots
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "pgrep -f metrics.py"
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "pgrep -f metrics.py"
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: metrics-ai-models
+        - name: plots
+          persistentVolumeClaim:
+            claimName: metrics-ai-plots
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: metrics-ai-alerts
+  namespace: metrics-ai
+type: Opaque
+stringData:
+  webhook-url: "https://hooks.slack.com/services/XXXXXXXXX/XXXXXXXXX/XXXXXXXXXXXXXXXXXXXX"
+
