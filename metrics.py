@@ -735,14 +735,76 @@ def report_host_only_pressure(feats, cpu_threshold=0.6, mem_threshold=0.7, pod_f
     if host_only_pressure.empty:
         return pd.DataFrame() if return_df else None
 
-    print("\n⚠️  Host pressure detected with minimal Kubernetes workload:")
     display = host_only_pressure.copy()
     if 'raw_instance' in display.columns:
         display['instance'] = display.apply(lambda row: canonical_node_label(row['entity'], with_ip=True, raw_label=row.get('raw_instance')), axis=1)
     else:
         display['instance'] = display['entity'].apply(lambda ent: canonical_node_label(ent, with_ip=True))
-    print(display[['instance', 'host_cpu', 'host_mem']].to_string(index=False))
-    print("Action: inspect OS-level processes (backups, cron jobs, daemons) on these nodes.")
+    # Convert to percentages and format for readability
+    display_output = display[['instance', 'host_cpu', 'host_mem']].copy()
+    display_output['Host CPU %'] = (display_output['host_cpu'] * 100).round(1)
+    display_output['Host Mem %'] = (display_output['host_mem'] * 100).round(1)
+    
+    # Separate nodes with pods vs nodes without pods
+    if 'has_pod_metrics' in host_only_pressure.columns:
+        nodes_with_pods = host_only_pressure[host_only_pressure['has_pod_metrics'] == True].copy()
+        nodes_without_pods = host_only_pressure[host_only_pressure['has_pod_metrics'] == False].copy()
+        
+        if not nodes_without_pods.empty and not nodes_with_pods.empty:
+            # Mixed case: some nodes have pods, some don't
+            print("\n⚠️  Host pressure detected:")
+            print("   Nodes with low pod usage:")
+            with_pods_instances = nodes_with_pods['instance'].values if 'instance' in nodes_with_pods.columns else nodes_with_pods['entity'].apply(lambda e: canonical_node_label(e, with_ip=True)).values
+            with_pods_display = display_output[display_output['instance'].isin(with_pods_instances)]
+            print(with_pods_display[['instance', 'Host CPU %', 'Host Mem %']].to_string(index=False))
+            print("\n   Nodes with high host usage:")
+            without_pods_instances = nodes_without_pods['instance'].values if 'instance' in nodes_without_pods.columns else nodes_without_pods['entity'].apply(lambda e: canonical_node_label(e, with_ip=True)).values
+            without_pods_display = display_output[display_output['instance'].isin(without_pods_instances)]
+            print(without_pods_display[['instance', 'Host CPU %', 'Host Mem %']].to_string(index=False))
+            print("\nAction:")
+            for _, row in with_pods_display.iterrows():
+                instance = row['instance']
+                cpu_pct = row['Host CPU %']
+                mem_pct = row['Host Mem %']
+                print(f"  • {instance}: High host usage (CPU: {cpu_pct}%, Mem: {mem_pct}%) with low pod usage - inspect OS-level processes (backups, cron jobs, daemons)")
+            for _, row in without_pods_display.iterrows():
+                instance = row['instance']
+                cpu_pct = row['Host CPU %']
+                mem_pct = row['Host Mem %']
+                print(f"  • {instance}: High host usage (CPU: {cpu_pct}%, Mem: {mem_pct}%) - inspect OS-level processes (backups, cron jobs, daemons)")
+        elif not nodes_without_pods.empty:
+            # All nodes have no pods - don't mention Kubernetes
+            print("\n⚠️  Host pressure detected:")
+            print("   (High host resource usage detected)")
+            print(display_output[['instance', 'Host CPU %', 'Host Mem %']].to_string(index=False))
+            print("\nAction:")
+            for _, row in display_output.iterrows():
+                instance = row['instance']
+                cpu_pct = row['Host CPU %']
+                mem_pct = row['Host Mem %']
+                print(f"  • {instance}: High host usage (CPU: {cpu_pct}%, Mem: {mem_pct}%) - inspect OS-level processes (backups, cron jobs, daemons)")
+        else:
+            # All nodes have pods (minimal usage)
+            print("\n⚠️  Host pressure detected with minimal pod usage:")
+            print("   (High host resource usage but low pod usage indicates OS-level processes)")
+            print(display_output[['instance', 'Host CPU %', 'Host Mem %']].to_string(index=False))
+            print("\nAction:")
+            for _, row in display_output.iterrows():
+                instance = row['instance']
+                cpu_pct = row['Host CPU %']
+                mem_pct = row['Host Mem %']
+                print(f"  • {instance}: High host usage (CPU: {cpu_pct}%, Mem: {mem_pct}%) with low pod usage - inspect OS-level processes (backups, cron jobs, daemons)")
+    else:
+        # Fallback: can't determine if pods exist, use generic message
+        print("\n⚠️  Host pressure detected:")
+        print("   (High host resource usage with low pod usage)")
+        print(display_output[['instance', 'Host CPU %', 'Host Mem %']].to_string(index=False))
+        print("\nAction:")
+        for _, row in display_output.iterrows():
+            instance = row['instance']
+            cpu_pct = row['Host CPU %']
+            mem_pct = row['Host Mem %']
+            print(f"  • {instance}: High host usage (CPU: {cpu_pct}%, Mem: {mem_pct}%) with low pod usage - inspect OS-level processes (backups, cron jobs, daemons)")
     
     if return_df:
         result_df = display[['instance', 'host_cpu', 'host_mem']].copy()
@@ -1216,6 +1278,7 @@ def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_m
 def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrain=False,
                            generate_fresh_forecast=False, show_backtest=False,
                            dump_csv_dir=None, context=None, enable_plots=True):
+    was_saved = False
     if not force_retrain:
         cached = load_cached_ensemble(model_path)
         if cached is not None:
@@ -1229,10 +1292,15 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
                         try:
                             joblib.dump(result, model_path)
                             log_verbose(f"Saved updated model after minimal update: {model_path}")
+                            was_saved = True
                         except Exception as e:
                             log_verbose(f"Warning: Failed to save updated model: {e}")
                         # Plot was already saved in generate_forecast_from_cached_model
-                        return result
+                        # Return result with was_saved flag
+                        if isinstance(result, tuple) and len(result) == 3:
+                            return (*result, was_saved)
+                        else:
+                            return (result, None, {}, was_saved)
                     else:
                         print(f"⚠ Warning: generate_forecast_from_cached_model returned None for {model_path}")
                         print(f"   Falling back to cached forecast plot generation...")
@@ -1268,9 +1336,15 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
                 )
                 if result is not None:
                     # Return cached model (not the newly trained one) to avoid updating model files
-                    return cached
+                    if isinstance(cached, tuple) and len(cached) == 3:
+                        return (*cached, False)
+                    else:
+                        return (cached, None, {}, False)
             # In normal mode, don't generate plots (only in forecast mode or when show_backtest)
-            return cached
+            if isinstance(cached, tuple) and len(cached) == 3:
+                return (*cached, False)
+            else:
+                return (cached, None, {}, False)
 
     log_verbose(f"Training ensemble model → {model_path}")
     result = build_ensemble_forecast_model(
@@ -1285,13 +1359,18 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
     try:
         joblib.dump(result, model_path)
         print(f"Saved ensemble artifacts → {model_path}")
+        was_saved = True
         metrics = result[-1] if isinstance(result, tuple) and result else {}
         split_info = metrics.get('split_info') if isinstance(metrics, dict) else None
         persist_model_metadata(model_path, split_info)
     except Exception as exc:
         print(f"Warning: failed to save ensemble artifacts ({model_path}): {exc}")
 
-    return result
+    # Return result with was_saved flag
+    if isinstance(result, tuple) and len(result) == 3:
+        return (*result, was_saved)
+    else:
+        return (result, None, {}, was_saved)
 
 # ----------------------------------------------------------------------
 # 1. FETCH & PREPROCESS
@@ -2878,6 +2957,32 @@ def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
                         lookback_hours=LOOKBACK_HOURS, contamination=CONTAMINATION, forecast_mode=False,
                         dump_csv_dir=None, enable_plots=True):
     feats = extract_instance_features(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, lookback_hours)
+    
+    # Track which nodes actually have pod metrics (not just filled with 0)
+    # This helps distinguish "no pods" from "low pod usage"
+    now = pd.Timestamp.now()
+    start = now - pd.Timedelta(hours=lookback_hours)
+    def has_pod_metrics(entity):
+        """Check if entity has actual pod metrics (not just NaN filled with 0)"""
+        if df_pod_cpu.empty and df_pod_mem.empty:
+            return False
+        has_cpu = False
+        has_mem = False
+        if not df_pod_cpu.empty:
+            pod_cpu_data = df_pod_cpu[(df_pod_cpu['timestamp'] >= start)]
+            if not pod_cpu_data.empty:
+                if 'entity' not in pod_cpu_data.columns:
+                    pod_cpu_data = pod_cpu_data.rename(columns={'instance': 'entity'})
+                has_cpu = entity in pod_cpu_data['entity'].values
+        if not df_pod_mem.empty:
+            pod_mem_data = df_pod_mem[(df_pod_mem['timestamp'] >= start)]
+            if not pod_mem_data.empty:
+                if 'entity' not in pod_mem_data.columns:
+                    pod_mem_data = pod_mem_data.rename(columns={'instance': 'entity'})
+                has_mem = entity in pod_mem_data['entity'].values
+        return has_cpu or has_mem
+    
+    feats['has_pod_metrics'] = feats['entity'].apply(has_pod_metrics)
     feats['instance_label'] = feats.apply(
         lambda row: canonical_node_label(row['entity'], with_ip=True, raw_label=row.get('raw_instance')),
         axis=1
@@ -2898,13 +3003,38 @@ def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
     if not anomalous.empty:
         # Keep the console output concise so on-call engineers can scan it quickly.
         print("\n⚠️  Anomalous nodes detected:")
+        print("   (Unusual resource pattern compared to cluster baseline - check values below)")
         display_cols = anomalous[['entity','raw_instance','host_cpu','host_mem','pod_cpu','pod_mem']].copy()
         display_cols['instance'] = display_cols.apply(
             lambda row: canonical_node_label(row['entity'], with_ip=True, raw_label=row.get('raw_instance')),
             axis=1
         )
-        print(display_cols[['instance','host_cpu','host_mem','pod_cpu','pod_mem']])
-        print("Action: investigate non-Kubernetes workload on these nodes.")
+        # Convert to percentages and format for readability
+        display_output = display_cols[['instance','host_cpu','host_mem','pod_cpu','pod_mem']].copy()
+        display_output['Host CPU %'] = (display_output['host_cpu'] * 100).round(1)
+        display_output['Host Mem %'] = (display_output['host_mem'] * 100).round(1)
+        display_output['Pod CPU %'] = (display_output['pod_cpu'] * 100).round(1)
+        display_output['Pod Mem %'] = (display_output['pod_mem'] * 100).round(1)
+        print(display_output[['instance', 'Host CPU %', 'Host Mem %', 'Pod CPU %', 'Pod Mem %']].to_string(index=False))
+        
+        # Provide context-aware action based on the pattern
+        print("\nAction:")
+        for _, row in display_output.iterrows():
+            host_cpu = row['Host CPU %']
+            host_mem = row['Host Mem %']
+            pod_cpu = row['Pod CPU %']
+            pod_mem = row['Pod Mem %']
+            instance = row['instance']
+            
+            if pod_cpu >= 90 or pod_mem >= 90:
+                print(f"  • {instance}: Pod resources saturated (CPU: {pod_cpu}%, Mem: {pod_mem}%) - investigate pod resource limits/requests")
+            elif host_cpu >= 60 or host_mem >= 70:
+                if pod_cpu < 30 and pod_mem < 30:
+                    print(f"  • {instance}: High host usage ({host_cpu}% CPU, {host_mem}% Mem) but low pod usage - likely non-Kubernetes workloads")
+                else:
+                    print(f"  • {instance}: High host usage ({host_cpu}% CPU, {host_mem}% Mem) - investigate system processes")
+            else:
+                print(f"  • {instance}: Unusual resource pattern - review workload distribution")
     else:
         print("\nNo anomalous nodes – host and pod usage aligned.")
 
@@ -2924,6 +3054,12 @@ def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
     plt.close()
 
     host_pressure_df = report_host_only_pressure(feats, return_df=True)
+    # Pass has_pod_metrics info to feats for host_pressure_df
+    if 'has_pod_metrics' in feats.columns and not host_pressure_df.empty:
+        # Merge has_pod_metrics info if available
+        if 'entity' in host_pressure_df.columns:
+            pod_metrics_map = feats.set_index('entity')['has_pod_metrics'].to_dict()
+            host_pressure_df['has_pod_metrics'] = host_pressure_df['entity'].map(pod_metrics_map).fillna(False)
 
     if FORCE_TRAINING_RUN:
         try:
@@ -2986,7 +3122,13 @@ def run_realtime_anomaly_watch(q_host_cpu, q_host_mem, q_pod_cpu, q_pod_mem,
                     print(f"[Watch #{idx+1} @ {ts_label}] ⚠️  {len(anomalies)} anomalies detected:")
                     display = anomalies.copy()
                     display['instance'] = anomalies.apply(lambda row: canonical_node_label(row['instance'], with_ip=True, raw_label=row.get('raw_instance')), axis=1)
-                    print(display[['instance','host_cpu','host_mem','pod_cpu','pod_mem']].to_string(index=False))
+                    # Convert to percentages and format for readability
+                    display_output = display[['instance','host_cpu','host_mem','pod_cpu','pod_mem']].copy()
+                    display_output['Host CPU %'] = (display_output['host_cpu'] * 100).round(1)
+                    display_output['Host Mem %'] = (display_output['host_mem'] * 100).round(1)
+                    display_output['Pod CPU %'] = (display_output['pod_cpu'] * 100).round(1)
+                    display_output['Pod Mem %'] = (display_output['pod_mem'] * 100).round(1)
+                    print(display_output[['instance', 'Host CPU %', 'Host Mem %', 'Pod CPU %', 'Pod Mem %']].to_string(index=False))
             except Exception as exc:
                 print(f"[Watch #{idx+1}] Failed to score anomalies: {exc}")
 
@@ -4134,12 +4276,13 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
     df_hcpu = fetch_and_preprocess_data(q_host_cpu)
     df_hmem = fetch_and_preprocess_data(q_host_mem)
     
+    host_saved = False
     if not os.path.exists(HOST_MODEL_PATH):
         print(f"⚠ Warning: Host model not found at {HOST_MODEL_PATH}")
         print("   Skipping host forecast. Run with --training flag first to train models.")
         host_fc = None
     else:
-        _, host_fc, _ = train_or_load_ensemble(
+        _, host_fc, _, host_saved = train_or_load_ensemble(
             df_hcpu,
             df_hmem,
             horizon_min=7*24*60,
@@ -4166,12 +4309,13 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
     summarize_instance_roles(df_hcpu, df_pcpu)
     print()
     
+    pod_saved = False
     if not os.path.exists(POD_MODEL_PATH):
         print(f"⚠ Warning: Pod model not found at {POD_MODEL_PATH}")
         print("   Skipping pod forecast. Run with --training flag first to train models.")
         pod_fc = None
     else:
-        _, pod_fc, _ = train_or_load_ensemble(
+        _, pod_fc, _, pod_saved = train_or_load_ensemble(
             df_pcpu,
             df_pmem,
             horizon_min=7*24*60,
@@ -4431,7 +4575,7 @@ if __name__ == "__main__":
 
     df_hcpu = fetch_and_preprocess_data(q_host_cpu)
     df_hmem = fetch_and_preprocess_data(q_host_mem)
-    _, host_fc, host_metrics = train_or_load_ensemble(
+    _, host_fc, host_metrics, host_saved = train_or_load_ensemble(
         df_hcpu,
         df_hmem,
         horizon_min=7*24*60,
@@ -4473,7 +4617,7 @@ if __name__ == "__main__":
     recanonicalize_entities(df_hcpu, df_hmem, df_pcpu, df_pmem)
     summarize_instance_roles(df_hcpu, df_pcpu)
     print()
-    _, pod_fc, pod_metrics = train_or_load_ensemble(
+    _, pod_fc, pod_metrics, pod_saved = train_or_load_ensemble(
         df_pcpu,
         df_pmem,
         horizon_min=7*24*60,
@@ -4517,8 +4661,18 @@ if __name__ == "__main__":
         dump_csv_dir=csv_dump_dir
     )
 
-    print(f"\nAll models saved: {HOST_MODEL_PATH}, {POD_MODEL_PATH}, {LSTM_MODEL_PATH}")
-    print("Dual-layer + LSTM + classification complete.")
+    # Print "models saved" message only when models were actually saved
+    if host_saved or pod_saved:
+        saved_models = []
+        if host_saved:
+            saved_models.append(HOST_MODEL_PATH)
+        if pod_saved:
+            saved_models.append(POD_MODEL_PATH)
+        # LSTM is saved as part of ensemble training, so include it if either host or pod was saved
+        if (host_saved or pod_saved) and LSTM_AVAILABLE:
+            saved_models.append(LSTM_MODEL_PATH)
+        print(f"\nAll models saved: {', '.join(saved_models)}")
+    print("\nDual-layer + LSTM + classification complete.")
 
     # ====================== DISK FULL PREDICTION — FULL TRANSPARENCY ======================
     print("\n" + "="*80)
