@@ -2010,17 +2010,17 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                         forecast = m.predict(future)
                         prophet_forecast_df = forecast
                         # Update forecast with minimal update
-                        over = forecast[forecast['yhat'] >= threshold_pct/100]
+                        # Only look at FUTURE forecast points (not historical)
+                        now_ts = pd.Timestamp.now()
+                        future_forecast = forecast[forecast['ds'] > now_ts]
+                        over = future_forecast[future_forecast['yhat'] >= threshold_pct/100]
                         if not over.empty:
-                            updated_prophet_days_calc = (over.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400
-                            # If already exceeded (negative or very close to 0), set to 0
-                            if updated_prophet_days_calc <= 0:
-                                updated_prophet_days = 0.0
-                            else:
-                                updated_prophet_days = updated_prophet_days_calc
+                            updated_prophet_days_calc = (over.iloc[0]['ds'] - now_ts).total_seconds() / 86400
+                            # Ensure non-negative (should always be positive for future points, but clamp anyway)
+                            updated_prophet_days = max(0.0, updated_prophet_days_calc)
                         else:
-                            # No forecast point exceeds threshold, keep existing value
-                            updated_prophet_days = cached_record.get('days_to_90pct', 9999.0)
+                            # No future forecast point exceeds threshold
+                            updated_prophet_days = 9999.0
                         # Update linear forecast too
                         daily_increase = train_ts.diff().resample('1D').mean().mean()
                         current_pct = ts.iloc[-1] * 100
@@ -2033,21 +2033,25 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                         else:
                             if daily_increase > 0.0001:
                                 updated_linear_days = (threshold_pct - current_pct) / (daily_increase * 100)
-                                updated_linear_days = max(0.1, updated_linear_days)
+                                # Ensure non-negative - if calculation gives negative, disk is not approaching threshold
+                                updated_linear_days = max(0.0, updated_linear_days)
+                                # If very small positive value, set to minimum 0.1 for display
+                                if 0 < updated_linear_days < 0.1:
+                                    updated_linear_days = 0.1
                             else:
                                 updated_linear_days = 9999.0
                             # Update hybrid forecast (min of linear and prophet)
                             updated_hybrid_days = min(updated_linear_days, updated_prophet_days)
                             
-                            # Ensure prophet_days is not negative
-                            if updated_prophet_days < 0:
-                                updated_prophet_days = 0.0
-                                updated_hybrid_days = min(updated_linear_days, 0.0)
-                        # Update cached record with fresh forecast
-                        cached_record['days_to_90pct'] = round(updated_hybrid_days, 1)
-                        cached_record['ensemble_eta'] = round(updated_hybrid_days, 1)
-                        cached_record['linear_eta'] = round(updated_linear_days, 1)
-                        cached_record['prophet_eta'] = round(updated_prophet_days, 1)
+                            # Ensure all values are non-negative
+                            updated_linear_days = max(0.0, updated_linear_days)
+                            updated_prophet_days = max(0.0, updated_prophet_days)
+                            updated_hybrid_days = max(0.0, updated_hybrid_days)
+                        # Update cached record with fresh forecast - ensure all values are non-negative
+                        cached_record['days_to_90pct'] = round(max(0.0, updated_hybrid_days), 1)
+                        cached_record['ensemble_eta'] = round(max(0.0, updated_hybrid_days), 1)
+                        cached_record['linear_eta'] = round(max(0.0, updated_linear_days), 1)
+                        cached_record['prophet_eta'] = round(max(0.0, updated_prophet_days), 1)
                         # Set alert severity - if already exceeded (0 days), mark as CRITICAL
                         if updated_hybrid_days <= 0:
                             cached_record['alert'] = "CRITICAL"
@@ -2146,8 +2150,13 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
             daily_increase = train_ts.diff().resample('1D').mean().mean()
             if daily_increase > 0.0001:  # 0.01% per day
                 linear_days = (threshold_pct - current_pct) / (daily_increase * 100)
-                linear_days = max(0.1, linear_days)
+                # Ensure non-negative - if calculation gives negative, disk is not approaching threshold
+                linear_days = max(0.0, linear_days)
+                # If very small positive value, set to minimum 0.1 for display
+                if 0 < linear_days < 0.1:
+                    linear_days = 0.1
             else:
+                # No significant increase, disk not approaching threshold
                 linear_days = 9999.0
         
         # Compute linear MAE on test set (only when retraining)
@@ -2204,16 +2213,20 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                 future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
                 forecast = m.predict(future)
                 prophet_forecast_df = forecast  # Store for plotting
-                over = forecast[forecast['yhat'] >= threshold_pct/100]
+                # Only look at FUTURE forecast points (not historical)
+                now_ts = pd.Timestamp.now()
+                future_forecast = forecast[forecast['ds'] > now_ts]
+                over = future_forecast[future_forecast['yhat'] >= threshold_pct/100]
                 if not over.empty:
-                    prophet_days_calc = (over.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400
-                    # If already exceeded (negative or very close to 0), set to 0
-                    if prophet_days_calc <= 0:
-                        prophet_days = 0.0
-                    else:
-                        prophet_days = prophet_days_calc
+                    prophet_days_calc = (over.iloc[0]['ds'] - now_ts).total_seconds() / 86400
+                    # Ensure non-negative (should always be positive for future points, but clamp anyway)
+                    prophet_days = max(0.0, prophet_days_calc)
+                else:
+                    # No future forecast point exceeds threshold
+                    prophet_days = 9999.0
             except:
-                prophet_days = linear_days
+                # Fallback to linear_days, but ensure it's non-negative
+                prophet_days = max(0.0, linear_days) if 'linear_days' in locals() else 9999.0
 
         # Compute ensemble MAE (min of linear and prophet) - only when retraining
         if needs_retrain:
@@ -2232,6 +2245,11 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
         if current_pct < threshold_pct:
             hybrid_days = min(linear_days, prophet_days)
             severity = "CRITICAL" if hybrid_days < 3 else "WARNING" if hybrid_days < 7 else "SOON" if hybrid_days < 30 else "OK"
+
+        # Ensure all values are non-negative before storing
+        linear_days = max(0.0, linear_days)
+        prophet_days = max(0.0, prophet_days)
+        hybrid_days = max(0.0, hybrid_days)
 
         if should_verbose():
             logger.info("Disk forecast done → node=%s mount=%s", node, mountpoint)
@@ -3095,7 +3113,9 @@ def predict_io_and_network_crisis_with_backtest(
             if trend_7d > 0:
                 remaining = threshold - current
                 divisor = trend_7d / 100 if units[name] == "ratio" else trend_7d
-                linear_eta = max(0.1, remaining / divisor)
+                linear_eta_calc = remaining / divisor
+                # Ensure non-negative
+                linear_eta = max(0.0, linear_eta_calc)
 
             # Prophet - use manifest (with _backtest suffix to avoid conflicts)
             key = f"{build_io_net_key(entity, name)}_backtest"
@@ -3231,10 +3251,12 @@ def predict_io_and_network_crisis_with_backtest(
             # Prophet ETA
             future_pred = forecast[forecast['ds'] > ts.index[-1]]
             crisis = future_pred[future_pred['yhat'] >= threshold]
-            prophet_eta = (crisis.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400 if not crisis.empty else 9999.0
+            prophet_eta_calc = (crisis.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400 if not crisis.empty else 9999.0
+            # Ensure non-negative
+            prophet_eta = max(0.0, prophet_eta_calc)
 
-            # Hybrid ETA
-            hybrid_eta = min(linear_eta, prophet_eta)
+            # Hybrid ETA - ensure non-negative
+            hybrid_eta = max(0.0, min(linear_eta, prophet_eta))
 
             # SEVERITY — ALWAYS DEFINED (this was the bug!)
             if hybrid_eta < 3:
@@ -3315,7 +3337,7 @@ def predict_io_and_network_crisis_with_backtest(
                     "signal": name.replace("_", " "),
                     "current": f"{current*100:.2f}%" if units[name] == "ratio" else f"{current/1e9:.2f} GB/s",
                     "mae": round(mae, 6),
-                    "hybrid_eta_days": round(hybrid_eta, 1),
+                    "hybrid_eta_days": round(max(0.0, hybrid_eta), 1),
                     "severity": severity
                 })
 
@@ -3632,7 +3654,9 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
             future_threshold = forecast_df[forecast_df['yhat'] >= res["threshold"]]
             eta_days = 9999.0
             if not future_threshold.empty:
-                eta_days = max(0.1, (future_threshold.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400)
+                eta_days_calc = (future_threshold.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400
+                # Ensure non-negative
+                eta_days = max(0.0, eta_days_calc)
 
             log_verbose(f"  Done → ETA: {eta_days:.1f} days | MAE: {metrics['mae_ensemble']:.6f}")
             
@@ -3652,7 +3676,7 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
                     "signal": res["name"].replace("_", " "),
                     "current": f"{current*100:.2f}%" if res["unit"] == "ratio" else f"{current/1e6:.1f} MB/s",
                     "mae_ensemble": round(metrics.get('mae_ensemble', 0.0), 6),
-                    "hybrid_eta_days": round(eta_days, 1),
+                    "hybrid_eta_days": round(max(0.0, eta_days), 1),
                     "severity": severity
                 })
 
