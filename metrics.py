@@ -1937,6 +1937,18 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
             # Ensure ensemble_eta exists (it's the same as days_to_90pct)
             if 'ensemble_eta' not in cached_record:
                 cached_record['ensemble_eta'] = cached_record.get('days_to_90pct', 9999.0)
+            
+            # Sanitize cached record: ensure all eta values are non-negative
+            # This fixes any negative values that might have been stored in previous runs
+            cached_record['days_to_90pct'] = max(0.0, cached_record.get('days_to_90pct', 9999.0))
+            cached_record['ensemble_eta'] = max(0.0, cached_record.get('ensemble_eta', 9999.0))
+            cached_record['linear_eta'] = max(0.0, cached_record.get('linear_eta', 9999.0))
+            cached_record['prophet_eta'] = max(0.0, cached_record.get('prophet_eta', 9999.0))
+            
+            # Update manifest with sanitized values to prevent future negative values
+            manifest[key] = cached_record
+            manifest_changed = True
+            
             alerts.append(cached_record)
             # Compute metrics for cached models if show_backtest is true
             if show_backtest:
