@@ -16,7 +16,7 @@ Metrics AI detects anomalies at **multiple levels** across the entire Kubernetes
 
 #### A. Classification Anomalies (IsolationForest)
 - **Level**: Individual node/host
-- **Method**: Unsupervised ML using IsolationForest
+- **Method**: Unsupervised ML using IsolationForest with per-cluster training
 - **Features Analyzed**:
   - `host_cpu` - Average host CPU usage (last 24h by default)
   - `host_mem` - Average host memory usage (last 24h)
@@ -24,15 +24,18 @@ Metrics AI detects anomalies at **multiple levels** across the entire Kubernetes
   - `pod_mem` - Average pod/container memory usage (last 24h)
 
 - **How It Works**:
-  1. Extracts average resource usage for each node over the lookback window (default: 24 hours)
-  2. Normalizes features using StandardScaler
-  3. Trains IsolationForest with contamination rate (default: 12%)
-  4. Flags nodes where host and pod usage patterns are misaligned
+  1. Identifies Kubernetes clusters and groups nodes by cluster membership
+  2. Extracts average resource usage for each node over the lookback window (default: 24 hours)
+  3. Normalizes features using StandardScaler per cluster
+  4. Trains separate IsolationForest models for each Kubernetes cluster with contamination rate (default: 12%)
+  5. Compares nodes only against their own cluster baseline (not global baseline)
+  6. Flags nodes where host and pod usage patterns are misaligned within their cluster context
+  7. Standalone nodes (no Kubernetes workloads) are excluded from anomaly detection
 
 - **What It Detects**:
   - Nodes with high host CPU/memory but low pod usage → **Non-Kubernetes workloads** (backups, cron jobs, daemons)
   - Nodes with low host usage but high pod usage → **Potential resource accounting issues**
-  - Nodes with unusual resource patterns compared to cluster baseline
+  - Nodes with unusual resource patterns compared to their cluster baseline (not global baseline)
 
 - **Output**: 
   - Anomaly label: `-1` (anomalous) or `1` (normal)
@@ -40,7 +43,7 @@ Metrics AI detects anomalies at **multiple levels** across the entire Kubernetes
   - Severity: `WARNING`
   - Includes: instance name, host_cpu, host_mem, pod_cpu, pod_mem values
 
-- **Scope**: **All nodes in the cluster** - compares each node against the cluster-wide pattern
+- **Scope**: **Per-cluster evaluation** - trains separate IsolationForest models per Kubernetes cluster, compares nodes only within their cluster. Requires minimum 2 nodes per cluster for comparison. Standalone nodes are excluded.
 
 ---
 
@@ -120,20 +123,41 @@ Metrics AI detects anomalies at **multiple levels** across the entire Kubernetes
 
 #### C. I/O + Network Anomaly Detection
 - **Level**: Per-node, per-signal
-- **Method**: Statistical deviation from ensemble forecast
-- **Status**: Currently a placeholder (line 3066-3068)
-  ```python
-  # Anomaly detection placeholder (you can expand later)
-  # is_anomaly = metrics.get('anomaly_score', 0) > 0.7
-  # if is_anomaly: ...
-  ```
+- **Method**: Statistical deviation from ensemble forecast with dual-threshold detection
+- **Status**: **Fully Implemented**
 
-- **Potential Implementation**:
-  - Compare actual values vs ensemble forecast
-  - Flag if deviation exceeds threshold (e.g., MAE > 0.7)
-  - Detect sudden spikes or drops that don't match predicted patterns
+- **How It Works**:
+  1. Compares recent actual values (last 24 hours) against ensemble forecast predictions
+  2. Calculates both absolute and percentage deviations from forecast baseline
+  3. Applies dual-threshold logic to reduce false positives:
+     - **Absolute thresholds**: Minimum meaningful differences (1% for I/O wait, 5 MB/s for network)
+     - **Percentage thresholds**: Relative deviations (50% for current, 30% for mean)
+  4. Considers model confidence (MAE) - high confidence models trigger fewer false positives
+  5. Only flags anomalies when:
+     - Significant absolute difference AND significant percentage deviation
+     - AND (value is actually concerning OR model confidence is low)
+  6. For very small baselines (< 1% I/O, < 5 MB/s network), uses absolute thresholds only (percentage is misleading)
 
-- **Scope**: **All nodes, per signal** - would be evaluated per node per signal
+- **Anomaly Conditions**:
+  - Current deviation > 50% from forecast baseline
+  - Mean deviation > 30% over recent window
+  - Spike/drop > 100% from baseline
+  - High MAE indicating model struggling to fit pattern
+  - **AND** actual value exceeds concerning threshold (5% for I/O wait, 30% of threshold for network)
+
+- **Anomaly Scoring**:
+  - Score range: 0.0 to 1.0 (higher = more anomalous)
+  - Severity classification:
+    - `CRITICAL`: Score > 0.8
+    - `WARNING`: Score 0.5-0.8
+    - `INFO`: Score < 0.5
+
+- **Output**:
+  - Alert type: `io_network_anomaly`
+  - Severity: `CRITICAL`, `WARNING`, or `INFO` (based on anomaly score)
+  - Includes: node, signal, current value, deviation percentage, anomaly score, MAE, human-readable description
+
+- **Scope**: **All nodes, per signal** - evaluated per node per signal with improved false positive reduction
 
 ---
 
@@ -165,23 +189,26 @@ Metrics AI detects anomalies at **multiple levels** across the entire Kubernetes
 
 | Detection Type | Level | Scope | Method |
 |----------------|-------|-------|--------|
-| **Classification Anomaly** | Node | All nodes in cluster | IsolationForest (ML) |
-| **Host Pressure** | Node | All nodes in cluster | Rule-based thresholds |
+| **Classification Anomaly** | Node | Per-cluster (min 2 nodes) | IsolationForest (ML, per-cluster) |
+| **Host Pressure** | Node | All nodes | Rule-based thresholds |
 | **Golden Signals** | Node + Signal | All nodes, 8 signal types | Prometheus query thresholds |
 | **I/O Network Crisis** | Node + Signal | All nodes, 2 signals | Ensemble forecast prediction |
-| **I/O Network Anomaly** | Node + Signal | All nodes, 2 signals | *Placeholder (not implemented)* |
+| **I/O Network Anomaly** | Node + Signal | All nodes, 2 signals | Statistical deviation (dual-threshold) |
 | **Disk Crisis** | Node + Mountpoint | All nodes, all mountpoints | Hybrid forecast prediction |
 
 ---
 
 ## How Anomalies Are Found Across the Entire System
 
-### 1. **Cluster-Wide Scanning**
-- **Classification Model**: Scans ALL nodes in the cluster simultaneously
+### 1. **Per-Cluster Scanning**
+- **Classification Model**: Scans nodes within each Kubernetes cluster separately
+  - Identifies cluster membership via Prometheus labels or pod instance patterns
   - Fetches host CPU/memory and pod CPU/memory for every node
-  - Builds a feature matrix: `[node1_features, node2_features, ..., nodeN_features]`
-  - Trains IsolationForest on the entire cluster
-  - Flags any node that deviates from cluster-wide patterns
+  - Groups nodes by cluster and trains separate IsolationForest models per cluster
+  - Builds feature matrices per cluster: `[cluster1_nodes], [cluster2_nodes], ...`
+  - Compares nodes only against their own cluster baseline (not global)
+  - Requires minimum 2 nodes per cluster for comparison
+  - Standalone nodes (no Kubernetes workloads) are excluded from anomaly detection
 
 ### 2. **Per-Node Evaluation**
 - **Golden Signals**: Queries Prometheus for each signal type, evaluates every instance
@@ -194,9 +221,10 @@ Metrics AI detects anomalies at **multiple levels** across the entire Kubernetes
 - **Forecast Horizon**: 7 days ahead
 
 ### 4. **Aggregation Strategy**
-- **Cluster-wide patterns**: Classification model compares nodes against each other
+- **Per-cluster patterns**: Classification model trains separate IsolationForest per Kubernetes cluster, compares nodes within their cluster only
 - **Per-node baselines**: I/O, Network, and Disk models learn individual node patterns
 - **Threshold-based**: Golden signals use fixed thresholds across all nodes
+- **Statistical deviation**: I/O/Network anomaly detection uses dual-threshold (absolute + percentage) with model confidence weighting
 
 ---
 
@@ -228,22 +256,34 @@ Key environment variables for anomaly detection:
 When `metrics.py --forecast` runs, it:
 
 1. **Fetches data** for all nodes from Prometheus
-2. **Classification Model**:
+2. **Cluster Identification**:
+   - Identifies Kubernetes clusters via Prometheus labels or pod instance patterns
+   - Classifies nodes as cluster members or standalone
+3. **Classification Model**:
    - Extracts features for all nodes
-   - Trains IsolationForest on cluster-wide data
-   - Flags anomalous nodes (e.g., "host02 has high host usage but low pod usage")
-3. **Host Pressure**:
+   - Trains separate IsolationForest models per Kubernetes cluster
+   - Compares nodes only within their cluster baseline
+   - Flags anomalous nodes (e.g., "host02 has high host usage but low pod usage compared to cluster baseline")
+   - Standalone nodes are excluded (require minimum 2 nodes per cluster)
+4. **Host Pressure**:
    - Checks each node individually
    - Flags nodes with host pressure (e.g., "pi has 84% host memory but only 2% pod memory")
-4. **Golden Signals**:
+5. **Golden Signals**:
    - Queries 8 signal types across all nodes
    - Flags any node/signal combination exceeding thresholds
-5. **I/O Network Crisis**:
+6. **I/O Network Crisis**:
    - For each node, for each signal (DISK_IO_WAIT, NET_TX_BW):
      - Loads or trains ensemble model
      - Forecasts 7 days ahead
      - Flags if threshold will be crossed within 30 days
-6. **Disk Crisis**:
+7. **I/O Network Anomaly**:
+   - For each node, for each signal (DISK_IO_WAIT, NET_TX_BW):
+     - Compares recent actual values (24h) vs ensemble forecast
+     - Calculates absolute and percentage deviations
+     - Applies dual-threshold logic (absolute + percentage)
+     - Considers model confidence (MAE)
+     - Flags anomalies with severity (CRITICAL/WARNING/INFO) and human-readable descriptions
+8. **Disk Crisis**:
    - For each node, for each mountpoint:
      - Loads or trains hybrid model
      - Forecasts 7 days ahead

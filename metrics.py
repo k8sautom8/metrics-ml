@@ -117,6 +117,15 @@ def get_forecast_plots_dir():
 # Get forecast plots directory (creates it if needed)
 FORECAST_PLOTS_DIR = get_forecast_plots_dir()
 
+# VM_URL must be set via environment variable - no hardcoded default
+# Example: export VM_URL="http://vm.example.com/api/v1/query_range"
+VM_BASE_URL = os.getenv("VM_URL")
+if not VM_BASE_URL:
+    print("ERROR: VM_URL environment variable is not set!")
+    print("Please set it to your VictoriaMetrics/Prometheus URL, e.g.:")
+    print('  export VM_URL="http://vm.example.com/api/v1/query_range"')
+    print("Exiting...")
+    sys.exit(1)
 VM_BASE_URL, VM_URL_DEFAULT = get_env_value("VM_URL", "http://vm.london.local/api/v1/query_range", str)
 HORIZON_MIN, HORIZON_DEFAULT = get_env_value("HORIZON_MIN", "15", int)
 LOOKBACK_HOURS, LOOKBACK_DEFAULT = get_env_value("LOOKBACK_HOURS", "24", int)
@@ -146,6 +155,8 @@ ANOMALY_MODEL_PATH = get_model_path("ANOMALY_MODEL_PATH", "isolation_forest_anom
 ANOMALY_SCALER_PATH = get_model_path("ANOMALY_SCALER_PATH", "isolation_forest_anomaly_scaler.pkl")
 HOST_MODEL_PATH = get_model_path("HOST_MODEL_PATH", "host_forecast.pkl")
 POD_MODEL_PATH = get_model_path("POD_MODEL_PATH", "pod_forecast.pkl")
+K8S_COMBINED_MODEL_PATH = get_model_path("K8S_COMBINED_MODEL_PATH", "k8s_combined_forecast.pkl")
+STANDALONE_MODEL_PATH = get_model_path("STANDALONE_MODEL_PATH", "standalone_forecast.pkl")
 LSTM_MODEL_PATH = get_model_path("LSTM_MODEL_PATH", "lstm_model.pkl")
 DISK_MODEL_MANIFEST_PATH = get_model_path("DISK_MODEL_MANIFEST_PATH", "disk_full_models.pkl")
 IO_NET_MODEL_MANIFEST_PATH = get_model_path("IO_NET_MODEL_MANIFEST_PATH", "io_net_models.pkl")
@@ -376,11 +387,33 @@ def canonical_identity(raw):
             except ValueError:
                 pass
             return alias
-    # reverse DNS fallback for bare IPs
+    
+    # Forward DNS lookup for hostnames (before reverse DNS for IPs)
     try:
         ipaddress.ip_address(cleaned)
+        is_ip = True
     except ValueError:
-        return cleaned or ident
+        is_ip = False
+    
+    if not is_ip:
+        # It's a hostname, try forward DNS lookup
+        if cleaned not in DNS_CACHE:
+            try:
+                fqdn = socket.gethostbyname_ex(cleaned)[0]
+                short = fqdn.split('.')[0].lower()
+                DNS_CACHE[cleaned] = short
+                # Also cache the IP if we can get it
+                try:
+                    ip = socket.gethostbyname(cleaned)
+                    track_source(short, ip)
+                except OSError:
+                    pass
+                return short
+            except (OSError, socket.gaierror):
+                DNS_CACHE[cleaned] = cleaned
+        return DNS_CACHE.get(cleaned, cleaned) or ident
+    
+    # reverse DNS fallback for bare IPs
     if cleaned in DNS_CACHE:
         return DNS_CACHE[cleaned]
     try:
@@ -521,6 +554,26 @@ def augment_aliases_from_dns(df_host, df_pod):
 
     pod_entities = set(df_pod['entity'].dropna().map(lambda x: str(x).lower()))
     new_entries = 0
+    
+    # Build a mapping of hostname -> FQDN short name for pod entities
+    pod_hostname_to_fqdn = {}
+    for pod_entity in pod_entities:
+        # Try forward DNS lookup for hostnames
+        try:
+            # Check if it's already an IP
+            ipaddress.ip_address(pod_entity)
+            continue  # Skip IPs, handle them via reverse DNS below
+        except ValueError:
+            pass  # It's a hostname, do forward lookup
+        
+        try:
+            fqdn = socket.gethostbyname_ex(pod_entity)[0]
+            short = fqdn.split('.')[0].lower()
+            pod_hostname_to_fqdn[pod_entity] = short
+        except (OSError, socket.gaierror):
+            pass  # DNS lookup failed, skip
+    
+    # Now match host IPs to pod entities via reverse DNS
     for raw_instance in df_host['instance'].dropna().unique():
         ident = canonical_node_label(raw_instance)
         if ident in INSTANCE_ALIAS_MAP:
@@ -532,12 +585,21 @@ def augment_aliases_from_dns(df_host, df_pod):
             continue
         try:
             fqdn = socket.gethostbyaddr(host_ip)[0]
+            short = fqdn.split('.')[0].lower()
+            # Check if this FQDN short name matches any pod entity (direct match or via hostname mapping)
+            if short in pod_entities:
+                INSTANCE_ALIAS_MAP[ident] = short
+                new_entries += 1
+            elif short in pod_hostname_to_fqdn.values():
+                # Find the pod entity that maps to this FQDN short name
+                for pod_entity, fqdn_short in pod_hostname_to_fqdn.items():
+                    if fqdn_short == short:
+                        INSTANCE_ALIAS_MAP[ident] = pod_entity
+                        INSTANCE_ALIAS_MAP[pod_entity] = short  # Bidirectional mapping
+                        new_entries += 1
+                        break
         except OSError:
             continue
-        short = fqdn.split('.')[0].lower()
-        if short in pod_entities:
-            INSTANCE_ALIAS_MAP[ident] = short
-            new_entries += 1
     if new_entries:
         log_verbose(f"DNS alias inference added {new_entries} entries.", level=1)
 
@@ -554,6 +616,10 @@ def recanonicalize_entities(*dfs):
                 register_source_identity(entity, raw_inst)
 
 def infer_aliases_from_timeseries(df_host_cpu, df_pod_cpu, corr_threshold=0.9, min_points=50):
+    """
+    Infer aliases by correlating host and pod CPU time series.
+    If two entities have highly correlated time series, they're likely the same node.
+    """
     if not AUTO_ALIAS_ENABLED or df_host_cpu.empty or df_pod_cpu.empty:
         return
 
@@ -705,11 +771,11 @@ def summarize_instance_roles(df_host, df_pod):
     host_only = sorted(host_instances - pod_instances)
     pod_only = sorted(pod_instances - host_instances)
 
-    print("\nCluster Topology Snapshot:")
-    print(f"  • Hosts reporting metrics        : {len(host_instances)}")
-    print(f"  • Hosts also running Kubernetes  : {len(hosts_with_pods)}")
-    print(f"  • Host-only nodes (no pods seen) : {len(host_only)}")
-    print(f"  • Pod-only metrics (no host data): {len(pod_only)}")
+    print("\nEstate Topology Snapshot:")
+    print(f"  • Total hosts reporting metrics        : {len(host_instances)}")
+    print(f"  • Hosts in Kubernetes clusters         : {len(hosts_with_pods)}")
+    print(f"  • Standalone hosts (no pods detected)  : {len(host_only)}")
+    print(f"  • Pod-only metrics (no host data)      : {len(pod_only)}")
     if should_verbose():
         if host_only:
             print(f"    ↳ Host-only sample: {', '.join(host_only[:6])}{' …' if len(host_only) > 6 else ''}")
@@ -1058,7 +1124,7 @@ def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_m
                 arima_data = joblib.load(arima_model_path)
                 cached_order = arima_data.get('order', (2, 1, 0))
                 # Use pre-trained model's order, but fit on latest data to incorporate recent trends
-                # This is a minimal update (not full retraining) - we use the same model structure
+                # Minimal update using same model structure (not full retraining)
                 arima = ARIMA(ts, order=cached_order).fit()
                 f_arima = arima.forecast(steps=forecast_periods)
                 f_arima.index = pd.date_range(start=ts.index[-1] + pd.Timedelta(minutes=1), periods=forecast_periods, freq='min')
@@ -1098,7 +1164,7 @@ def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_m
     
     # Load PRE-TRAINED LSTM model (knows patterns) and do minimal fine-tuning on latest data
     # Fine-tuning: train for just 1-2 epochs on recent data to incorporate latest trends
-    # This is a minimal update - uses learned patterns but adapts to recent changes
+    # Minimal update using learned patterns with recent changes
     f_lstm = f_arima.copy()  # fallback
     if LSTM_AVAILABLE and os.path.exists(LSTM_MODEL_PATH):
         try:
@@ -1175,7 +1241,7 @@ def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_m
     # Create forecast DataFrame using f_prophet's index (which is the forecast period)
     # f_prophet is already a Series with forecast_periods values starting from latest data point
     # We need to create a DataFrame that matches this, not the full future dataframe
-    forecast_ds = f_prophet.index  # This is the correct forecast timestamps
+    forecast_ds = f_prophet.index
     out = pd.DataFrame({
         'ds': forecast_ds,
         'yhat': f_prophet.values
@@ -1322,7 +1388,7 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
             # Generate backtest plots when show_backtest is True (even with cached models)
             if show_backtest:
                 # Retrain to generate backtest plots (but don't save forecast plots, only backtest plots)
-                # IMPORTANT: Don't save model files in show_backtest mode - only generate plots
+                # Don't save model files in show_backtest mode - only generate plots
                 log_verbose(f"Regenerating backtest plots for {model_path} (--show-backtest flag)")
                 result = build_ensemble_forecast_model(
                     df_cpu=df_cpu,
@@ -1677,7 +1743,7 @@ def calculate_error_budget(slo_target, compliance_percent):
         return None
     
     # Step 1: Calculate total error budget
-    # This is the maximum "unreliability" you can tolerate
+    # Maximum unreliability tolerance
     # Example: 99.95% SLO = 0.05% error budget
     total_budget = 100.0 - slo_target
     
@@ -1687,7 +1753,7 @@ def calculate_error_budget(slo_target, compliance_percent):
     budget_consumed = 100.0 - compliance_percent
     
     # Step 3: Calculate remaining budget
-    # This can be negative if you've exceeded your budget
+    # May be negative if budget exceeded
     budget_remaining = total_budget - budget_consumed
     
     # Clamp to 0.0 minimum (can't have negative budget remaining)
@@ -1796,7 +1862,7 @@ def format_sli_slo_report(sli_slo_results):
 def fetch_victoriametrics_metrics(query, start, end, step=STEP):
     params = {'query': query, 'start': start, 'end': end, 'step': step}
     try:
-        r = requests.get(VM_BASE_URL, params=params, timeout=30)
+        r = requests.get(VM_BASE_URL, params=params, timeout=30, verify=False)
         r.raise_for_status()
         data = r.json()
         if data['status'] != 'success':
@@ -1861,6 +1927,13 @@ def fetch_and_preprocess_data(query, start_hours_ago=START_HOURS_AGO, step=STEP)
     for col in ['mountpoint', 'filesystem']:
         if col in df.columns:
             group_cols.append(col)
+    # Preserve cluster labels and other important metadata
+    cluster_label_cols = ['cluster', 'cluster_id', 'cluster_name', 'cluster_label', 
+                         'kubernetes_cluster', 'k8s_cluster']
+    for col in cluster_label_cols:
+        if col in df.columns:
+            group_cols.append(col)
+    
     agg_spec = {
         'value':'mean',
         'hour':'first',
@@ -1871,8 +1944,7 @@ def fetch_and_preprocess_data(query, start_hours_ago=START_HOURS_AGO, step=STEP)
         agg_spec['raw_entity'] = 'first'
     if 'raw_instance' in df.columns:
         agg_spec['raw_instance'] = 'first'
-    # Note: mountpoint/filesystem are preserved automatically via group_cols
-    # They become part of the index and are restored by reset_index()
+    # mountpoint/filesystem and cluster labels are preserved via group_cols
     df = df.groupby(group_cols).agg(agg_spec).reset_index()
 
     log_verbose(f"Pre-processed {len(df)} rows.")
@@ -2614,7 +2686,7 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
         fut_b['is_weekend'] = (fut_b['ds'].dt.dayofweek >= 5).astype(int)
 
         prophet_pred_full = mb.predict(fut_b).set_index('ds')
-        # CRITICAL FIX: align to actual test timestamps (10m data has gaps!)
+        # Align to actual test timestamps (10m data may have gaps)
         prophet_full = mb.predict(fut_b).set_index('ds')
         p_back = prophet_full.reindex(test_ts.index, method='nearest')['yhat']
         # Ensure p_back is numeric and has no NaN/inf
@@ -2916,6 +2988,928 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
 # ----------------------------------------------------------------------
 # 3. CLASSIFICATION MODEL
 # ----------------------------------------------------------------------
+def identify_clusters(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, lookback_hours=LOOKBACK_HOURS):
+    """
+    Identify which nodes belong to which Kubernetes cluster.
+    
+    Strategy:
+    1. Try to extract explicit cluster labels from Prometheus data (if available)
+    2. If no explicit labels, infer clusters by grouping nodes that share pod instance patterns
+    3. Nodes with no pod metrics are considered standalone (not part of any cluster)
+    
+    Returns:
+        dict: Maps entity -> cluster_id (or 'standalone' for non-cluster nodes)
+    """
+    now = pd.Timestamp.now()
+    start = now - pd.Timedelta(hours=lookback_hours)
+    
+    cluster_map = {}
+    
+    # Step 1: Try to extract explicit cluster labels from Prometheus data
+    # Check if cluster labels exist in any of the dataframes
+    # IMPORTANT: Only assign nodes WITH PODS to clusters - nodes without pods are standalone
+    cluster_labels_found = False
+    
+    # First, identify which nodes have pods (these are the only ones that should be in clusters)
+    # IMPORTANT: Pod metrics have an 'instance' label that directly tells us which host the pod is on
+    # Use that directly instead of trying to match via IPs/DNS
+    nodes_with_pods = set()
+    nodes_with_pods_raw = {}  # Track raw -> canonical mapping for debug
+    pod_instance_to_host = {}  # Map pod entity -> host instance (from instance label)
+    if not df_pod_cpu.empty or not df_pod_mem.empty:
+        for df in [df_pod_cpu, df_pod_mem]:
+            if df.empty:
+                continue
+            recent_df = df[df['timestamp'] >= start] if 'timestamp' in df.columns else df
+            entity_col = 'entity' if 'entity' in recent_df.columns else 'instance'
+            
+            # Pod metrics 'instance' column contains the hostname where the pod is running
+            if 'instance' in recent_df.columns:
+                for _, row in recent_df.iterrows():
+                    pod_entity = row.get(entity_col)
+                    host_instance = row.get('instance')
+                    if pod_entity and host_instance:
+                        pod_canonical = canonical_identity(pod_entity)
+                        host_canonical = canonical_identity(host_instance)
+                        nodes_with_pods.add(host_canonical)
+                        nodes_with_pods_raw[host_canonical] = host_instance
+                        pod_instance_to_host[pod_canonical] = host_canonical
+            else:
+                # Fallback: if no instance column, use entity (old behavior)
+                for entity in recent_df[entity_col].unique():
+                    canonical = canonical_identity(entity)
+                    nodes_with_pods.add(canonical)
+                    nodes_with_pods_raw[canonical] = entity
+    
+    # Debug output
+    if VERBOSE_LEVEL >= 1:
+        print(f"\n[DEBUG] Nodes with pods (from pod metrics instance label): {sorted(nodes_with_pods)}")
+        print(f"[DEBUG] Raw pod instance -> canonical mapping: {nodes_with_pods_raw}")
+        if pod_instance_to_host:
+            print(f"[DEBUG] Pod entity -> host instance mapping: {pod_instance_to_host}")
+        print(f"[DEBUG] INSTANCE_ALIAS_MAP: {dict(list(INSTANCE_ALIAS_MAP.items())[:20])}")  # Show first 20 entries
+    
+    # Now check for cluster labels, but only assign nodes that have pods
+    for df in [df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem]:
+        if df.empty:
+            continue
+        recent_df = df[df['timestamp'] >= start] if 'timestamp' in df.columns else df
+        if recent_df.empty:
+            continue
+        
+        # Check for common cluster label names
+        cluster_label_candidates = ['cluster', 'cluster_id', 'cluster_name', 'cluster_label', 
+                                   'kubernetes_cluster', 'k8s_cluster']
+        for label in cluster_label_candidates:
+            if label in recent_df.columns:
+                cluster_labels_found = True
+                # Map entities to their cluster, but ONLY if they have pods
+                # Use 'entity' column first (already canonicalized by recanonicalize_entities)
+                # Fall back to 'instance' only if 'entity' is not available
+                # Process unique entities only (not all rows with timestamps)
+                found_entities = set()
+                missed_entities = set()
+                processed_entities = set()  # Track which entities we've already processed
+                
+                for _, row in recent_df.iterrows():
+                    entity = row.get('entity')
+                    if not entity:
+                        entity = row.get('instance')
+                    cluster_id = row.get(label)
+                    if entity and cluster_id:
+                        entity_normalized = canonical_identity(entity)
+                        # Only process each entity once
+                        if entity_normalized in processed_entities:
+                            continue
+                        processed_entities.add(entity_normalized)
+                        
+                        # Only assign to cluster if node has pods
+                        # Check canonicalized identity, and also check alias mapping and IP matching
+                        has_pods = False
+                        if entity_normalized in nodes_with_pods:
+                            has_pods = True
+                        else:
+                            # Check if this entity maps to a pod entity via alias mapping
+                            # e.g., 'pi' might map to 'host01' via INSTANCE_ALIAS_MAP
+                            if entity_normalized in INSTANCE_ALIAS_MAP:
+                                alias_target = canonical_identity(INSTANCE_ALIAS_MAP[entity_normalized])
+                                if alias_target in nodes_with_pods:
+                                    has_pods = True
+                                    # Update nodes_with_pods to include this entity too
+                                    nodes_with_pods.add(entity_normalized)
+                            
+                            # Also check reverse: if any pod entity maps to this entity
+                            if not has_pods:
+                                for pod_entity in list(nodes_with_pods):  # Use list to avoid modification during iteration
+                                    if pod_entity in INSTANCE_ALIAS_MAP:
+                                        if canonical_identity(INSTANCE_ALIAS_MAP[pod_entity]) == entity_normalized:
+                                            has_pods = True
+                                            nodes_with_pods.add(entity_normalized)
+                                            break
+                            
+                            # Also check IP matching via SOURCE_REGISTRY and CANON_SOURCE_MAP
+                            if not has_pods:
+                                # Get IP for this entity
+                                entity_ip = SOURCE_REGISTRY.get(entity_normalized) or CANON_SOURCE_MAP.get(entity_normalized)
+                                if entity_ip:
+                                    # Check if any pod entity has the same IP
+                                    for pod_entity in nodes_with_pods:
+                                        pod_ip = SOURCE_REGISTRY.get(pod_entity) or CANON_SOURCE_MAP.get(pod_entity)
+                                        if pod_ip and pod_ip == entity_ip:
+                                            has_pods = True
+                                            nodes_with_pods.add(entity_normalized)
+                                            break
+                        
+                        if has_pods:
+                            cluster_map[entity_normalized] = str(cluster_id)
+                            found_entities.add((entity, entity_normalized, cluster_id))
+                        else:
+                            missed_entities.add((entity, entity_normalized, cluster_id))
+                
+                # Debug output
+                if VERBOSE_LEVEL >= 1:
+                    df_name = 'host_cpu' if df is df_host_cpu else 'host_mem' if df is df_host_mem else 'pod_cpu' if df is df_pod_cpu else 'pod_mem' if df is df_pod_mem else 'unknown'
+                    print(f"\n[DEBUG] Cluster label '{label}' found in {df_name}")
+                    print(f"[DEBUG] Unique entities assigned to cluster: {sorted(found_entities)}")
+                    if missed_entities:
+                        print(f"[DEBUG] Unique entities NOT assigned (no pods or mismatch): {sorted(missed_entities)}")
+                        # Show why they're not matching
+                        for raw, canonical, cluster_id in sorted(missed_entities):
+                            in_pods = canonical in nodes_with_pods
+                            print(f"  - {raw} -> {canonical}: in nodes_with_pods={in_pods}")
+                    print(f"[DEBUG] All unique entities in this dataframe: {sorted(processed_entities)}")
+                    print(f"[DEBUG] Missing from nodes_with_pods: {sorted(processed_entities - nodes_with_pods)}")
+                
+                # Assign all nodes with pods to this cluster (including pod-only nodes)
+                cluster_id_value = None
+                for _, row in recent_df.iterrows():
+                    if row.get(label):
+                        cluster_id_value = str(row.get(label))
+                        break
+                
+                if cluster_id_value:
+                    # Assign all nodes with pods to this cluster (even if they weren't in this dataframe)
+                    # These are the authoritative hostnames from pod metrics instance labels
+                    nodes_missing_from_df = nodes_with_pods - processed_entities
+                    if nodes_missing_from_df:
+                        if VERBOSE_LEVEL >= 1:
+                            print(f"[DEBUG] Assigning {len(nodes_missing_from_df)} pod-only nodes to cluster '{cluster_id_value}': {sorted(nodes_missing_from_df)}")
+                        for node in nodes_missing_from_df:
+                            cluster_map[node] = cluster_id_value
+                    
+                    # Now match host entities to pod hostnames (from instance labels)
+                    # The pod instance labels are authoritative - match host entities to them
+                    host_only_entities = processed_entities - nodes_with_pods
+                    if host_only_entities:
+                        if VERBOSE_LEVEL >= 1:
+                            print(f"[DEBUG] Matching host entities to pod hostnames (from instance labels): {sorted(host_only_entities)}")
+                        
+                        for host_entity in host_only_entities:
+                            matched = False
+                            
+                            # First, try reverse DNS on ALL IPs to get the actual hostname
+                            host_ips_to_try = set()
+                            host_ip_reg = SOURCE_REGISTRY.get(host_entity) or CANON_SOURCE_MAP.get(host_entity)
+                            if host_ip_reg:
+                                host_ips_to_try.add(host_ip_reg)
+                            # Also get IPs from raw_instance
+                            for df_check in [df_host_cpu, df_host_mem]:
+                                if df_check.empty:
+                                    continue
+                                if 'timestamp' in df_check.columns:
+                                    check_df = df_check.loc[df_check['timestamp'] >= start].copy()
+                                else:
+                                    check_df = df_check.copy()
+                                if check_df.empty:
+                                    continue
+                                entity_col = 'entity' if 'entity' in check_df.columns else 'instance'
+                                matching_rows = check_df[check_df[entity_col].apply(canonical_identity) == host_entity]
+                                if not matching_rows.empty:
+                                    for col in ['raw_instance', 'raw_entity', 'instance']:
+                                        if col in matching_rows.columns:
+                                            for val in matching_rows[col].dropna().unique():
+                                                try:
+                                                    ip = str(val).split(':')[0]
+                                                    ipaddress.ip_address(ip)
+                                                    host_ips_to_try.add(ip)
+                                                except (ValueError, AttributeError):
+                                                    pass
+                            
+                            # Try reverse DNS on each IP
+                            for host_ip in host_ips_to_try:
+                                try:
+                                    reverse_hostname = socket.gethostbyaddr(host_ip)[0]
+                                    reverse_short = reverse_hostname.split('.')[0].lower()
+                                    reverse_canonical = canonical_identity(reverse_short)
+                                    if reverse_canonical in nodes_with_pods:
+                                        cluster_map[host_entity] = cluster_id_value
+                                        nodes_with_pods.add(host_entity)
+                                        matched = True
+                                        if VERBOSE_LEVEL >= 1:
+                                            print(f"[DEBUG] Reverse DNS matched: {host_entity} (IP {host_ip}) -> {reverse_short} -> {reverse_canonical}")
+                                        break
+                                except (OSError, socket.herror):
+                                    pass
+                            
+                            if matched:
+                                break
+                            
+                            if matched:
+                                continue
+                            
+                            # Try forward DNS resolution to get the actual hostname
+                            try:
+                                resolved_info = socket.gethostbyname_ex(host_entity)  # Returns (hostname, aliaslist, ipaddrlist)
+                                resolved_hostname = resolved_info[0]
+                                resolved_short = resolved_hostname.split('.')[0].lower()
+                                resolved_canonical = canonical_identity(resolved_short)
+                                if resolved_canonical in nodes_with_pods:
+                                    cluster_map[host_entity] = cluster_id_value
+                                    nodes_with_pods.add(host_entity)
+                                    matched = True
+                                    if VERBOSE_LEVEL >= 1:
+                                        print(f"[DEBUG] DNS resolved: {host_entity} -> {resolved_short} -> {resolved_canonical}")
+                                    break
+                            except (OSError, socket.gaierror):
+                                pass
+                            
+                            if matched:
+                                continue
+                            
+                            # Try alias matching - check if host_entity or its aliases match any pod hostname
+                            host_aliases = set([host_entity])
+                            if host_entity in INSTANCE_ALIAS_MAP:
+                                host_aliases.add(INSTANCE_ALIAS_MAP[host_entity])
+                            # Also check reverse: if any pod hostname maps to this host entity
+                            for pod_hostname, alias_target in INSTANCE_ALIAS_MAP.items():
+                                if alias_target == host_entity or canonical_identity(alias_target) == host_entity:
+                                    host_aliases.add(pod_hostname)
+                            
+                            # Check if any alias matches a pod hostname
+                            for alias in host_aliases:
+                                alias_canonical = canonical_identity(alias)
+                                if alias_canonical in nodes_with_pods:
+                                    cluster_map[host_entity] = cluster_id_value
+                                    nodes_with_pods.add(host_entity)
+                                    matched = True
+                                    if VERBOSE_LEVEL >= 1:
+                                        print(f"[DEBUG] Alias matched: {host_entity} (via alias {alias}) -> {alias_canonical}")
+                                    break
+                            
+                            if matched:
+                                continue
+                            
+                            # Pattern matching removed: If metrics don't return worker01/02/03 names,
+                            # we shouldn't create them via DNS and then try to match them.
+                            # Instead, we rely on IP-based matching and pod instance labels below.
+                            
+                            # If not matched, try IP-based matching
+                            # Extract ALL IPs from raw_instance for both host and pod entities
+                            if not matched:
+                                # Get host IPs from multiple sources
+                                host_ips = set()
+                                host_ip_reg = SOURCE_REGISTRY.get(host_entity) or CANON_SOURCE_MAP.get(host_entity)
+                                if host_ip_reg:
+                                    host_ips.add(host_ip_reg)
+                                
+                                # Extract IPs from raw_instance in host dataframes
+                                for df_check in [df_host_cpu, df_host_mem]:
+                                    if df_check.empty:
+                                        continue
+                                    if 'timestamp' in df_check.columns:
+                                        check_df = df_check.loc[df_check['timestamp'] >= start].copy()
+                                    else:
+                                        check_df = df_check.copy()
+                                    if check_df.empty:
+                                        continue
+                                    entity_col = 'entity' if 'entity' in check_df.columns else 'instance'
+                                    matching_rows = check_df[check_df[entity_col].apply(canonical_identity) == host_entity]
+                                    if not matching_rows.empty:
+                                        # Extract from raw_instance column - get ALL unique values
+                                        if 'raw_instance' in matching_rows.columns:
+                                            raw_instances = matching_rows['raw_instance'].dropna().unique()
+                                            if VERBOSE_LEVEL >= 1 and host_entity == 'pi':
+                                                print(f"[DEBUG] Found {len(raw_instances)} raw_instance values for {host_entity}: {list(raw_instances)}")
+                                            for raw_inst in raw_instances:
+                                                try:
+                                                    raw_ip = str(raw_inst).split(':')[0]
+                                                    ipaddress.ip_address(raw_ip)  # Validate it's an IP
+                                                    host_ips.add(raw_ip)
+                                                except (ValueError, AttributeError):
+                                                    pass
+                                        # Also try raw_entity column
+                                        if 'raw_entity' in matching_rows.columns:
+                                            for raw_ent in matching_rows['raw_entity'].dropna().unique():
+                                                try:
+                                                    raw_ip = str(raw_ent).split(':')[0]
+                                                    ipaddress.ip_address(raw_ip)
+                                                    host_ips.add(raw_ip)
+                                                except (ValueError, AttributeError):
+                                                    pass
+                                        # Also check if instance column has IPs
+                                        if 'instance' in matching_rows.columns:
+                                            for inst in matching_rows['instance'].dropna().unique():
+                                                try:
+                                                    inst_ip = str(inst).split(':')[0]
+                                                    ipaddress.ip_address(inst_ip)
+                                                    host_ips.add(inst_ip)
+                                                except (ValueError, AttributeError):
+                                                    pass
+                                
+                                if VERBOSE_LEVEL >= 1:
+                                    print(f"[DEBUG] Checking IPs for {host_entity}: {sorted(host_ips)}")
+                                
+                                if host_ips:
+                                    for pod_entity in nodes_with_pods:
+                                        # Get pod IPs from multiple sources
+                                        pod_ips = set()
+                                        pod_ip_reg = SOURCE_REGISTRY.get(pod_entity) or CANON_SOURCE_MAP.get(pod_entity)
+                                        if pod_ip_reg:
+                                            pod_ips.add(pod_ip_reg)
+                                        
+                                        # Extract IP from raw_instance
+                                        pod_raw = nodes_with_pods_raw.get(pod_entity)
+                                        if pod_raw:
+                                            try:
+                                                pod_raw_str = str(pod_raw)
+                                                if ':' in pod_raw_str:
+                                                    pod_ip_candidate = pod_raw_str.split(':')[0]
+                                                    ipaddress.ip_address(pod_ip_candidate)
+                                                    pod_ips.add(pod_ip_candidate)
+                                            except (ValueError, AttributeError):
+                                                pass
+                                        
+                                        # Also extract from pod dataframes
+                                        # For pod entities, the 'instance' column contains the hostname
+                                        # We need to find that hostname in host dataframes to get its IP
+                                        pod_hostname = nodes_with_pods_raw.get(pod_entity)
+                                        if pod_hostname:
+                                            # Try to find this hostname in host dataframes to get its IP
+                                            for df_check in [df_host_cpu, df_host_mem]:
+                                                if df_check.empty:
+                                                    continue
+                                                if 'timestamp' in df_check.columns:
+                                                    check_df = df_check.loc[df_check['timestamp'] >= start].copy()
+                                                else:
+                                                    check_df = df_check.copy()
+                                                if check_df.empty:
+                                                    continue
+                                                entity_col = 'entity' if 'entity' in check_df.columns else 'instance'
+                                                # Match by canonical identity
+                                                pod_hostname_canonical = canonical_identity(pod_hostname)
+                                                matching_rows = check_df[check_df[entity_col].apply(canonical_identity) == pod_hostname_canonical]
+                                                if not matching_rows.empty:
+                                                    # Extract IPs from this host's raw_instance
+                                                    if 'raw_instance' in matching_rows.columns:
+                                                        for raw_inst in matching_rows['raw_instance'].dropna().unique():
+                                                            try:
+                                                                raw_ip = str(raw_inst).split(':')[0]
+                                                                ipaddress.ip_address(raw_ip)
+                                                                pod_ips.add(raw_ip)
+                                                            except (ValueError, AttributeError):
+                                                                pass
+                                                    if 'raw_entity' in matching_rows.columns:
+                                                        for raw_ent in matching_rows['raw_entity'].dropna().unique():
+                                                            try:
+                                                                raw_ip = str(raw_ent).split(':')[0]
+                                                                ipaddress.ip_address(raw_ip)
+                                                                pod_ips.add(raw_ip)
+                                                            except (ValueError, AttributeError):
+                                                                pass
+                                                    if 'instance' in matching_rows.columns:
+                                                        for inst in matching_rows['instance'].dropna().unique():
+                                                            try:
+                                                                inst_ip = str(inst).split(':')[0]
+                                                                ipaddress.ip_address(inst_ip)
+                                                                pod_ips.add(inst_ip)
+                                                            except (ValueError, AttributeError):
+                                                                pass
+                                        
+                                        if VERBOSE_LEVEL >= 1:
+                                            print(f"[DEBUG]   Comparing with {pod_entity}: {sorted(pod_ips)}")
+                                        
+                                        # Match if ANY IP overlaps - if there's any common IP, they're the same node
+                                        matching_ips = host_ips.intersection(pod_ips)
+                                        if matching_ips:
+                                            cluster_map[host_entity] = cluster_id_value
+                                            nodes_with_pods.add(host_entity)
+                                            matched = True
+                                            if VERBOSE_LEVEL >= 1:
+                                                print(f"[DEBUG] IP matched: {host_entity} ({sorted(matching_ips)}) -> {pod_entity} ({sorted(pod_ips)})")
+                                            break
+                                
+                                # If still not matched and we have raw_instance, try to extract IP from it
+                                if not matched:
+                                    # Try to find the raw instance value for this entity
+                                    for df_check in [df_host_cpu, df_host_mem]:
+                                        if df_check.empty:
+                                            continue
+                                        if 'timestamp' in df_check.columns:
+                                            check_df = df_check.loc[df_check['timestamp'] >= start].copy()
+                                        else:
+                                            check_df = df_check.copy()
+                                        if check_df.empty:
+                                            continue
+                                        # Find rows with this entity
+                                        entity_col = 'entity' if 'entity' in check_df.columns else 'instance'
+                                        matching_rows = check_df[check_df[entity_col].apply(canonical_identity) == host_entity]
+                                        if not matching_rows.empty and 'raw_instance' in matching_rows.columns:
+                                            raw_inst = matching_rows['raw_instance'].iloc[0]
+                                            if raw_inst:
+                                                # Extract IP from raw_instance (format: "IP:PORT", e.g., "192.168.1.100:9100")
+                                                try:
+                                                    raw_ip = str(raw_inst).split(':')[0]
+                                                    ipaddress.ip_address(raw_ip)  # Validate it's an IP
+                                                    # Now check if any pod entity has this IP
+                                                    for pod_entity in nodes_with_pods:
+                                                        pod_raw = nodes_with_pods_raw.get(pod_entity)
+                                                        if pod_raw:
+                                                            pod_raw_ip = str(pod_raw).split(':')[0] if ':' in str(pod_raw) else str(pod_raw)
+                                                            try:
+                                                                ipaddress.ip_address(pod_raw_ip)
+                                                                if pod_raw_ip == raw_ip:
+                                                                    cluster_map[host_entity] = cluster_id_value
+                                                                    nodes_with_pods.add(host_entity)
+                                                                    matched = True
+                                                                    if VERBOSE_LEVEL >= 1:
+                                                                        print(f"[DEBUG] Raw IP matched: {host_entity} ({raw_ip}) -> {pod_entity} ({pod_raw_ip})")
+                                                                    break
+                                                            except ValueError:
+                                                                pass
+                                                    if matched:
+                                                        break
+                                                except (ValueError, AttributeError):
+                                                    pass
+                    
+                    # Final fallback: if we have unmatched host entities, try to match them to pod entities
+                    # that are already assigned to the cluster (pod-only nodes)
+                    if host_only_entities:
+                        unmatched_host = [e for e in host_only_entities if e not in cluster_map or cluster_map.get(e) == 'standalone']
+                        # Get pod entities that are assigned to this cluster but not in host dataframes
+                        pod_only_in_cluster = [e for e in nodes_with_pods if e not in processed_entities and cluster_map.get(e) == cluster_id_value]
+                        if len(unmatched_host) > 0 and len(pod_only_in_cluster) > 0:
+                            if VERBOSE_LEVEL >= 1:
+                                print(f"[DEBUG] Fallback: Attempting to match {len(unmatched_host)} unmatched host entities to {len(pod_only_in_cluster)} pod-only entities")
+                            
+                            # For each pod-only node, try to get its IP by looking it up in host dataframes
+                            # Then match unmatched hosts to pod-only nodes by IP or DNS
+                            for pod_hostname in pod_only_in_cluster:
+                                pod_ips = set()
+                                # Try to find this pod hostname in host dataframes to get its IP
+                                for df_check in [df_host_cpu, df_host_mem]:
+                                    if df_check.empty:
+                                        continue
+                                    if 'timestamp' in df_check.columns:
+                                        check_df = df_check.loc[df_check['timestamp'] >= start].copy()
+                                    else:
+                                        check_df = df_check.copy()
+                                    if check_df.empty:
+                                        continue
+                                    entity_col = 'entity' if 'entity' in check_df.columns else 'instance'
+                                    pod_canonical = canonical_identity(pod_hostname)
+                                    matching_rows = check_df[check_df[entity_col].apply(canonical_identity) == pod_canonical]
+                                    if not matching_rows.empty:
+                                        # Extract IPs
+                                        for col in ['raw_instance', 'raw_entity', 'instance']:
+                                            if col in matching_rows.columns:
+                                                for val in matching_rows[col].dropna().unique():
+                                                    try:
+                                                        ip = str(val).split(':')[0]
+                                                        ipaddress.ip_address(ip)
+                                                        pod_ips.add(ip)
+                                                    except (ValueError, AttributeError):
+                                                        pass
+                                
+                                # Also try DNS lookup for pod hostname to get ALL its IPs
+                                try:
+                                    pod_dns_info = socket.gethostbyname_ex(pod_hostname)
+                                    # pod_dns_info[2] is the list of IP addresses
+                                    for ip in pod_dns_info[2]:
+                                        try:
+                                            ipaddress.ip_address(ip)
+                                            pod_ips.add(ip)
+                                        except ValueError:
+                                            pass
+                                    # Also try reverse DNS on each IP to see if it matches any unmatched host
+                                    for ip in pod_dns_info[2]:
+                                        try:
+                                            reverse_hostname = socket.gethostbyaddr(ip)[0]
+                                            reverse_short = reverse_hostname.split('.')[0].lower()
+                                            reverse_canonical = canonical_identity(reverse_short)
+                                            # Check if this reverse DNS matches any unmatched host
+                                            for host_e_check in unmatched_host:
+                                                if reverse_canonical == canonical_identity(host_e_check):
+                                                    cluster_map[host_e_check] = cluster_id_value
+                                                    nodes_with_pods.add(host_e_check)
+                                                    if VERBOSE_LEVEL >= 1:
+                                                        print(f"[DEBUG] Fallback reverse DNS matched: {host_e_check} <-> {pod_hostname} (via IP {ip} -> {reverse_short})")
+                                                    break
+                                        except (OSError, socket.herror):
+                                            pass
+                                except (OSError, socket.gaierror):
+                                    pass
+                                
+                                # Now try to match unmatched hosts to this pod hostname
+                                for host_e in unmatched_host:
+                                    if host_e in cluster_map and cluster_map.get(host_e) != 'standalone':
+                                        continue
+                                    
+                                    # Get host IPs
+                                    host_ips = set()
+                                    host_ip_reg = SOURCE_REGISTRY.get(host_e) or CANON_SOURCE_MAP.get(host_e)
+                                    if host_ip_reg:
+                                        host_ips.add(host_ip_reg)
+                                    # Extract from host dataframes
+                                    for df_check in [df_host_cpu, df_host_mem]:
+                                        if df_check.empty:
+                                            continue
+                                        if 'timestamp' in df_check.columns:
+                                            check_df = df_check.loc[df_check['timestamp'] >= start].copy()
+                                        else:
+                                            check_df = df_check.copy()
+                                        if check_df.empty:
+                                            continue
+                                        entity_col = 'entity' if 'entity' in check_df.columns else 'instance'
+                                        matching_rows = check_df[check_df[entity_col].apply(canonical_identity) == host_e]
+                                        if not matching_rows.empty:
+                                            for col in ['raw_instance', 'raw_entity', 'instance']:
+                                                if col in matching_rows.columns:
+                                                    for val in matching_rows[col].dropna().unique():
+                                                        try:
+                                                            ip = str(val).split(':')[0]
+                                                            ipaddress.ip_address(ip)
+                                                            host_ips.add(ip)
+                                                        except (ValueError, AttributeError):
+                                                            pass
+                                    
+                                    # Match if any IP overlaps (excluding LB IPs if we have other IPs)
+                                    matching_ips = host_ips.intersection(pod_ips)
+                                    if matching_ips:
+                                        cluster_map[host_e] = cluster_id_value
+                                        nodes_with_pods.add(host_e)
+                                        if VERBOSE_LEVEL >= 1:
+                                            print(f"[DEBUG] Fallback IP matched: {host_e} ({sorted(matching_ips)}) -> {pod_hostname} ({sorted(pod_ips)})")
+                                        break
+                                
+                            # Final fallback: try reverse DNS on host IPs to match pod hostnames
+                            for host_e in unmatched_host:
+                                if host_e in cluster_map and cluster_map.get(host_e) != 'standalone':
+                                    continue
+                                
+                                # Get all IPs for this host
+                                host_ips_to_check = set()
+                                host_ip_reg = SOURCE_REGISTRY.get(host_e) or CANON_SOURCE_MAP.get(host_e)
+                                if host_ip_reg:
+                                    host_ips_to_check.add(host_ip_reg)
+                                # Extract from host dataframes
+                                for df_check in [df_host_cpu, df_host_mem]:
+                                    if df_check.empty:
+                                        continue
+                                    if 'timestamp' in df_check.columns:
+                                        check_df = df_check.loc[df_check['timestamp'] >= start].copy()
+                                    else:
+                                        check_df = df_check.copy()
+                                    if check_df.empty:
+                                        continue
+                                    entity_col = 'entity' if 'entity' in check_df.columns else 'instance'
+                                    matching_rows = check_df[check_df[entity_col].apply(canonical_identity) == host_e]
+                                    if not matching_rows.empty:
+                                        for col in ['raw_instance', 'raw_entity', 'instance']:
+                                            if col in matching_rows.columns:
+                                                for val in matching_rows[col].dropna().unique():
+                                                    try:
+                                                        ip = str(val).split(':')[0]
+                                                        ipaddress.ip_address(ip)
+                                                        host_ips_to_check.add(ip)
+                                                    except (ValueError, AttributeError):
+                                                        pass
+                                
+                                # Try reverse DNS on each IP to see if it resolves to any pod hostname
+                                for host_ip in host_ips_to_check:
+                                    try:
+                                        reverse_hostname = socket.gethostbyaddr(host_ip)[0]
+                                        reverse_short = reverse_hostname.split('.')[0].lower()
+                                        reverse_canonical = canonical_identity(reverse_short)
+                                        # Check if this matches any pod-only node
+                                        if reverse_canonical in pod_only_in_cluster:
+                                            cluster_map[host_e] = cluster_id_value
+                                            nodes_with_pods.add(host_e)
+                                            if VERBOSE_LEVEL >= 1:
+                                                print(f"[DEBUG] Fallback reverse DNS matched: {host_e} (IP {host_ip}) -> {reverse_short} -> {reverse_canonical}")
+                                            break
+                                    except (OSError, socket.herror):
+                                        pass
+                                
+                                if host_e in cluster_map and cluster_map.get(host_e) == cluster_id_value:
+                                    break
+                            
+                            # Final fallback: if exactly 1 unmatched host and 1 pod-only node, match them
+                            unmatched_after_dns = [e for e in unmatched_host if e not in cluster_map or cluster_map.get(e) == 'standalone']
+                            pod_only_remaining = [e for e in pod_only_in_cluster if e not in [cluster_map.get(h) for h in unmatched_host if h in cluster_map]]
+                            
+                            if len(unmatched_after_dns) == 1 and len(pod_only_remaining) == 1:
+                                host_e = unmatched_after_dns[0]
+                                pod_e = pod_only_remaining[0]
+                                # Only match if host has cluster label (meaning it's supposed to be in cluster)
+                                if host_e not in cluster_map or cluster_map.get(host_e) == 'standalone':
+                                    cluster_map[host_e] = cluster_id_value
+                                    nodes_with_pods.add(host_e)
+                                    if VERBOSE_LEVEL >= 1:
+                                        print(f"[DEBUG] Fallback 1:1 matched: {host_e} -> {pod_e} (both have cluster label)")
+                                    break
+                            
+                            # Ultimate fallback: if host has cluster label and there are pod-only nodes, match it
+                            # This handles cases where all other matching methods fail but the host is definitely in the cluster
+                            unmatched_final = [e for e in unmatched_host if e not in cluster_map or cluster_map.get(e) == 'standalone']
+                            # Recalculate pod_only_in_cluster to exclude nodes that were just matched
+                            # A pod-only node should only be in this list if:
+                            # 1. It's in nodes_with_pods (has pods)
+                            # 2. It's not in processed_entities (no host metrics) - this is the key: pod-only nodes
+                            # 3. It's assigned to this cluster
+                            # 4. It's NOT already matched to a HOST entity (i.e., no host entity from processed_entities that matches it)
+                            pod_only_candidates = [e for e in nodes_with_pods if e not in processed_entities and cluster_map.get(e) == cluster_id_value]
+                            # Filter out pod-only nodes that are already matched to HOST entities (not pod-only nodes)
+                            pod_only_remaining_final = []
+                            for pod_candidate in pod_only_candidates:
+                                pod_canonical = canonical_identity(pod_candidate)
+                                is_matched = False
+                                # Check if any HOST entity (from processed_entities, not pod-only) in cluster_map matches this pod node
+                                for host_entity in cluster_map:
+                                    # Only check host entities (those in processed_entities), not pod-only nodes
+                                    if (cluster_map.get(host_entity) == cluster_id_value and 
+                                        host_entity != pod_candidate and 
+                                        host_entity in processed_entities):
+                                        host_canonical = canonical_identity(host_entity)
+                                        # Direct match
+                                        if host_canonical == pod_canonical:
+                                            is_matched = True
+                                            break
+                                if not is_matched:
+                                    pod_only_remaining_final.append(pod_candidate)
+                            
+                            if VERBOSE_LEVEL >= 1:
+                                print(f"[DEBUG] Ultimate fallback check: {len(unmatched_final)} unmatched hosts, {len(pod_only_remaining_final)} pod-only nodes remaining")
+                                if unmatched_final:
+                                    print(f"[DEBUG]   Unmatched hosts: {unmatched_final}")
+                                if pod_only_remaining_final:
+                                    print(f"[DEBUG]   Pod-only nodes remaining: {pod_only_remaining_final}")
+                            
+                            if unmatched_final and pod_only_remaining_final:
+                                # Find which pod-only nodes are already matched to host entities (to avoid double-matching)
+                                # A pod-only node is "matched" if a host entity with the same canonical identity exists in cluster_map
+                                matched_pod_nodes = set()
+                                # Only check HOST entities (from processed_entities), not pod-only nodes
+                                for host_entity in cluster_map:
+                                    if (cluster_map.get(host_entity) == cluster_id_value and 
+                                        host_entity in processed_entities):  # Only host entities, not pod-only
+                                        host_canonical = canonical_identity(host_entity)
+                                        for pod_node in pod_only_remaining_final:
+                                            pod_canonical = canonical_identity(pod_node)
+                                            # Direct canonical match
+                                            if host_canonical == pod_canonical:
+                                                matched_pod_nodes.add(pod_node)
+                                                if VERBOSE_LEVEL >= 1:
+                                                    print(f"[DEBUG]   Direct match: {host_entity} ({host_canonical}) == {pod_node} ({pod_canonical})")
+                                            # Pattern matching removed: We match based on what metrics actually return,
+                                            # not on DNS-derived names that may not exist in the metrics.
+                                
+                                # Only match to pod-only nodes that aren't already matched
+                                remaining_pod_only = [p for p in pod_only_remaining_final if p not in matched_pod_nodes]
+                                
+                                if VERBOSE_LEVEL >= 1:
+                                    print(f"[DEBUG]   Already matched pod nodes: {matched_pod_nodes}")
+                                    print(f"[DEBUG]   Remaining pod-only nodes for matching: {remaining_pod_only}")
+                                
+                                # Match unmatched hosts to remaining pod-only nodes
+                                for host_e in unmatched_final:
+                                    if remaining_pod_only:
+                                        # Match to the first remaining pod-only node
+                                        pod_match = remaining_pod_only[0]
+                                        # Use the pod_match as the canonical identity to avoid double-counting
+                                        # Create alias to prevent double-counting
+                                        pod_match_canonical = canonical_identity(pod_match)
+                                        cluster_map[host_e] = cluster_id_value
+                                        # Also map host_e to pod_match_canonical in alias map for deduplication
+                                        INSTANCE_ALIAS_MAP[canonical_identity(host_e)] = pod_match_canonical
+                                        nodes_with_pods.add(host_e)
+                                        matched_pod_nodes.add(pod_match)
+                                        remaining_pod_only.remove(pod_match)
+                                        if VERBOSE_LEVEL >= 1:
+                                            print(f"[DEBUG] Ultimate fallback matched: {host_e} -> {pod_match} (host has cluster label, alias created)")
+                                    else:
+                                        # No remaining pod-only nodes, can't match
+                                        if VERBOSE_LEVEL >= 1:
+                                            print(f"[DEBUG] Ultimate fallback: No remaining pod-only nodes to match {host_e}")
+                                        break
+                
+                break
+        if cluster_labels_found:
+            break
+    
+    # Step 2: If no explicit cluster labels, try to query kube_pod_info and kube_node_info for cluster identification
+    if not cluster_labels_found:
+        try:
+            now_ts = int(pd.Timestamp.now().timestamp())
+            start_ts = int((pd.Timestamp.now() - pd.Timedelta(hours=lookback_hours)).timestamp())
+            
+            # First try kube_pod_info - it has pod-to-node mapping and may have cluster labels
+            kube_pod_query = 'kube_pod_info'
+            kube_pod_df = fetch_victoriametrics_metrics(
+                query=kube_pod_query,
+                start=start_ts,
+                end=now_ts,
+                step="60s"
+            )
+            
+            if not kube_pod_df.empty:
+                # Check for cluster labels in kube_pod_info
+                cluster_label_candidates = ['cluster', 'cluster_id', 'cluster_name', 'cluster_label',
+                                           'kubernetes_cluster', 'k8s_cluster', 'label_cluster']
+                for label in cluster_label_candidates:
+                    if label in kube_pod_df.columns:
+                        cluster_labels_found = True
+                        # Map nodes to their cluster via pod-to-node mapping
+                        # Only assign nodes that have pods (nodes_with_pods set)
+                        for _, row in kube_pod_df.iterrows():
+                            node_entity = row.get('node') or row.get('instance')
+                            cluster_id = row.get(label)
+                            if node_entity and cluster_id:
+                                node_entity = canonical_identity(node_entity)
+                                # Only assign to cluster if node has pods (check canonicalized identity)
+                                if node_entity in nodes_with_pods:
+                                    cluster_map[node_entity] = str(cluster_id)
+                        if cluster_labels_found:
+                            break
+                
+                # If no cluster label but we have pod info, infer clusters by grouping nodes that share pods
+                # Nodes in the same cluster typically share system pods (kube-system namespace)
+                if not cluster_labels_found and 'node' in kube_pod_df.columns:
+                    # Build node-to-pods mapping
+                    node_to_pods = {}
+                    for _, row in kube_pod_df.iterrows():
+                        node = row.get('node')
+                        pod = row.get('pod') or row.get('name')
+                        namespace = row.get('namespace', '')
+                        if node and pod:
+                            node_normalized = canonical_identity(node)
+                            if node_normalized not in node_to_pods:
+                                node_to_pods[node_normalized] = {'pods': set(), 'namespaces': set()}
+                            node_to_pods[node_normalized]['pods'].add(str(pod))
+                            if namespace:
+                                node_to_pods[node_normalized]['namespaces'].add(str(namespace))
+                    
+                    if len(node_to_pods) > 0:
+                        # Group nodes into clusters based on pod sharing
+                        # Strategy: Nodes that share pods (especially kube-system namespace pods) are in the same cluster
+                        cluster_groups = {}  # cluster_id -> set of nodes
+                        cluster_counter = 0
+                        
+                        # First, identify nodes with kube-system namespace - strongest indicator of cluster membership
+                        # Nodes in the same cluster will have pods in kube-system namespace
+                        nodes_with_kube_system = {}
+                        for node, data in node_to_pods.items():
+                            if 'kube-system' in data['namespaces']:
+                                nodes_with_kube_system[node] = data
+                        
+                        # Group nodes by shared kube-system namespace (strongest signal)
+                        # If nodes both have kube-system pods, they're in the same cluster
+                        for node, data in nodes_with_kube_system.items():
+                            assigned = False
+                            for cluster_id, cluster_nodes in cluster_groups.items():
+                                # Check if any node in this cluster also has kube-system namespace
+                                for cluster_node in cluster_nodes:
+                                    if cluster_node in nodes_with_kube_system:
+                                        # Both have kube-system namespace - same cluster
+                                        cluster_groups[cluster_id].add(node)
+                                        cluster_map[node] = cluster_id
+                                        assigned = True
+                                        break
+                                if assigned:
+                                    break
+                            
+                            if not assigned:
+                                # Create new cluster
+                                cluster_id = f"inferred_cluster_{cluster_counter}"
+                                cluster_counter += 1
+                                cluster_groups[cluster_id] = {node}
+                                cluster_map[node] = cluster_id
+                        
+                        # Now handle nodes without system pods - group by general pod sharing
+                        for node, data in node_to_pods.items():
+                            if node in cluster_map:  # Already assigned
+                                continue
+                            
+                            assigned = False
+                            # Try to find a cluster where nodes share at least some pods
+                            for cluster_id, cluster_nodes in cluster_groups.items():
+                                for cluster_node in cluster_nodes:
+                                    if cluster_node in node_to_pods:
+                                        shared = data['pods'] & node_to_pods[cluster_node]['pods']
+                                        # If they share at least 2 pods or 10% of pods, likely same cluster
+                                        min_shared = max(2, min(len(data['pods']), len(node_to_pods[cluster_node]['pods'])) * 0.1)
+                                        if len(shared) >= min_shared:
+                                            cluster_groups[cluster_id].add(node)
+                                            cluster_map[node] = cluster_id
+                                            assigned = True
+                                            break
+                                if assigned:
+                                    break
+                            
+                            if not assigned:
+                                # Create new cluster for isolated nodes
+                                cluster_id = f"inferred_cluster_{cluster_counter}"
+                                cluster_counter += 1
+                                cluster_groups[cluster_id] = {node}
+                                cluster_map[node] = cluster_id
+                        
+                        if cluster_map:
+                            cluster_labels_found = True  # Mark as found so we don't override
+            
+            # If still no cluster found, try kube_node_info
+            if not cluster_labels_found:
+                kube_node_query = 'kube_node_info'
+                kube_node_df = fetch_victoriametrics_metrics(
+                    query=kube_node_query,
+                    start=start_ts,
+                    end=now_ts,
+                    step="60s"
+                )
+                if not kube_node_df.empty:
+                    cluster_label_candidates = ['cluster', 'cluster_id', 'cluster_name', 'cluster_label',
+                                               'kubernetes_cluster', 'k8s_cluster', 'label_cluster']
+                    for label in cluster_label_candidates:
+                        if label in kube_node_df.columns:
+                            cluster_labels_found = True
+                            for _, row in kube_node_df.iterrows():
+                                node_entity = row.get('node') or row.get('instance')
+                                cluster_id = row.get(label)
+                                if node_entity and cluster_id:
+                                    node_entity = canonical_identity(node_entity)
+                                    # Only assign to cluster if node has pods (check canonicalized identity)
+                                    if node_entity in nodes_with_pods:
+                                        cluster_map[node_entity] = str(cluster_id)
+                            if cluster_labels_found:
+                                break
+        except Exception as e:
+            log_verbose(f"Failed to query kube_pod_info/kube_node_info for cluster identification: {e}", level=2)
+    
+    # Step 3: If still no cluster labels found, group all nodes with pods into a single inferred cluster
+    # This is the safest default: if we can't determine clusters explicitly, assume all K8s nodes are in one cluster
+    # Only split into multiple clusters if we have explicit evidence (labels) that they're different
+    if not cluster_labels_found:
+        # Get all nodes that have pod metrics (these are Kubernetes nodes)
+        # Use canonical_identity to normalize both hostnames and IPs for proper matching
+        nodes_with_pods = set()
+        if not df_pod_cpu.empty or not df_pod_mem.empty:
+            for df in [df_pod_cpu, df_pod_mem]:
+                if df.empty:
+                    continue
+                recent_df = df[df['timestamp'] >= start] if 'timestamp' in df.columns else df
+                entity_col = 'entity' if 'entity' in recent_df.columns else 'instance'
+                # Canonicalize all pod entities to ensure proper matching with host entities
+                for entity in recent_df[entity_col].unique():
+                    nodes_with_pods.add(canonical_identity(entity))
+        
+        # If we have nodes with pods but no explicit cluster labels, put them all in one inferred cluster
+        # This is better than creating separate clusters per node - we assume they're all in the same cluster
+        # until we have explicit evidence (labels) that they're different
+        if nodes_with_pods:
+            for node in nodes_with_pods:
+                node_normalized = canonical_identity(node)
+                if node_normalized not in cluster_map:
+                    # All nodes with pods go into a single inferred cluster when we can't determine clusters
+                    # Use 'inferred_cluster_0' to indicate this is an inferred cluster (not unknown)
+                    cluster_map[node_normalized] = 'inferred_cluster_0'
+    
+    # Step 4: Mark nodes without pod metrics as standalone (not in any Kubernetes cluster)
+    all_host_entities = set()
+    for df in [df_host_cpu, df_host_mem]:
+        if df.empty:
+            continue
+        recent_df = df[df['timestamp'] >= start] if 'timestamp' in df.columns else df
+        entity_col = 'entity' if 'entity' in recent_df.columns else 'instance'
+        all_host_entities.update(recent_df[entity_col].unique())
+    
+    standalone_nodes = []
+    cluster_nodes = []
+    for entity in all_host_entities:
+        entity_normalized = canonical_identity(entity)
+        if entity_normalized not in cluster_map:
+            # No pods = standalone (not a Kubernetes cluster node)
+            cluster_map[entity_normalized] = 'standalone'
+            standalone_nodes.append((entity, entity_normalized))
+        else:
+            cluster_nodes.append((entity, entity_normalized, cluster_map[entity_normalized]))
+    
+    # Debug output
+    if VERBOSE_LEVEL >= 1:
+        print(f"\n[DEBUG] Final cluster_map: {dict(sorted(cluster_map.items()))}")
+        print(f"[DEBUG] Nodes assigned to clusters: {cluster_nodes}")
+        print(f"[DEBUG] Standalone nodes (no pods or not matched): {standalone_nodes}")
+        print(f"[DEBUG] Total nodes in cluster_map: {len(cluster_map)}")
+    
+    return cluster_map
+
 def extract_instance_features(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, lookback_hours=LOOKBACK_HOURS):
     now = pd.Timestamp.now()
     start = now - pd.Timedelta(hours=lookback_hours)
@@ -2958,6 +3952,10 @@ def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
                         dump_csv_dir=None, enable_plots=True):
     feats = extract_instance_features(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, lookback_hours)
     
+    # Identify clusters - this groups nodes by their Kubernetes cluster membership
+    cluster_map = identify_clusters(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, lookback_hours)
+    feats['cluster_id'] = feats['entity'].map(lambda e: cluster_map.get(e, 'standalone'))
+    
     # Track which nodes actually have pod metrics (not just filled with 0)
     # This helps distinguish "no pods" from "low pod usage"
     now = pd.Timestamp.now()
@@ -2988,34 +3986,96 @@ def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
         axis=1
     )
     dump_dataframe_to_csv(feats.copy(), dump_csv_dir, "classification_features")
-    scaler = StandardScaler()
-    X = scaler.fit_transform(feats[['host_cpu','host_mem','pod_cpu','pod_mem']])
-    iso = IsolationForest(contamination=contamination, random_state=42)
-    labels = iso.fit_predict(X)
-    feats['anomaly'] = labels
+    
+    # Train separate IsolationForest models per cluster
+    # Compare nodes only against their own cluster baseline
+    feats['anomaly'] = 1  # Default to normal
+    all_labels = []
+    all_feats_indices = []
+    
+    cluster_summary = {}
+    for cluster_id in feats['cluster_id'].unique():
+        cluster_feats = feats[feats['cluster_id'] == cluster_id].copy()
+        
+        # Skip anomaly detection for:
+        # - Standalone nodes (no pods, not in clusters)
+        # - Unknown clusters (have pods but cluster can't be determined - legacy)
+        # - Single-node clusters (need at least 2 nodes to compare)
+        # inferred_cluster_0 is a valid cluster and should be processed
+        if cluster_id == 'standalone' or (cluster_id == 'unknown_cluster' and not cluster_id.startswith('inferred_cluster')) or len(cluster_feats) < 2:
+            cluster_feats['anomaly'] = 1  # Mark as normal (no anomaly detection)
+            feats.loc[cluster_feats.index, 'anomaly'] = 1
+            cluster_summary[cluster_id] = {'total': len(cluster_feats), 'anomalous': 0}
+            continue
+        
+        # Train IsolationForest for this cluster
+        scaler = StandardScaler()
+        X = scaler.fit_transform(cluster_feats[['host_cpu','host_mem','pod_cpu','pod_mem']])
+        iso = IsolationForest(contamination=contamination, random_state=42)
+        cluster_labels = iso.fit_predict(X)
+        cluster_feats['anomaly'] = cluster_labels
+        feats.loc[cluster_feats.index, 'anomaly'] = cluster_labels
+        
+        all_labels.extend(cluster_labels)
+        all_feats_indices.extend(cluster_feats.index.tolist())
+        cluster_summary[cluster_id] = {
+            'total': len(cluster_feats),
+            'anomalous': int((cluster_labels == -1).sum())
+        }
 
     print("\n" + "="*80)
     print("Building Classification (Anomaly) Model...")
     print("="*80)
-    print(classification_report(labels, labels, digits=2))
+    
+    # Print cluster summary
+    if len(cluster_summary) > 1:
+        print("\nCluster/Group Summary:")
+        for cluster_id, stats in sorted(cluster_summary.items()):
+            if cluster_id == 'standalone':
+                cluster_name = "Standalone nodes (no Kubernetes)"
+            elif cluster_id == 'unknown_cluster':
+                cluster_name = "Kubernetes nodes (cluster unknown)"
+            elif cluster_id.startswith('inferred_cluster'):
+                cluster_name = f"Kubernetes cluster (inferred)"
+            else:
+                cluster_name = f"Cluster: {cluster_id}"
+            print(f"  • {cluster_name}: {stats['total']} nodes, {stats['anomalous']} anomalous")
+    
+    # Print overall classification report if we have labels
+    if all_labels:
+        print(classification_report(all_labels, all_labels, digits=2))
 
     anomalous = feats[feats['anomaly'] == -1]
     if not anomalous.empty:
         # Keep the console output concise so on-call engineers can scan it quickly.
         print("\n⚠️  Anomalous nodes detected:")
-        print("   (Unusual resource pattern compared to cluster baseline - check values below)")
-        display_cols = anomalous[['entity','raw_instance','host_cpu','host_mem','pod_cpu','pod_mem']].copy()
+        print("   (Unusual resource pattern compared to their cluster/group baseline - check values below)")
+        display_cols = anomalous[['entity','raw_instance','host_cpu','host_mem','pod_cpu','pod_mem','cluster_id']].copy()
         display_cols['instance'] = display_cols.apply(
             lambda row: canonical_node_label(row['entity'], with_ip=True, raw_label=row.get('raw_instance')),
             axis=1
         )
         # Convert to percentages and format for readability
-        display_output = display_cols[['instance','host_cpu','host_mem','pod_cpu','pod_mem']].copy()
+        display_output = display_cols[['instance','host_cpu','host_mem','pod_cpu','pod_mem','cluster_id']].copy()
         display_output['Host CPU %'] = (display_output['host_cpu'] * 100).round(1)
         display_output['Host Mem %'] = (display_output['host_mem'] * 100).round(1)
         display_output['Pod CPU %'] = (display_output['pod_cpu'] * 100).round(1)
         display_output['Pod Mem %'] = (display_output['pod_mem'] * 100).round(1)
-        print(display_output[['instance', 'Host CPU %', 'Host Mem %', 'Pod CPU %', 'Pod Mem %']].to_string(index=False))
+        
+        # Group by cluster for better readability
+        if len(display_output['cluster_id'].unique()) > 1:
+            for cluster_id in sorted(display_output['cluster_id'].unique()):
+                cluster_nodes = display_output[display_output['cluster_id'] == cluster_id]
+                if cluster_id == 'standalone':
+                    cluster_name = "Standalone nodes"
+                elif cluster_id == 'unknown_cluster':
+                    cluster_name = "Kubernetes nodes (cluster unknown)"
+                else:
+                    cluster_name = f"Cluster: {cluster_id}"
+                print(f"\n  {cluster_name}:")
+                print(cluster_nodes[['instance', 'Host CPU %', 'Host Mem %', 'Pod CPU %', 'Pod Mem %']].to_string(index=False))
+        else:
+            print(display_output[['instance', 'Host CPU %', 'Host Mem %', 'Pod CPU %', 'Pod Mem %']].to_string(index=False))
         
         # Provide context-aware action based on the pattern
         print("\nAction:")
@@ -3039,7 +4099,7 @@ def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
         print("\nNo anomalous nodes – host and pod usage aligned.")
 
     plt.figure(figsize=(9,6))
-    colors = ['red' if a==-1 else 'steelblue' for a in labels]
+    colors = ['red' if a==-1 else 'steelblue' for a in feats['anomaly']]
     plt.scatter(feats['host_mem'], feats['pod_mem'], c=colors, alpha=0.7)
     for _, r in feats.iterrows():
         plt.text(r['host_mem']+0.01, r['pod_mem'], r['entity'][:10], fontsize=9)
@@ -3082,7 +4142,15 @@ def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
         anomalous_df['signal'] = 'anomalous_node'
         anomalous_df['detected_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    return feats, iso, anomalous_df, host_pressure_df
+    # Return iso model if it was trained, otherwise None
+    # iso is only defined when at least one cluster has 2+ nodes and a model was trained
+    iso_model = None
+    if all_labels:  # If any models were trained, we have at least one iso instance
+        # We don't actually need to return iso since we're doing per-cluster training
+        # But for backward compatibility, return None
+        iso_model = None
+    
+    return feats, iso_model, anomalous_df, host_pressure_df
 
 def run_realtime_anomaly_watch(q_host_cpu, q_host_mem, q_pod_cpu, q_pod_mem,
                                iterations=1, interval_seconds=15):
@@ -3242,7 +4310,28 @@ def predict_io_and_network_crisis_with_backtest(
         df['timestamp'] = pd.to_datetime(df['ts'], unit='s')
 
         processed_nodes = 0
-        for inst, group in df.groupby('instance'):
+        # Pre-compute retrain matching logic once (outside loop) for performance
+        # Only do expensive DNS lookups if retrain_targets is not empty
+        retrain_targets_set = set(retrain_targets) if retrain_targets else set()
+        has_retrain_targets = len(retrain_targets_set) > 0
+        retrain_all = '__RETRAIN_ALL__' in retrain_targets_set if has_retrain_targets else False
+        
+        # Pre-compute canonical identities for retrain targets (avoid repeated canonicalization)
+        retrain_targets_canon = {}
+        if has_retrain_targets and not retrain_all:
+            for target in retrain_targets_set:
+                if '|' not in target and '_' not in target:  # Only node names, not keys
+                    retrain_targets_canon[target] = canonical_identity(target)
+        
+        # Progress reporting for large node counts (reduces perceived slowness)
+        total_nodes = len(df.groupby('instance'))
+        show_progress = total_nodes > 20
+        if show_progress:
+            print(f"  Processing {total_nodes} nodes for {name}...")
+        
+        for idx, (inst, group) in enumerate(df.groupby('instance'), 1):
+            if show_progress and idx % 10 == 0:
+                print(f"  Progress: {idx}/{total_nodes} nodes processed...", end='\r')
             node = canonical_node_label(inst, with_ip=True)
             entity = canonical_identity(inst)  # Canonical name for matching
             ts = group.set_index('timestamp')['value'].sort_index()
@@ -3273,69 +4362,71 @@ def predict_io_and_network_crisis_with_backtest(
 
             # Prophet - use manifest (with _backtest suffix to avoid conflicts)
             key = f"{build_io_net_key(entity, name)}_backtest"
-            # Check if retraining is needed - match against entity, key, or any aliases
-            # Check for "all" flag first
-            needs_retrain = force_retrain or ('__RETRAIN_ALL__' in retrain_targets if retrain_targets else False)
-            if needs_retrain:
-                entity_match = key_match = instance_match = node_match = alias_match = False
-            else:
-                entity_match = entity in retrain_targets
-                key_match = key in retrain_targets
+            
+            # OPTIMIZED: Fast path when no retraining needed
+            needs_retrain = force_retrain or retrain_all
+            if not needs_retrain and has_retrain_targets:
+                # Fast checks first (no DNS lookups)
+                entity_match = entity in retrain_targets_set
+                key_match = key in retrain_targets_set
                 instance_canon = canonical_identity(inst)
-                instance_match = instance_canon in retrain_targets
+                instance_match = instance_canon in retrain_targets_set
                 node_base = node.split('(')[0].strip() if '(' in node else node
                 node_base_canon = canonical_identity(node_base)
-                node_match = node_base_canon in retrain_targets
+                node_match = node_base_canon in retrain_targets_set
                 
-                # Check if any retrain target is an alias that maps to this entity
+                # Check alias map (fast, no DNS)
                 alias_match = False
-            for target in retrain_targets:
-                if '|' in target or '_' in target:
-                    continue  # Skip keys, only check node names
-                target_canon = canonical_identity(target)
-                # Direct match already checked above
-                if target_canon == entity:
-                    alias_match = True
-                    break
-                # Check if target maps to this entity via alias map
-                if target_canon in INSTANCE_ALIAS_MAP:
-                    alias_value = INSTANCE_ALIAS_MAP[target_canon]
-                    if canonical_identity(alias_value) == entity:
-                        alias_match = True
-                        break
-                # Check reverse: if entity is in alias map, does target match the key?
-                for k, v in INSTANCE_ALIAS_MAP.items():
-                    if canonical_identity(v) == entity and canonical_identity(k) == target_canon:
-                        alias_match = True
-                        break
-                if alias_match:
-                    break
-                # Check if both resolve to same IP in source registry
-                target_ip = SOURCE_REGISTRY.get(target_canon) or CANON_SOURCE_MAP.get(target_canon)
-                entity_ip = SOURCE_REGISTRY.get(entity) or CANON_SOURCE_MAP.get(entity)
-                if target_ip and entity_ip and target_ip == entity_ip:
-                    alias_match = True
-                    break
-                # Extract IP from node display string and check if target resolves to it
-                # Only attempt DNS if target looks like a hostname
-                if looks_like_hostname(target) and '(' in node and ')' in node:
-                    node_ip = node.split('(')[1].split(')')[0].strip()
-                    # Try to resolve target to IP (try with and without domain suffixes)
-                    target_variants = [target]
-                    for domain in DNS_DOMAIN_SUFFIXES:
-                        if domain and not target.endswith(domain):
-                            target_variants.append(f"{target}{domain}")
-                    for target_var in target_variants:
-                        try:
-                            target_resolved = socket.gethostbyname(target_var)
-                            if target_resolved == node_ip:
+                if not (entity_match or key_match or instance_match or node_match):
+                    # Only check alias map if simple matches failed
+                    for target, target_canon in retrain_targets_canon.items():
+                        if target_canon == entity:
+                            alias_match = True
+                            break
+                        # Check alias map (cached, no DNS)
+                        if target_canon in INSTANCE_ALIAS_MAP:
+                            alias_value = INSTANCE_ALIAS_MAP[target_canon]
+                            if canonical_identity(alias_value) == entity:
                                 alias_match = True
-                                log_verbose(f"   DNS match: {target_var} → {target_resolved} == {node_ip}")
                                 break
-                        except:
-                            pass
-                    if alias_match:
-                        break
+                        # Check reverse alias map
+                        for k, v in INSTANCE_ALIAS_MAP.items():
+                            if canonical_identity(v) == entity and canonical_identity(k) == target_canon:
+                                alias_match = True
+                                break
+                        if alias_match:
+                            break
+                        # Check IP registry (fast, no DNS)
+                        target_ip = SOURCE_REGISTRY.get(target_canon) or CANON_SOURCE_MAP.get(target_canon)
+                        entity_ip = SOURCE_REGISTRY.get(entity) or CANON_SOURCE_MAP.get(entity)
+                        if target_ip and entity_ip and target_ip == entity_ip:
+                            alias_match = True
+                            break
+                
+                # Only do expensive DNS lookups as last resort (and only if still no match)
+                if not alias_match and not (entity_match or key_match or instance_match or node_match):
+                    # DNS lookup only for remaining unmatched targets (expensive, do last)
+                    if '(' in node and ')' in node:
+                        node_ip = node.split('(')[1].split(')')[0].strip()
+                        for target, target_canon in retrain_targets_canon.items():
+                            if looks_like_hostname(target):
+                                target_variants = [target]
+                                for domain in DNS_DOMAIN_SUFFIXES:
+                                    if domain and not target.endswith(domain):
+                                        target_variants.append(f"{target}{domain}")
+                                for target_var in target_variants:
+                                    try:
+                                        target_resolved = socket.gethostbyname(target_var)
+                                        if target_resolved == node_ip:
+                                            alias_match = True
+                                            log_verbose(f"   DNS match: {target_var} → {target_resolved} == {node_ip}")
+                                            break
+                                    except:
+                                        pass
+                                    if alias_match:
+                                        break
+                            if alias_match:
+                                break
                 
                 needs_retrain = entity_match or key_match or instance_match or node_match or alias_match
             
@@ -3343,18 +4434,28 @@ def predict_io_and_network_crisis_with_backtest(
                 m = manifest[key].get('model')
                 if m is not None:
                     log_verbose(f"  → Loaded model from manifest: {key}")
-                    # MINIMAL UPDATE: Use recent data only (last 7 days) for forecast mode only
+                    # MINIMAL UPDATE: Use recent data only (last 7 days) for forecast mode
+                    # This incorporates latest trends while preserving learned patterns
+                    # Minimal updates are required in --forecast, --disk-retrain, and --io-net-retrain modes
                     if forecast_mode:
                         # This incorporates latest trends while preserving learned patterns
                         # train is a Series with timestamp index, so use last('7D')
                         recent_train = train.last('7D') if len(train) > 7*24*6 else train
-                        pdf = recent_train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
-                        m_updated = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, weekly_seasonality=True)
-                        m_updated.fit(pdf)
-                        m = m_updated  # Use updated model for forecasting
-                        manifest[key] = {'model': m}  # Save updated model to manifest
-                        manifest_changed = True
-                        log_verbose(f"  → Minimal update applied (recent 7 days): {key}")
+                        if len(recent_train) >= 50:  # Only update if we have enough recent data
+                            pdf = recent_train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
+                            # OPTIMIZATION: Use faster Prophet settings for minimal updates
+                            # Use fewer changepoints and simpler seasonality for speed
+                            m_updated = Prophet(
+                                changepoint_prior_scale=0.2,
+                                daily_seasonality=True,
+                                weekly_seasonality=True,
+                                n_changepoints=10  # Reduce changepoints from default 25 for faster fitting
+                            )
+                            m_updated.fit(pdf)
+                            m = m_updated  # Use updated model for forecasting
+                            manifest[key] = {'model': m}  # Save updated model to manifest
+                            manifest_changed = True
+                            log_verbose(f"  → Minimal update applied (recent 7 days): {key}")
                 else:
                     needs_retrain = True
             
@@ -3364,7 +4465,8 @@ def predict_io_and_network_crisis_with_backtest(
                     # Minimal update: use recent data (last 7 days) to incorporate latest trends
                     recent_train = train.last('7D') if len(train) > 7*24*6 else train
                     pdf = recent_train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
-                    m = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, weekly_seasonality=True)
+                    # OPTIMIZATION: Use faster Prophet settings for minimal updates
+                    m = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, weekly_seasonality=True, n_changepoints=10)
                     m.fit(pdf)
                     # Add node and signal metadata to CSV
                     if dump_csv_dir:
@@ -3378,7 +4480,8 @@ def predict_io_and_network_crisis_with_backtest(
                 else:
                     # First-time training: use all data to learn patterns
                     pdf = train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
-                    m = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, weekly_seasonality=True)
+                    # OPTIMIZATION: Use faster Prophet settings for first-time training
+                    m = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, weekly_seasonality=True, n_changepoints=15)
                     m.fit(pdf)
                     manifest[key] = {'model': m}
                     manifest_changed = True
@@ -3412,7 +4515,7 @@ def predict_io_and_network_crisis_with_backtest(
             # Hybrid ETA - ensure non-negative
             hybrid_eta = max(0.0, min(linear_eta, prophet_eta))
 
-            # SEVERITY — ALWAYS DEFINED (this was the bug!)
+            # Severity is always defined
             if hybrid_eta < 3:
                 severity = "CRITICAL"
             elif hybrid_eta < 7:
@@ -3422,8 +4525,9 @@ def predict_io_and_network_crisis_with_backtest(
             else:
                 severity = "OK"
 
+            # OPTIMIZATION: Skip plot generation unless explicitly needed (plots are expensive)
             # Save backtest plot when training/retraining or when show_backtest is True
-            if needs_retrain or show_backtest:
+            if (needs_retrain or show_backtest) and enable_plots:
                 plt.figure(figsize=(14, 7))
                 plt.plot(train.index, train.values, label="Train Data", color="#1f77b4")
                 plt.plot(test.index, test.values, label="Test (Actual)", color="#2ca02c", linewidth=2.5)
@@ -3434,16 +4538,16 @@ def predict_io_and_network_crisis_with_backtest(
                 plt.title(f"{node} — {name.replace('_', ' ')}\n"
                           f"MAE: {mae:.6f} | RMSE: {rmse:.6f} | Hybrid ETA: {hybrid_eta:.1f} days → {severity}")
                 plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
-                if enable_plots:
-                    # Sanitize node name for filename
-                    safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
-                    plot_file = os.path.join(plot_dir, f"{safe_node}_{name.lower().replace(' ', '_')}_backtest.png")
-                    plt.savefig(plot_file, dpi=180, bbox_inches='tight')
-                    log_verbose(f"  → Plot saved: {plot_file}")
+                # Sanitize node name for filename
+                safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
+                plot_file = os.path.join(plot_dir, f"{safe_node}_{name.lower().replace(' ', '_')}_backtest.png")
+                plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                log_verbose(f"  → Plot saved: {plot_file}")
                 plt.close()
             
+            # OPTIMIZATION: Skip forecast plots in forecast mode unless enable_plots is True
             # Save forecast plot in forecast mode (showing future predictions, not backtest)
-            if forecast_mode:
+            if forecast_mode and enable_plots:
                 plt.figure(figsize=(14, 7))
                 # Plot last 24 hours of historical data
                 historical = ts.last('24H')
@@ -3464,12 +4568,11 @@ def predict_io_and_network_crisis_with_backtest(
                 plt.xlabel('Time')
                 plt.ylabel('Value')
                 plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
-                if enable_plots:
-                    # Sanitize node name for filename
-                    safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
-                    plot_file = os.path.join(plot_dir, f"{safe_node}_{name.lower().replace(' ', '_')}_forecast.png")
-                    plt.savefig(plot_file, dpi=180, bbox_inches='tight')
-                    log_verbose(f"  → Forecast plot saved: {plot_file}")
+                # Sanitize node name for filename
+                safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
+                plot_file = os.path.join(plot_dir, f"{safe_node}_{name.lower().replace(' ', '_')}_forecast.png")
+                plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                log_verbose(f"  → Forecast plot saved: {plot_file}")
                 plt.close()
 
             if show_backtest or should_verbose():
@@ -3497,6 +4600,9 @@ def predict_io_and_network_crisis_with_backtest(
 
             processed_nodes += 1
 
+        if show_progress:
+            print()  # New line after progress indicator
+        
         summary = [r for r in results if r['signal'] == name.replace("_", " ")]
         print(f"{name}: processed {processed_nodes} nodes, crises <30d: {len(summary)}")
 
@@ -3504,18 +4610,94 @@ def predict_io_and_network_crisis_with_backtest(
     return results_df, manifest, manifest_changed
 
 # ----------------------------------------------------------------------
-# 8. IO and NETWORK AGAIN
+# 8. I/O AND NETWORK ENSEMBLE FORECASTING
 # ----------------------------------------------------------------------
+def format_anomaly_description(node, signal, current_val, current_str, mae_ensemble, score, severity, deviation_pct, unit):
+    """Create human-readable description of an anomaly."""
+    signal_lower = signal.lower()
+    
+    # Determine what the signal measures
+    if "disk io wait" in signal_lower or "iowait" in signal_lower:
+        signal_name = "Disk I/O Wait"
+        what_it_means = "how much time the CPU spends waiting for disk operations"
+        impact = "High I/O wait means the system is waiting for storage, causing slowdowns"
+    elif "net tx" in signal_lower or "network" in signal_lower:
+        signal_name = "Network Transmit"
+        what_it_means = "outgoing network bandwidth"
+        impact = "Network issues can cause slow data transfers and connectivity problems"
+    else:
+        signal_name = signal
+        what_it_means = "system performance metric"
+        impact = "Anomalies indicate unexpected behavior"
+    
+    # Interpret the severity and score
+    if severity == "CRITICAL":
+        urgency = "⚠️  URGENT: Requires immediate attention"
+    elif severity == "WARNING":
+        urgency = "⚠️  Monitor closely"
+    else:
+        urgency = "ℹ️  Informational - keep an eye on it"
+    
+    # Interpret deviation
+    if deviation_pct > 50:
+        deviation_desc = f"significantly different ({deviation_pct:.1f}% off from expected)"
+    elif deviation_pct > 20:
+        deviation_desc = f"noticeably different ({deviation_pct:.1f}% off from expected)"
+    else:
+        deviation_desc = f"slightly different ({deviation_pct:.1f}% off from expected)"
+    
+    # Interpret MAE
+    if unit == "ratio":
+        if mae_ensemble > 0.05:
+            mae_desc = "Model is struggling to predict this pattern accurately"
+        elif mae_ensemble > 0.01:
+            mae_desc = "Model has moderate prediction accuracy"
+        else:
+            mae_desc = "Model predictions are fairly accurate"
+    else:  # bytes/sec
+        threshold = 120_000_000 * 0.10  # 10% of network threshold
+        if mae_ensemble > threshold:
+            mae_desc = "Model is struggling to predict this pattern accurately"
+        elif mae_ensemble > threshold * 0.5:
+            mae_desc = "Model has moderate prediction accuracy"
+        else:
+            mae_desc = "Model predictions are fairly accurate"
+    
+    # Build the description
+    description = (
+        f"{urgency}\n"
+        f"  • Node: {node}\n"
+        f"  • Metric: {signal_name} ({what_it_means})\n"
+        f"  • Current Value: {current_str}\n"
+        f"  • What's Wrong: The actual value is {deviation_desc}\n"
+        f"  • Prediction Quality: {mae_desc}\n"
+        f"  • Impact: {impact}"
+    )
+    
+    return description
+
 def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forecast_plots", force_retrain: bool | None = None,
                                     manifest: dict | None = None, retrain_targets: set | None = None, show_backtest: bool = False,
                                     forecast_mode: bool = False, dump_csv_dir: str | None = None, enable_plots: bool = True):
     """
-    DISK I/O + NETWORK — FULL ENSEMBLE FORECAST (same brain as CPU/Memory)
-    - Uses manifest for model storage (single file instead of per-node files)
-    - Instant load if exists
-    - Trains only when missing
-    - 1Gbps network threshold (120MB/s)
-    - Zero bugs. Zero lies.
+    Disk I/O and Network ensemble forecasting using Prophet, ARIMA, and LSTM models.
+    
+    This function provides comprehensive forecasting and anomaly detection for:
+    - Disk I/O wait time (DISK_IO_WAIT): Measures CPU time spent waiting for disk operations
+    - Network transmit bandwidth (NET_TX_BW): Measures outgoing network traffic
+    
+    Features:
+    - Manifest-based model storage: Single file storage for all node/signal combinations
+    - Lazy model loading: Models are loaded from cache if available, trained only when missing
+    - Selective retraining: Supports retraining specific nodes/signals without full retraining
+    - Network threshold: 120 MB/s (96% of 1 Gbps) for crisis detection
+    - Anomaly detection: Statistical deviation analysis with configurable sensitivity
+    
+    Returns:
+        crisis_df: DataFrame of predicted crises (ETA < 30 days to threshold)
+        anomaly_df: DataFrame of detected anomalies (statistical deviations)
+        manifest: Updated model manifest dictionary
+        manifest_changed: Boolean indicating if manifest was modified
     """
     if plot_dir is None:
         plot_dir = FORECAST_PLOTS_DIR
@@ -3834,9 +5016,156 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
                     "severity": severity
                 })
 
-            # Anomaly detection placeholder (you can expand later)
-            # is_anomaly = metrics.get('anomaly_score', 0) > 0.7
-            # if is_anomaly: ...
+            # ———— ANOMALY DETECTION ————
+            # Compare actual values vs ensemble forecast to detect statistical deviations
+            # Method: Check deviation of recent actual values from predicted patterns
+            # 
+            # IMPROVED LOGIC (to reduce false positives):
+            # - Uses BOTH absolute and percentage thresholds (avoids flagging tiny differences)
+            # - Only flags if value is ACTUALLY concerning (e.g., I/O wait > 5%, not just different)
+            # - Accounts for model confidence (low MAE = trust model more, be conservative)
+            # - For very small baselines (< 1% I/O, < 5MB/s network), uses absolute thresholds only
+            #   (percentage deviations are misleading when baseline is near zero)
+            #
+            mae_ensemble = metrics.get('mae_ensemble', 0.0)
+            
+            # Get recent actual values (last 24 hours) for anomaly detection
+            recent_window = pd.Timedelta(hours=24)
+            now = pd.Timestamp.now()
+            recent_start = now - recent_window
+            recent_actual = ts[ts.index >= recent_start]
+            
+            if len(recent_actual) >= 6:  # Need at least 6 data points (1 hour at 10min intervals)
+                # Get forecast values for the same time period (if available in forecast_df)
+                # forecast_df contains future predictions, so we need to find the model's prediction
+                # for the current/recent time period. We'll use the most recent forecast value as baseline.
+                
+                # Find the forecast value closest to now (or most recent forecast)
+                forecast_df_sorted = forecast_df.sort_values('ds')
+                if not forecast_df_sorted.empty:
+                    # Get the forecast value at or just before now
+                    past_forecasts = forecast_df_sorted[forecast_df_sorted['ds'] <= now]
+                    if not past_forecasts.empty:
+                        # Use the most recent past forecast as baseline
+                        baseline_forecast = past_forecasts.iloc[-1]['yhat']
+                    else:
+                        # If no past forecasts, use the earliest future forecast as proxy
+                        baseline_forecast = forecast_df_sorted.iloc[0]['yhat']
+                    
+                    # Calculate statistics on recent actual values
+                    recent_mean = recent_actual.mean()
+                    recent_std = recent_actual.std()
+                    recent_max = recent_actual.max()
+                    recent_min = recent_actual.min()
+                    
+                    # Calculate deviation metrics
+                    # 1. Current value deviation from baseline forecast (both absolute and percentage)
+                    current_deviation_abs = abs(current - baseline_forecast)
+                    current_deviation_pct = abs((current - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (current_deviation_abs if current != 0 else 0)
+                    
+                    # 2. Recent mean deviation from baseline
+                    mean_deviation_abs = abs(recent_mean - baseline_forecast)
+                    mean_deviation_pct = abs((recent_mean - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (mean_deviation_abs if recent_mean != 0 else 0)
+                    
+                    # 3. Check for sudden spikes/drops (recent max/min vs baseline)
+                    spike_deviation_abs = abs(recent_max - baseline_forecast)
+                    spike_deviation = abs((recent_max - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (spike_deviation_abs if recent_max != 0 else 0)
+                    drop_deviation_abs = abs(baseline_forecast - recent_min)
+                    drop_deviation = abs((baseline_forecast - recent_min) / baseline_forecast) if baseline_forecast != 0 else (drop_deviation_abs if recent_min != 0 else 0)
+                    
+                    # 4. Define meaningful thresholds to avoid false positives
+                    # For I/O wait (ratio): values < 1% are usually fine, > 5% is concerning
+                    # For network (bytes/sec): use percentage of threshold
+                    if res["unit"] == "ratio":
+                        min_abs_threshold = 0.01  # 1% - minimum absolute difference to care about
+                        mae_threshold = 0.05  # 5% for ratio signals
+                        concerning_threshold = 0.05  # 5% I/O wait is actually concerning
+                        baseline_too_small = baseline_forecast < 0.01  # If baseline < 1%, use absolute only
+                    else:
+                        min_abs_threshold = 5_000_000  # 5 MB/s - minimum absolute difference
+                        mae_threshold = res["threshold"] * 0.10  # 10% of threshold
+                        concerning_threshold = res["threshold"] * 0.30  # 30% of threshold is concerning
+                        baseline_too_small = baseline_forecast < 5_000_000  # If baseline < 5MB/s, use absolute only
+                    
+                    # 5. Model confidence check - if MAE is very low, model is accurate, be more conservative
+                    # If MAE is high, model is struggling, be more lenient (don't trust it as much)
+                    if res["unit"] == "ratio":
+                        mae_confidence_factor = 1.0 if mae_ensemble < 0.005 else (0.7 if mae_ensemble < 0.01 else 0.3)
+                    else:
+                        mae_confidence_factor = 1.0 if mae_ensemble < mae_threshold * 0.1 else (0.7 if mae_ensemble < mae_threshold * 0.3 else 0.3)
+                    
+                    # Anomaly detection logic - be conservative to avoid false positives
+                    # Strategy: Only flag if the value is ACTUALLY concerning, not just different
+                    
+                    # Check if current value is concerning (regardless of deviation)
+                    is_concerning_value = (
+                        (res["unit"] == "ratio" and current >= concerning_threshold) or
+                        (res["unit"] != "ratio" and current >= concerning_threshold)
+                    )
+                    
+                    # Check for significant absolute deviation
+                    has_significant_abs_diff = (
+                        current_deviation_abs >= min_abs_threshold or
+                        mean_deviation_abs >= min_abs_threshold
+                    )
+                    
+                    # For small baselines, only use absolute thresholds (percentage is misleading)
+                    # For larger baselines, use both absolute and percentage
+                    if baseline_too_small:
+                        # Small baseline: only check absolute difference AND if value is concerning
+                        is_anomaly = has_significant_abs_diff and is_concerning_value
+                    else:
+                        # Larger baseline: check both absolute and percentage deviation
+                        has_significant_pct_diff = (
+                            current_deviation_pct > 0.50 or  # 50% relative deviation
+                            mean_deviation_pct > 0.30        # 30% mean deviation
+                        )
+                        # Anomaly if: (significant absolute + significant percentage) AND (concerning value OR low model confidence)
+                        is_anomaly = (
+                            has_significant_abs_diff and
+                            has_significant_pct_diff and
+                            (is_concerning_value or mae_confidence_factor < 0.5 or mae_ensemble > mae_threshold)
+                        )
+                    
+                    if is_anomaly:
+                        # Calculate anomaly score (0-1 scale)
+                        anomaly_score = min(1.0, max(
+                            current_deviation_pct,
+                            mean_deviation_pct,
+                            spike_deviation / 2.0,
+                            drop_deviation / 2.0,
+                            min(1.0, mae_ensemble / mae_threshold) if mae_threshold > 0 else 0
+                        ))
+                        
+                        # Determine severity based on score
+                        if anomaly_score > 0.8:
+                            severity = "CRITICAL"
+                        elif anomaly_score > 0.5:
+                            severity = "WARNING"
+                        else:
+                            severity = "INFO"
+                        
+                        signal_display = res["name"].replace("_", " ")
+                        current_str = f"{current*100:.2f}%" if res["unit"] == "ratio" else f"{current/1e6:.1f} MB/s"
+                        
+                        # Create human-readable description
+                        description = format_anomaly_description(
+                            node, signal_display, current, current_str, mae_ensemble, 
+                            anomaly_score, severity, current_deviation_pct * 100, res["unit"]
+                        )
+                        
+                        anomaly_results.append({
+                            "node": node,
+                            "signal": signal_display,
+                            "current": current_str,
+                            "mae_ensemble": round(mae_ensemble, 6),
+                            "score": round(anomaly_score, 3),
+                            "severity": severity,
+                            "deviation_pct": round(current_deviation_pct * 100, 1),
+                            "description": description
+                        })
+                        
+                        log_verbose(f"   ⚠️  Anomaly detected: {node} | {res['name']} (score: {anomaly_score:.3f}, deviation: {current_deviation_pct*100:.1f}%)")
 
     crisis_df = pd.DataFrame(crisis_results)
     anomaly_df = pd.DataFrame(anomaly_results)
@@ -3922,8 +5251,8 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
             # Check which targets didn't match
             matched_targets = set()
             for retrained in retrained_nodes:
-                # Format is "node (entity)" where node is like "worker02 (192.168.10.82)"
-                # So full format is "worker02 (192.168.10.82) (worker02)"
+                # Format is "node (entity)" where node is like "hostname (IP)"
+                # So full format is "hostname (IP) (canonical_name)"
                 if '(' in retrained and ')' in retrained:
                     # Extract entity (last part in parentheses)
                     entity_match = retrained.split('(')[-1].rstrip(')').strip()
@@ -4267,72 +5596,271 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
     classification_anomalies_df = pd.DataFrame()
     host_pressure_df = pd.DataFrame()
     
-    # ====================== HOST LAYER ======================
-    print("\n" + "="*80)
-    print("HOST LAYER (full node) — FORECAST")
-    print("="*80)
+    # ====================== IDENTIFY KUBERNETES CLUSTERS VS STANDALONE NODES ======================
     q_host_cpu = '1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance)'
     q_host_mem = '(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes'
-    df_hcpu = fetch_and_preprocess_data(q_host_cpu)
-    df_hmem = fetch_and_preprocess_data(q_host_mem)
-    
-    host_saved = False
-    if not os.path.exists(HOST_MODEL_PATH):
-        print(f"⚠ Warning: Host model not found at {HOST_MODEL_PATH}")
-        print("   Skipping host forecast. Run with --training flag first to train models.")
-        host_fc = None
-    else:
-        _, host_fc, _, host_saved = train_or_load_ensemble(
-            df_hcpu,
-            df_hmem,
-            horizon_min=7*24*60,
-            model_path=HOST_MODEL_PATH,
-            force_retrain=False,
-            generate_fresh_forecast=True,
-            dump_csv_dir=csv_dump_dir,
-            context={'node': 'host'},
-            enable_plots=enable_plots
-        )
-    
-    # ====================== POD LAYER ======================
-    print("\n" + "="*80)
-    print("POD LAYER (apps only) — FORECAST")
-    print("="*80)
     q_pod_cpu = 'sum(rate(container_cpu_usage_seconds_total{container!="POD",container!=""}[5m])) by (instance)'
     q_pod_mem = 'sum(container_memory_working_set_bytes{container!="POD",container!=""}[5m]) by (instance)'
+
+    df_hcpu = fetch_and_preprocess_data(q_host_cpu)
+    df_hmem = fetch_and_preprocess_data(q_host_mem)
     df_pcpu = fetch_and_preprocess_data(q_pod_cpu)
     df_pmem = fetch_and_preprocess_data(q_pod_mem)
     
+    # Alias resolution and entity canonicalization
     augment_aliases_from_dns(df_hcpu, df_pcpu)
     infer_aliases_from_timeseries(df_hcpu, df_pcpu)
     recanonicalize_entities(df_hcpu, df_hmem, df_pcpu, df_pmem)
     summarize_instance_roles(df_hcpu, df_pcpu)
-    print()
     
-    pod_saved = False
-    if not os.path.exists(POD_MODEL_PATH):
-        print(f"⚠ Warning: Pod model not found at {POD_MODEL_PATH}")
-        print("   Skipping pod forecast. Run with --training flag first to train models.")
-        pod_fc = None
+    # Identify clusters to understand which nodes belong to which Kubernetes cluster
+    cluster_map = identify_clusters(df_hcpu, df_hmem, df_pcpu, df_pmem, lookback_hours=LOOKBACK_HOURS)
+    
+    # Group entities by cluster
+    def get_entity_set(df):
+        if df.empty:
+            return set()
+        entity_col = 'entity' if 'entity' in df.columns else 'instance'
+        return set(df[entity_col].unique())
+    
+    host_entities = get_entity_set(df_hcpu)
+    pod_entities = get_entity_set(df_pcpu)
+    
+    # Group entities by cluster_id
+    # Include ALL entities (both host and pod) to catch all nodes with pods
+    # But deduplicate by canonical identity AND alias map to avoid double-counting
+    # (e.g., pi and host03 are the same node, worker03 and host03 are the same node)
+    all_entities = host_entities | pod_entities
+    entities_by_cluster = {}
+    # Track which canonical identities we've already added (to prevent duplicates via aliases)
+    added_canonical = set()
+    for entity in all_entities:
+        entity_normalized = canonical_identity(entity)
+        # Check if this entity has an alias - if so, use the alias target for deduplication
+        alias_target = INSTANCE_ALIAS_MAP.get(entity_normalized)
+        if alias_target:
+            alias_target_canonical = canonical_identity(alias_target)
+            # If the alias target is already in the set, skip this entity (it's a duplicate)
+            if alias_target_canonical in added_canonical:
+                continue
+            # Use the alias target as the canonical identity
+            entity_normalized = alias_target_canonical
+        
+        # Skip if we've already added this canonical identity
+        if entity_normalized in added_canonical:
+            continue
+        
+        cluster_id = cluster_map.get(entity_normalized, 'standalone')
+        # Also check if any alias of this entity is in cluster_map
+        if entity_normalized not in cluster_map:
+            for alias_key, alias_val in INSTANCE_ALIAS_MAP.items():
+                if canonical_identity(alias_val) == entity_normalized:
+                    if alias_key in cluster_map:
+                        cluster_id = cluster_map[alias_key]
+                        break
+        
+        if cluster_id not in entities_by_cluster:
+            entities_by_cluster[cluster_id] = set()
+        entities_by_cluster[cluster_id].add(entity_normalized)
+        added_canonical.add(entity_normalized)
+    
+    # Separate Kubernetes clusters from standalone
+    # Include inferred_cluster_0 as a valid cluster (nodes with pods but no explicit cluster label)
+    k8s_clusters = {cid: ents for cid, ents in entities_by_cluster.items() 
+                    if cid != 'standalone' and not cid.startswith('unknown_cluster')}
+    standalone_entities = entities_by_cluster.get('standalone', set())
+    unknown_cluster_entities = entities_by_cluster.get('unknown_cluster', set())
+    
+    print(f"\nNode Classification:")
+    print(f"  • Kubernetes clusters: {len(k8s_clusters)}")
+    for cluster_id, entities in sorted(k8s_clusters.items()):
+        cluster_display = "inferred" if cluster_id.startswith('inferred_cluster') else cluster_id
+        print(f"    - Cluster '{cluster_display}': {len(entities)} nodes")
+    if unknown_cluster_entities:
+        print(f"  • Kubernetes nodes (cluster unknown): {len(unknown_cluster_entities)}")
+    print(f"  • Standalone nodes (no pods): {len(standalone_entities)}")
+    
+    # Helper function to combine host + pod data
+    def combine_host_pod(host_df, pod_df, metric_name):
+        """Combine host and pod data by averaging them per timestamp"""
+        if host_df.empty and pod_df.empty:
+            return pd.DataFrame()
+        
+        host_agg = host_df.groupby('timestamp')['value'].mean().reset_index(name='host')
+        pod_agg = pod_df.groupby('timestamp')['value'].mean().reset_index(name='pod')
+        
+        # Merge and average
+        combined = pd.merge(host_agg, pod_agg, on='timestamp', how='outer')
+        combined['value'] = (combined['host'].fillna(0) + combined['pod'].fillna(0)) / 2
+        # If one is missing, use the available one
+        combined.loc[combined['host'].isna(), 'value'] = combined.loc[combined['host'].isna(), 'pod']
+        combined.loc[combined['pod'].isna(), 'value'] = combined.loc[combined['pod'].isna(), 'host']
+        
+        return combined[['timestamp', 'value']]
+    
+    # ====================== KUBERNETES CLUSTER MODELS (Host + Pod per cluster) — FORECAST ======================
+    k8s_cluster_forecasts = {}  # cluster_id -> forecast
+    k8s_host_fc = None  # Combined host forecast for all K8s nodes (for divergence)
+    
+    if k8s_clusters:
+        print("\n" + "="*80)
+        print("KUBERNETES CLUSTER MODELS (Host + Pod data per cluster) — FORECAST")
+        print("="*80)
+        
+        entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
+        entity_col_p = 'entity' if 'entity' in df_pcpu.columns else 'instance'
+        
+        # Load and generate forecasts for each Kubernetes cluster
+        for cluster_id, cluster_entities in sorted(k8s_clusters.items()):
+            print(f"\n  Processing Cluster: {cluster_id} ({len(cluster_entities)} nodes)")
+            
+            # Filter data to this cluster's nodes
+            # cluster_entities contains canonical identities, so we need to match entities via canonical_identity
+            df_hcpu_cluster = df_hcpu[df_hcpu[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
+            df_hmem_cluster = df_hmem[df_hmem[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
+            df_pcpu_cluster = df_pcpu[df_pcpu[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
+            df_pmem_cluster = df_pmem[df_pmem[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
+            
+            # Combine host + pod data for this cluster
+            df_combined_cpu = combine_host_pod(df_hcpu_cluster, df_pcpu_cluster, 'cpu')
+            df_combined_mem = combine_host_pod(df_hmem_cluster, df_pmem_cluster, 'mem')
+            
+            if not df_combined_cpu.empty and not df_combined_mem.empty:
+                # Create cluster-specific model path
+                cluster_model_path = os.path.join(MODEL_DIR, f"k8s_cluster_{sanitize_label(cluster_id)}_forecast.pkl")
+                
+                if not os.path.exists(cluster_model_path):
+                    print(f"    ⚠ Warning: Cluster model not found at {cluster_model_path}")
+                    print("       Skipping this cluster. Run with --training flag first to train models.")
+                else:
+                    _, cluster_fc, _, _ = train_or_load_ensemble(
+                        df_combined_cpu,
+                        df_combined_mem,
+                        horizon_min=7*24*60,
+                        model_path=cluster_model_path,
+                        force_retrain=False,
+                        generate_fresh_forecast=True,
+                        dump_csv_dir=csv_dump_dir,
+                        context={'node': 'k8s_cluster', 'cluster_id': cluster_id},
+                        enable_plots=enable_plots
+                    )
+                    k8s_cluster_forecasts[cluster_id] = cluster_fc
+        
+        # Also create combined host forecast for all K8s nodes (for divergence calculation)
+        all_k8s_entities = set()
+        for entities in k8s_clusters.values():
+            all_k8s_entities.update(entities)
+        
+        if all_k8s_entities:
+            df_hcpu_all_k8s = df_hcpu[df_hcpu[entity_col_h].isin(all_k8s_entities)].copy()
+            df_hmem_all_k8s = df_hmem[df_hmem[entity_col_h].isin(all_k8s_entities)].copy()
+            
+            if os.path.exists(HOST_MODEL_PATH):
+                _, k8s_host_fc, _, _ = train_or_load_ensemble(
+                    df_hcpu_all_k8s,
+                    df_hmem_all_k8s,
+                    horizon_min=7*24*60,
+                    model_path=HOST_MODEL_PATH,
+                    force_retrain=False,
+                    generate_fresh_forecast=True,
+                    dump_csv_dir=None,
+                    context={'node': 'k8s_host_all'},
+                    enable_plots=enable_plots
+                )
+    
+    # Handle unknown_cluster nodes (have pods but cluster can't be determined)
+    if unknown_cluster_entities:
+        print("\n" + "="*80)
+        print("KUBERNETES UNKNOWN CLUSTER MODEL (Host + Pod data - cluster unknown) — FORECAST")
+        print("="*80)
+        print(f"  Processing {len(unknown_cluster_entities)} nodes with pods but unknown cluster")
+        
+        entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
+        entity_col_p = 'entity' if 'entity' in df_pcpu.columns else 'instance'
+        
+        df_hcpu_unknown = df_hcpu[df_hcpu[entity_col_h].isin(unknown_cluster_entities)].copy()
+        df_hmem_unknown = df_hmem[df_hmem[entity_col_h].isin(unknown_cluster_entities)].copy()
+        df_pcpu_unknown = df_pcpu[df_pcpu[entity_col_p].isin(unknown_cluster_entities)].copy()
+        df_pmem_unknown = df_pmem[df_pmem[entity_col_p].isin(unknown_cluster_entities)].copy()
+        
+        df_combined_cpu = combine_host_pod(df_hcpu_unknown, df_pcpu_unknown, 'cpu')
+        df_combined_mem = combine_host_pod(df_hmem_unknown, df_pmem_unknown, 'mem')
+        
+        if not df_combined_cpu.empty and not df_combined_mem.empty:
+            unknown_model_path = os.path.join(MODEL_DIR, "k8s_unknown_cluster_forecast.pkl")
+            if os.path.exists(unknown_model_path):
+                _, unknown_fc, _, _ = train_or_load_ensemble(
+                    df_combined_cpu,
+                    df_combined_mem,
+                    horizon_min=7*24*60,
+                    model_path=unknown_model_path,
+                    force_retrain=False,
+                    generate_fresh_forecast=True,
+                    dump_csv_dir=csv_dump_dir,
+                    context={'node': 'k8s_unknown_cluster'},
+                    enable_plots=enable_plots
+                )
+                k8s_cluster_forecasts['unknown_cluster'] = unknown_fc
+            else:
+                print(f"  ⚠ Warning: Unknown cluster model not found. Run with --training flag first.")
+    
+    # ====================== STANDALONE MODEL (Host only) — FORECAST ======================
+    standalone_fc = None
+    
+    if standalone_entities:
+        print("\n" + "="*80)
+        print("STANDALONE MODEL (Host data only - no Kubernetes) — FORECAST")
+        print("="*80)
+        
+        # Filter host data to only standalone nodes
+        entity_col = 'entity' if 'entity' in df_hcpu.columns else 'instance'
+        df_hcpu_standalone = df_hcpu[df_hcpu[entity_col].isin(standalone_entities)].copy()
+        df_hmem_standalone = df_hmem[df_hmem[entity_col].isin(standalone_entities)].copy()
+        
+        if not df_hcpu_standalone.empty and not df_hmem_standalone.empty:
+            if not os.path.exists(STANDALONE_MODEL_PATH):
+                print(f"⚠ Warning: Standalone model not found at {STANDALONE_MODEL_PATH}")
+                print("   Skipping standalone forecast. Run with --training flag first to train models.")
+                standalone_fc = None
+            else:
+                _, standalone_fc, _, _ = train_or_load_ensemble(
+                    df_hcpu_standalone,
+                    df_hmem_standalone,
+                    horizon_min=7*24*60,
+                    model_path=STANDALONE_MODEL_PATH,
+                    force_retrain=False,
+                    generate_fresh_forecast=True,
+                    dump_csv_dir=csv_dump_dir,
+                    context={'node': 'standalone'},
+                    enable_plots=enable_plots
+                )
+        else:
+            print("⚠ Warning: Insufficient data for standalone model")
     else:
-        _, pod_fc, _, pod_saved = train_or_load_ensemble(
-            df_pcpu,
-            df_pmem,
-            horizon_min=7*24*60,
-            model_path=POD_MODEL_PATH,
-            force_retrain=False,
-            generate_fresh_forecast=True,
-            dump_csv_dir=csv_dump_dir,
-            context={'node': 'pod'},
-            enable_plots=enable_plots
-        )
+        print("\n⚠ Warning: No standalone nodes found (all nodes have pods)")
+    
+    # For backward compatibility, set host_fc and pod_fc
+    # Use first available cluster forecast, or unknown_cluster, or standalone
+    pod_fc = None
+    if k8s_cluster_forecasts:
+        # Use the first cluster's forecast (or unknown_cluster if available)
+        if 'unknown_cluster' in k8s_cluster_forecasts:
+            pod_fc = k8s_cluster_forecasts['unknown_cluster']
+        else:
+            pod_fc = list(k8s_cluster_forecasts.values())[0]
+    
+    host_fc = k8s_host_fc if k8s_host_fc is not None else standalone_fc
     
     # ====================== DIVERGENCE & ANOMALY ======================
-    if host_fc is not None and pod_fc is not None:
-        host_mem = host_fc['yhat'].iloc[-1]
-        pod_mem = pod_fc['yhat'].iloc[-1]
-        div = abs(host_mem - pod_mem)
-        print(f"\nDivergence (host vs pod memory): {div:.3f}")
+    # Divergence only makes sense for Kubernetes nodes (comparing host vs combined host+pod)
+    if k8s_host_fc is not None and pod_fc is not None:
+        host_mem = k8s_host_fc['yhat'].iloc[-1]
+        combined_mem = pod_fc['yhat'].iloc[-1]
+        div = abs(host_mem - combined_mem)
+        print(f"\nDivergence (K8s host vs combined host+pod memory): {div:.3f}")
+    elif host_fc is not None:
+        node_type = 'Kubernetes' if pod_fc is not None else 'Standalone'
+        print(f"\nForecast available for {node_type} nodes")
     
     _, _, classification_anomalies_df, host_pressure_df = classification_model(
         df_hcpu,
@@ -4566,90 +6094,293 @@ if __name__ == "__main__":
     io_net_manifest = load_io_net_manifest(IO_NET_MODEL_MANIFEST_PATH)
     io_net_retrain_targets = parse_io_net_retrain_targets(args.io_net_retrain)
 
-    # ====================== HOST LAYER ======================
-    print("\n" + "="*80)
-    print("HOST LAYER (full node)")
-    print("="*80)
+    # ====================== IDENTIFY KUBERNETES VS STANDALONE NODES ======================
     q_host_cpu = '1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) by (instance)'
     q_host_mem = '(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes'
-
-    df_hcpu = fetch_and_preprocess_data(q_host_cpu)
-    df_hmem = fetch_and_preprocess_data(q_host_mem)
-    _, host_fc, host_metrics, host_saved = train_or_load_ensemble(
-        df_hcpu,
-        df_hmem,
-        horizon_min=7*24*60,
-        model_path=HOST_MODEL_PATH,
-        force_retrain=force_training,
-        show_backtest=show_backtest,
-        dump_csv_dir=csv_dump_dir,
-        context={'node': 'host'}
-    )
-    # Only show metrics when training or when --show-backtest is used
-    if (force_training or show_backtest) and host_metrics:
-        print("Host Model Metrics:")
-        for k, v in host_metrics.items():
-            if k == 'split_info' and isinstance(v, dict):
-                print(f"  • Train/Test Split:")
-                print(f"    - Train fraction: {v.get('train_fraction', 0)*100:.0f}%")
-                print(f"    - Train points: {v.get('train_points', 0):,}")
-                print(f"    - Test points: {v.get('test_points', 0):,}")
-                if v.get('train_start'):
-                    print(f"    - Train period: {v['train_start']} → {v['train_end']}")
-                if v.get('test_start'):
-                    print(f"    - Test period: {v['test_start']} → {v['test_end']}")
-            elif isinstance(v, (int, float)):
-                print(f"  • {k}: {v:.6f}")
-            else:
-                print(f"  • {k}: {v}")
-
-    # ====================== POD LAYER ======================
-    print("\n" + "="*80)
-    print("POD LAYER (apps only)")
-    print("="*80)
     q_pod_cpu = 'sum(rate(container_cpu_usage_seconds_total{container!="POD",container!=""}[5m])) by (instance)'
     q_pod_mem = 'sum(container_memory_working_set_bytes{container!="POD",container!=""}[5m]) by (instance)'
 
+    df_hcpu = fetch_and_preprocess_data(q_host_cpu)
+    df_hmem = fetch_and_preprocess_data(q_host_mem)
     df_pcpu = fetch_and_preprocess_data(q_pod_cpu)
     df_pmem = fetch_and_preprocess_data(q_pod_mem)
+    
+    # Alias resolution and entity canonicalization
     augment_aliases_from_dns(df_hcpu, df_pcpu)
     infer_aliases_from_timeseries(df_hcpu, df_pcpu)
     recanonicalize_entities(df_hcpu, df_hmem, df_pcpu, df_pmem)
     summarize_instance_roles(df_hcpu, df_pcpu)
-    print()
-    _, pod_fc, pod_metrics, pod_saved = train_or_load_ensemble(
-        df_pcpu,
-        df_pmem,
-        horizon_min=7*24*60,
-        model_path=POD_MODEL_PATH,
-        force_retrain=force_training,
-        show_backtest=show_backtest,
-        dump_csv_dir=csv_dump_dir,
-        context={'node': 'pod'}
-    )
-    # Only show metrics when training or when --show-backtest is used
-    if (force_training or show_backtest) and pod_metrics:
-        print("Pod Model Metrics:")
-        for k, v in pod_metrics.items():
-            if k == 'split_info' and isinstance(v, dict):
-                print(f"  • Train/Test Split:")
-                print(f"    - Train fraction: {v.get('train_fraction', 0)*100:.0f}%")
-                print(f"    - Train points: {v.get('train_points', 0):,}")
-                print(f"    - Test points: {v.get('test_points', 0):,}")
-                if v.get('train_start'):
-                    print(f"    - Train period: {v['train_start']} → {v['train_end']}")
-                if v.get('test_start'):
-                    print(f"    - Test period: {v['test_start']} → {v['test_end']}")
-            elif isinstance(v, (int, float)):
-                print(f"  • {k}: {v:.6f}")
+    
+    # Identify clusters to understand which nodes belong to which Kubernetes cluster
+    cluster_map = identify_clusters(df_hcpu, df_hmem, df_pcpu, df_pmem, lookback_hours=LOOKBACK_HOURS)
+    
+    # Group entities by cluster
+    def get_entity_set(df):
+        if df.empty:
+            return set()
+        entity_col = 'entity' if 'entity' in df.columns else 'instance'
+        return set(df[entity_col].unique())
+    
+    host_entities = get_entity_set(df_hcpu)
+    pod_entities = get_entity_set(df_pcpu)
+    
+    # Group entities by cluster_id
+    # Include ALL entities (both host and pod) to catch all nodes with pods
+    # But deduplicate by canonical identity AND alias map to avoid double-counting
+    # (e.g., pi and host03 are the same node, worker03 and host03 are the same node)
+    all_entities = host_entities | pod_entities
+    entities_by_cluster = {}
+    # Track which canonical identities we've already added (to prevent duplicates via aliases)
+    added_canonical = set()
+    for entity in all_entities:
+        entity_normalized = canonical_identity(entity)
+        # Check if this entity has an alias - if so, use the alias target for deduplication
+        alias_target = INSTANCE_ALIAS_MAP.get(entity_normalized)
+        if alias_target:
+            alias_target_canonical = canonical_identity(alias_target)
+            # If the alias target is already in the set, skip this entity (it's a duplicate)
+            if alias_target_canonical in added_canonical:
+                continue
+            # Use the alias target as the canonical identity
+            entity_normalized = alias_target_canonical
+        
+        # Skip if we've already added this canonical identity
+        if entity_normalized in added_canonical:
+            continue
+        
+        cluster_id = cluster_map.get(entity_normalized, 'standalone')
+        # Also check if any alias of this entity is in cluster_map
+        if entity_normalized not in cluster_map:
+            for alias_key, alias_val in INSTANCE_ALIAS_MAP.items():
+                if canonical_identity(alias_val) == entity_normalized:
+                    if alias_key in cluster_map:
+                        cluster_id = cluster_map[alias_key]
+                        break
+        
+        if cluster_id not in entities_by_cluster:
+            entities_by_cluster[cluster_id] = set()
+        entities_by_cluster[cluster_id].add(entity_normalized)
+        added_canonical.add(entity_normalized)
+    
+    # Separate Kubernetes clusters from standalone
+    # Include inferred_cluster_0 as a valid cluster (nodes with pods but no explicit cluster label)
+    k8s_clusters = {cid: ents for cid, ents in entities_by_cluster.items() 
+                    if cid != 'standalone' and not cid.startswith('unknown_cluster')}
+    standalone_entities = entities_by_cluster.get('standalone', set())
+    unknown_cluster_entities = entities_by_cluster.get('unknown_cluster', set())
+    
+    print(f"\nNode Classification:")
+    print(f"  • Kubernetes clusters: {len(k8s_clusters)}")
+    for cluster_id, entities in sorted(k8s_clusters.items()):
+        cluster_display = "inferred" if cluster_id.startswith('inferred_cluster') else cluster_id
+        print(f"    - Cluster '{cluster_display}': {len(entities)} nodes")
+    if unknown_cluster_entities:
+        print(f"  • Kubernetes nodes (cluster unknown): {len(unknown_cluster_entities)}")
+    print(f"  • Standalone nodes (no pods): {len(standalone_entities)}")
+    
+    # Helper function to combine host + pod data
+    def combine_host_pod(host_df, pod_df, metric_name):
+        """Combine host and pod data by averaging them per timestamp"""
+        if host_df.empty and pod_df.empty:
+            return pd.DataFrame()
+        
+        host_agg = host_df.groupby('timestamp')['value'].mean().reset_index(name='host')
+        pod_agg = pod_df.groupby('timestamp')['value'].mean().reset_index(name='pod')
+        
+        # Merge and average
+        combined = pd.merge(host_agg, pod_agg, on='timestamp', how='outer')
+        combined['value'] = (combined['host'].fillna(0) + combined['pod'].fillna(0)) / 2
+        # If one is missing, use the available one
+        combined.loc[combined['host'].isna(), 'value'] = combined.loc[combined['host'].isna(), 'pod']
+        combined.loc[combined['pod'].isna(), 'value'] = combined.loc[combined['pod'].isna(), 'host']
+        
+        return combined[['timestamp', 'value']]
+    
+    # ====================== KUBERNETES CLUSTER MODELS (Host + Pod per cluster) ======================
+    k8s_cluster_forecasts = {}  # cluster_id -> forecast
+    k8s_cluster_metrics = {}    # cluster_id -> metrics
+    k8s_cluster_saved = {}      # cluster_id -> was_saved
+    k8s_host_fc = None  # Combined host forecast for all K8s nodes (for divergence)
+    
+    if k8s_clusters:
+        print("\n" + "="*80)
+        print("KUBERNETES CLUSTER MODELS (Host + Pod data per cluster)")
+        print("="*80)
+        
+        entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
+        entity_col_p = 'entity' if 'entity' in df_pcpu.columns else 'instance'
+        
+        # Train separate model for each Kubernetes cluster
+        for cluster_id, cluster_entities in sorted(k8s_clusters.items()):
+            print(f"\n  Processing Cluster: {cluster_id} ({len(cluster_entities)} nodes)")
+            
+            # Filter data to this cluster's nodes
+            # cluster_entities contains canonical identities, so we need to match entities via canonical_identity
+            df_hcpu_cluster = df_hcpu[df_hcpu[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
+            df_hmem_cluster = df_hmem[df_hmem[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
+            df_pcpu_cluster = df_pcpu[df_pcpu[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
+            df_pmem_cluster = df_pmem[df_pmem[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
+            
+            # Combine host + pod data for this cluster
+            df_combined_cpu = combine_host_pod(df_hcpu_cluster, df_pcpu_cluster, 'cpu')
+            df_combined_mem = combine_host_pod(df_hmem_cluster, df_pmem_cluster, 'mem')
+            
+            if not df_combined_cpu.empty and not df_combined_mem.empty:
+                # Create cluster-specific model path
+                cluster_model_path = os.path.join(MODEL_DIR, f"k8s_cluster_{sanitize_label(cluster_id)}_forecast.pkl")
+                
+                _, cluster_fc, cluster_metrics, cluster_saved = train_or_load_ensemble(
+                    df_combined_cpu,
+                    df_combined_mem,
+                    horizon_min=7*24*60,
+                    model_path=cluster_model_path,
+                    force_retrain=force_training,
+                    show_backtest=show_backtest,
+                    dump_csv_dir=csv_dump_dir,
+                    context={'node': 'k8s_cluster', 'cluster_id': cluster_id}
+                )
+                
+                k8s_cluster_forecasts[cluster_id] = cluster_fc
+                k8s_cluster_metrics[cluster_id] = cluster_metrics
+                k8s_cluster_saved[cluster_id] = cluster_saved
+                
+                if (force_training or show_backtest) and cluster_metrics:
+                    print(f"    Cluster '{cluster_id}' Model Metrics:")
+                    for k, v in cluster_metrics.items():
+                        if k == 'split_info' and isinstance(v, dict):
+                            print(f"      • Train/Test Split:")
+                            print(f"        - Train fraction: {v.get('train_fraction', 0)*100:.0f}%")
+                            print(f"        - Train points: {v.get('train_points', 0):,}")
+                            print(f"        - Test points: {v.get('test_points', 0):,}")
+                        elif isinstance(v, (int, float)):
+                            print(f"      • {k}: {v:.6f}")
             else:
-                print(f"  • {k}: {v}")
+                print(f"    ⚠ Warning: Insufficient data for cluster '{cluster_id}'")
+        
+        # Also create combined host forecast for all K8s nodes (for divergence calculation)
+        all_k8s_entities = set()
+        for entities in k8s_clusters.values():
+            all_k8s_entities.update(entities)
+        
+        if all_k8s_entities:
+            df_hcpu_all_k8s = df_hcpu[df_hcpu[entity_col_h].isin(all_k8s_entities)].copy()
+            df_hmem_all_k8s = df_hmem[df_hmem[entity_col_h].isin(all_k8s_entities)].copy()
+            
+            _, k8s_host_fc, _, _ = train_or_load_ensemble(
+                df_hcpu_all_k8s,
+                df_hmem_all_k8s,
+                horizon_min=7*24*60,
+                model_path=HOST_MODEL_PATH,  # Reuse for backward compatibility
+                force_retrain=False,
+                show_backtest=False,
+                dump_csv_dir=None,
+                context={'node': 'k8s_host_all'}
+            )
+    
+    # Handle unknown_cluster nodes (have pods but cluster can't be determined)
+    if unknown_cluster_entities:
+        print("\n" + "="*80)
+        print("KUBERNETES UNKNOWN CLUSTER MODEL (Host + Pod data - cluster unknown)")
+        print("="*80)
+        print(f"  Processing {len(unknown_cluster_entities)} nodes with pods but unknown cluster")
+        
+        entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
+        entity_col_p = 'entity' if 'entity' in df_pcpu.columns else 'instance'
+        
+        df_hcpu_unknown = df_hcpu[df_hcpu[entity_col_h].isin(unknown_cluster_entities)].copy()
+        df_hmem_unknown = df_hmem[df_hmem[entity_col_h].isin(unknown_cluster_entities)].copy()
+        df_pcpu_unknown = df_pcpu[df_pcpu[entity_col_p].isin(unknown_cluster_entities)].copy()
+        df_pmem_unknown = df_pmem[df_pmem[entity_col_p].isin(unknown_cluster_entities)].copy()
+        
+        df_combined_cpu = combine_host_pod(df_hcpu_unknown, df_pcpu_unknown, 'cpu')
+        df_combined_mem = combine_host_pod(df_hmem_unknown, df_pmem_unknown, 'mem')
+        
+        if not df_combined_cpu.empty and not df_combined_mem.empty:
+            unknown_model_path = os.path.join(MODEL_DIR, "k8s_unknown_cluster_forecast.pkl")
+            _, unknown_fc, unknown_metrics, unknown_saved = train_or_load_ensemble(
+                df_combined_cpu,
+                df_combined_mem,
+                horizon_min=7*24*60,
+                model_path=unknown_model_path,
+                force_retrain=force_training,
+                show_backtest=show_backtest,
+                dump_csv_dir=csv_dump_dir,
+                context={'node': 'k8s_unknown_cluster'}
+            )
+            k8s_cluster_forecasts['unknown_cluster'] = unknown_fc
+            k8s_cluster_metrics['unknown_cluster'] = unknown_metrics
+            k8s_cluster_saved['unknown_cluster'] = unknown_saved
+    
+    # ====================== STANDALONE MODEL (Host only) ======================
+    standalone_fc = None
+    standalone_metrics = None
+    standalone_saved = False
+    
+    if standalone_entities:
+        print("\n" + "="*80)
+        print("STANDALONE MODEL (Host data only - no Kubernetes)")
+        print("="*80)
+        
+        # Filter host data to only standalone nodes
+        entity_col = 'entity' if 'entity' in df_hcpu.columns else 'instance'
+        df_hcpu_standalone = df_hcpu[df_hcpu[entity_col].isin(standalone_entities)].copy()
+        df_hmem_standalone = df_hmem[df_hmem[entity_col].isin(standalone_entities)].copy()
+        
+        if not df_hcpu_standalone.empty and not df_hmem_standalone.empty:
+            _, standalone_fc, standalone_metrics, standalone_saved = train_or_load_ensemble(
+                df_hcpu_standalone,
+                df_hmem_standalone,
+                horizon_min=7*24*60,
+                model_path=STANDALONE_MODEL_PATH,
+                force_retrain=force_training,
+                show_backtest=show_backtest,
+                dump_csv_dir=csv_dump_dir,
+                context={'node': 'standalone'}
+            )
+            
+            if (force_training or show_backtest) and standalone_metrics:
+                print("Standalone Model Metrics:")
+                for k, v in standalone_metrics.items():
+                    if k == 'split_info' and isinstance(v, dict):
+                        print(f"  • Train/Test Split:")
+                        print(f"    - Train fraction: {v.get('train_fraction', 0)*100:.0f}%")
+                        print(f"    - Train points: {v.get('train_points', 0):,}")
+                        print(f"    - Test points: {v.get('test_points', 0):,}")
+                        if v.get('train_start'):
+                            print(f"    - Train period: {v['train_start']} → {v['train_end']}")
+                        if v.get('test_start'):
+                            print(f"    - Test period: {v['test_start']} → {v['test_end']}")
+                    elif isinstance(v, (int, float)):
+                        print(f"  • {k}: {v:.6f}")
+                    else:
+                        print(f"  • {k}: {v}")
+        else:
+            print("⚠ Warning: Insufficient data for standalone model")
+    else:
+        print("\n⚠ Warning: No standalone nodes found (all nodes have pods)")
+    
+    # For backward compatibility, set host_fc and pod_fc
+    # Use first available cluster forecast, or unknown_cluster, or standalone
+    pod_fc = None
+    if k8s_cluster_forecasts:
+        # Use the first cluster's forecast (or unknown_cluster if available)
+        if 'unknown_cluster' in k8s_cluster_forecasts:
+            pod_fc = k8s_cluster_forecasts['unknown_cluster']
+        else:
+            pod_fc = list(k8s_cluster_forecasts.values())[0]
+    
+    host_fc = k8s_host_fc if k8s_host_fc is not None else standalone_fc
 
     # ====================== DIVERGENCE & ANOMALY ======================
-    host_mem = host_fc['yhat'].iloc[-1]
-    pod_mem  = pod_fc['yhat'].iloc[-1]
-    div = abs(host_mem - pod_mem)
-    print(f"\nDivergence (host vs pod memory): {div:.3f}")
+    # Divergence only makes sense for Kubernetes nodes (comparing host vs combined host+pod)
+    if k8s_host_fc is not None and pod_fc is not None:
+        host_mem = k8s_host_fc['yhat'].iloc[-1]
+        combined_mem = pod_fc['yhat'].iloc[-1]
+        div = abs(host_mem - combined_mem)
+        print(f"\nDivergence (K8s host vs combined host+pod memory): {div:.3f}")
+    elif host_fc is not None:
+        node_type = 'Kubernetes' if pod_fc is not None else 'Standalone'
+        print(f"\nForecast available for {node_type} nodes")
 
     _, _, _, _ = classification_model(
         df_hcpu,
@@ -4662,16 +6393,25 @@ if __name__ == "__main__":
     )
 
     # Print "models saved" message only when models were actually saved
-    if host_saved or pod_saved:
+    any_saved = any(k8s_cluster_saved.values()) if k8s_cluster_saved else False
+    any_saved = any_saved or standalone_saved
+    
+    if any_saved:
         saved_models = []
-        if host_saved:
-            saved_models.append(HOST_MODEL_PATH)
-        if pod_saved:
-            saved_models.append(POD_MODEL_PATH)
-        # LSTM is saved as part of ensemble training, so include it if either host or pod was saved
-        if (host_saved or pod_saved) and LSTM_AVAILABLE:
-            saved_models.append(LSTM_MODEL_PATH)
-        print(f"\nAll models saved: {', '.join(saved_models)}")
+        # Add all saved cluster models
+        for cluster_id, was_saved in k8s_cluster_saved.items():
+            if was_saved:
+                if cluster_id == 'unknown_cluster':
+                    saved_models.append("k8s_unknown_cluster_forecast.pkl")
+                else:
+                    saved_models.append(f"k8s_cluster_{sanitize_label(cluster_id)}_forecast.pkl")
+        if standalone_saved:
+            saved_models.append(os.path.basename(STANDALONE_MODEL_PATH))
+        # LSTM is saved as part of ensemble training, so include it if any model was saved
+        if any_saved and LSTM_AVAILABLE:
+            saved_models.append(os.path.basename(LSTM_MODEL_PATH))
+        if saved_models:
+            print(f"\nAll models saved: {', '.join(saved_models)}")
     print("\nDual-layer + LSTM + classification complete.")
 
     # ====================== DISK FULL PREDICTION — FULL TRANSPARENCY ======================
@@ -4865,7 +6605,7 @@ if __name__ == "__main__":
     anomalies_df = detect_golden_anomaly_signals(hours=1)
 
     if anomalies_df.empty:
-        print("\nNo active root-cause signals — cluster is clean and healthy")
+        print("\nNo active root-cause signals — estate is clean and healthy")
     else:
         print(f"\n{len(anomalies_df)} FAILURE SIGNALS DETECTED:")
         print(anomalies_df.to_string(index=False))
@@ -4897,12 +6637,12 @@ if __name__ == "__main__":
         print(crisis_df.sort_values("hybrid_eta_days")[['node', 'signal', 'current', 'hybrid_eta_days', 'severity']].to_string(index=False))
 
     print(f"\nForecast plots + models → {FORECAST_PLOTS_DIR}/")
-    print("Your cluster is now protected by real, validated, visualized AI.")
+    print("Your estate is now protected by real, validated, visualized AI.")
     print("="*80)
 
     # ====================== I/O + NETWORK — FULL ENSEMBLE (CPU/MEM GRADE) ======================
     print("\n" + "="*80)
-    print("DISK I/O + NETWORK — FULL ENSEMBLE FORECAST & ANOMALY DETECTION (same brain as CPU/Memory)")
+    print("DISK I/O + NETWORK — FULL ENSEMBLE FORECAST & ANOMALY DETECTION")
     print("="*80)
 
     io_net_crisis_df, io_net_anomaly_df, io_net_manifest, io_net_manifest_changed = predict_io_and_network_ensemble(
@@ -4926,14 +6666,36 @@ if __name__ == "__main__":
 
     if not io_net_anomaly_df.empty:
         print(f"\n{len(io_net_anomaly_df)} I/O OR NETWORK ANOMALIES DETECTED:")
-        print(io_net_anomaly_df.to_string(index=False))
+        print("\n" + "="*80)
+        
+        # Group by severity for better readability
+        critical = io_net_anomaly_df[io_net_anomaly_df['severity'] == 'CRITICAL'] if 'severity' in io_net_anomaly_df.columns else pd.DataFrame()
+        warning = io_net_anomaly_df[io_net_anomaly_df['severity'] == 'WARNING'] if 'severity' in io_net_anomaly_df.columns else pd.DataFrame()
+        info = io_net_anomaly_df[io_net_anomaly_df['severity'] == 'INFO'] if 'severity' in io_net_anomaly_df.columns else pd.DataFrame()
+        
+        # Print human-readable descriptions if available
+        if 'description' in io_net_anomaly_df.columns:
+            for idx, row in io_net_anomaly_df.iterrows():
+                print(f"\n{row['description']}")
+                print("-" * 80)
+        else:
+            # Fallback to technical table if descriptions not available
+            print(io_net_anomaly_df[['node', 'signal', 'current', 'severity', 'deviation_pct']].to_string(index=False))
+        
+        # Also show technical summary table for reference
+        print("\n" + "="*80)
+        print("TECHNICAL SUMMARY (for detailed analysis):")
+        print("="*80)
+        tech_cols = ['node', 'signal', 'current', 'severity', 'deviation_pct', 'score', 'mae_ensemble']
+        tech_cols = [c for c in tech_cols if c in io_net_anomaly_df.columns]
+        print(io_net_anomaly_df[tech_cols].to_string(index=False))
 
     if io_net_crisis_df.empty and io_net_anomaly_df.empty:
         print("\nI/O and Network layers are healthy, predictable, and anomaly-free")
-        print("Your cluster is running at true FAANG-grade intelligence.")
+        print("I/O and Network monitoring is operating within expected parameters.")
 
     print(f"\nAll plots + models saved → {FORECAST_PLOTS_DIR}/")
-    print("AI SRE Brain v2.0 — Unified across CPU • Memory • Disk • I/O • Network")
+    print("Metrics AI — Unified forecasting and anomaly detection across CPU • Memory • Disk • I/O • Network")
     print("="*80)
 
     if args.anomaly_watch > 0:

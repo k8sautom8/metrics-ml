@@ -5,6 +5,8 @@ A comprehensive ML-powered forecasting and anomaly detection system for Kubernet
 ## Features
 
 - **Dual-Layer Forecasting**: Separate models for Host (full node) and Pod (Kubernetes workloads) layers
+- **Kubernetes Cluster Awareness**: Automatic cluster identification and per-cluster model training
+- **Standalone Node Support**: Separate handling for nodes without Kubernetes workloads
 - **Ensemble Models**: Combines Prophet, ARIMA, and LSTM for robust predictions
 - **Multiple Metric Types**: CPU, Memory, Disk Usage, Disk I/O, Network bandwidth
 - **Anomaly Detection**: Isolation Forest-based classification for detecting anomalous nodes
@@ -451,25 +453,40 @@ python3 metrics.py --forecast \
 
 ### Model Files (`MODEL_FILES_DIR`)
 
-- `host_forecast.pkl` - Host layer ensemble model
-- `pod_forecast.pkl` - Pod layer ensemble model
-- `lstm_model.pkl` - LSTM model (if TensorFlow available)
-- `host_arima.pkl` - Host ARIMA model parameters
-- `host_prophet_params.pkl` - Host Prophet hyperparameters
-- `pod_arima.pkl` - Pod ARIMA model parameters
-- `pod_prophet_params.pkl` - Pod Prophet hyperparameters
+#### Kubernetes Cluster Models
+- `k8s_cluster_{cluster_id}_forecast.pkl` - Per-cluster ensemble model (host + pod combined)
+- `k8s_cluster_{cluster_id}_arima.pkl` - Per-cluster ARIMA model parameters
+- `k8s_cluster_{cluster_id}_prophet_params.pkl` - Per-cluster Prophet hyperparameters
+- `k8s_cluster_{cluster_id}_forecast.pkl.meta.json` - Cluster model metadata
+
+#### Standalone Node Models
+- `standalone_forecast.pkl` - Standalone nodes ensemble model
+- `standalone_arima.pkl` - Standalone ARIMA model parameters
+- `standalone_prophet_params.pkl` - Standalone Prophet hyperparameters
+
+#### Legacy Models (Backward Compatibility)
+- `host_forecast.pkl` - Legacy host layer ensemble model
+- `pod_forecast.pkl` - Legacy pod layer ensemble model
+- `host_arima.pkl` - Legacy host ARIMA model parameters
+- `host_prophet_params.pkl` - Legacy host Prophet hyperparameters
+- `pod_arima.pkl` - Legacy pod ARIMA model parameters
+- `pod_prophet_params.pkl` - Legacy pod Prophet hyperparameters
+
+#### Shared Models
+- `lstm_model.pkl` - LSTM model (if TensorFlow available, shared across clusters)
 - `disk_full_models.pkl` - Disk models manifest
 - `io_net_models.pkl` - I/O and Network models manifest
-- `isolation_forest_anomaly.pkl` - Anomaly detection model
+- `isolation_forest_anomaly.pkl` - Anomaly detection model (per-cluster)
 - `*.meta.json` - Model metadata files
 
 ### Forecast Plots (`FORECAST_PLOTS_DIR`)
 
-#### Host/Pod Layer
-- `host_layer_forecast.png` - Host layer forecast (default 7d historical + 7d forecast, configurable)
-- `pod_layer_forecast.png` - Pod layer forecast (default 7d historical + 7d forecast, configurable)
-- `host_layer_backtest.png` - Host layer backtest (generated during training/--show-backtest)
-- `pod_layer_backtest.png` - Pod layer backtest (generated during training/--show-backtest)
+#### Host/Pod Layer (Cluster-Aware)
+- `k8s_layer_forecast.png` - Kubernetes cluster forecast (aggregated across all clusters, default 7d historical + 7d forecast, configurable)
+- `k8s_layer_backtest.png` - Kubernetes cluster backtest (generated during training/--show-backtest)
+- `standalone_layer_forecast.png` - Standalone nodes forecast (default 7d historical + 7d forecast, configurable)
+- `standalone_layer_backtest.png` - Standalone nodes backtest (generated during training/--show-backtest)
+- Legacy: `host_layer_forecast.png`, `pod_layer_forecast.png`, `host_layer_backtest.png`, `pod_layer_backtest.png` (for backward compatibility)
 
 #### Disk Models
 - `disk_{node}_{mountpoint}_forecast.png` - Individual disk forecast plots
@@ -570,12 +587,14 @@ Final prediction: Weighted ensemble of all three models
 
 ### Minimal Updates (Forecast Mode)
 
-In `--forecast` mode, models receive minimal updates:
-- **Prophet**: Loads saved hyperparameters, fits on last 7 days of data, saves updated hyperparameters
+In `--forecast` mode, models receive minimal updates (required, not optional):
+- **Prophet**: Loads saved hyperparameters, fits on last 7 days of data with optimized settings (`n_changepoints=10` for 30-40% faster fitting), saves updated hyperparameters
 - **ARIMA**: Uses saved model order, fits on latest data, saves updated model
 - **LSTM**: Loads pre-trained model, fine-tunes for 2 epochs on last 2 days, saves updated model
 
 This preserves learned patterns while incorporating recent trends. All model files (including `host_arima.pkl`, `pod_arima.pkl`, `host_prophet_params.pkl`, `pod_prophet_params.pkl`) are updated with the latest timestamp after minimal updates.
+
+**Performance**: Minimal updates are optimized for speed, especially beneficial when processing 100+ nodes. I/O and Network models include additional optimizations: pre-computed retrain matching, progress reporting, and conditional plot generation.
 
 ### Plot Window Overrides
 
@@ -626,7 +645,8 @@ chmod 755 forecast_plots
 ## Performance
 
 - **Training Mode**: ~5-15 minutes (depends on data volume)
-- **Forecast Mode**: ~10-30 seconds (optimized for frequent runs)
+- **Forecast Mode**: ~10-30 seconds for typical deployments (optimized for frequent runs)
+  - **I/O and Network**: ~200-400 seconds for 100 nodes (optimized with faster Prophet settings, progress reporting, and conditional plot generation)
 - **Normal Mode**: ~5-10 seconds (uses cached models)
 
 ## License
