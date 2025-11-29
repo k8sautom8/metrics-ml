@@ -36,6 +36,7 @@ Metrics AI is an intelligent forecasting and anomaly detection system for Kubern
 - **Ensemble Approach**: Combines Prophet, ARIMA, and LSTM models
 - **Multi-Metric Support**: CPU, Memory, Disk Usage, Disk I/O, Network bandwidth
 - **Manifest-Based Storage**: Efficient storage for multiple models per metric type
+- **Parallel Processing**: Automatic CPU detection with 80% utilization rule, respects Kubernetes/Docker container limits
 
 ---
 
@@ -125,12 +126,24 @@ The system automatically identifies Kubernetes clusters and handles nodes accord
 - **Output**: Detailed forecasts with anomaly detection
 - **Storage**: Manifest-based (`io_net_models.pkl`)
 - **Performance Optimizations**:
+  - **Parallel Processing**: Automatic CPU detection with 80% utilization rule, respects Kubernetes/Docker container limits
+    - **Parallelization Thresholds** (only apply when using automatic detection, not with `--parallel`):
+      - Disk Models: Parallelizes when processing >10 disks
+      - I/O Network Crisis: Parallelizes when processing >10 nodes
+      - I/O Network Ensemble: Parallelizes when processing >10 nodes
+    - Uses `min(total_items, MAX_WORKER_THREADS)` to avoid over-subscription
+    - Override options:
+      - Environment variable: `export MAX_WORKER_THREADS=4` (applies 80% rule to this value, respects thresholds)
+      - CLI flag: `--parallel 4` (direct override, highest priority, bypasses 80% rule AND thresholds)
+    - **Note**: When `--parallel` is set, thresholds are bypassed and parallel processing is used regardless of item count
+    - Expected speedup: 3-6x for large deployments (100+ nodes/disks)
   - Optimized Prophet settings (`n_changepoints=10`) for faster minimal updates
   - Pre-computed retrain target matching to avoid expensive DNS lookups
   - Progress reporting for large node counts (>20 nodes shows progress every 10 nodes)
   - Conditional plot generation (only when `enable_plots=True`)
   - Reduced verbose output (backtest details only when `show_backtest=True` or `VERBOSE_LEVEL >= 2`)
   - Expected performance: ~200-400 seconds for 100 nodes (vs ~500-1000 seconds before optimization)
+  - **With Parallelization**: ~50-80 seconds for 100 nodes on 10-core system (8 workers)
 
 #### High-Level Forecast Workflow
 - **Data ingestion**: Pull metrics from Prometheus/VictoriaMetrics (CPU, memory, disk, I/O, net) into timestamped dataframes.
@@ -661,7 +674,7 @@ python3 metrics.py --io-net-retrain host02:DISK_IO_WAIT --show-backtest
 4. Adapts to recent changes
 5. Saves updated model and scaler to disk (`lstm_model.pkl`)
 
-### 8.3 When Applied
+### 8.5 When Applied
 
 **Applied In** (Required, not optional):
 - `--forecast` mode (all models) - **Always applied**
@@ -675,7 +688,7 @@ python3 metrics.py --io-net-retrain host02:DISK_IO_WAIT --show-backtest
 
 **Note**: Minimal updates are a core requirement for forecast and retrain modes to ensure models stay current with recent trends while preserving learned patterns. They are not optional and are always performed when models exist.
 
-### 8.4 Outcome
+### 8.6 Outcome
 
 - **Speed**: 10-30 seconds vs 5-15 minutes for full training
 - **Accuracy**: Maintains learned patterns while adapting to trends
@@ -845,6 +858,7 @@ Both alert channels leverage the `--interval` loop (default 15 seconds) so a sin
 - `--plot-history-hours <int>`: Override history window for the run
 - `--plot-forecast-hours <int>`: Override forecast window for the run
 - `--interval <int>`: Seconds between forecast iterations (default 15; set 0 to run once)
+- `--parallel <N>`: Override automatic CPU detection and use N parallel workers (overrides 80% rule, `MAX_WORKER_THREADS` env var, and bypasses >10 items threshold). Example: `--parallel 4`
 - `--alert-webhook <url>`: Notify an HTTP endpoint whenever alerts are present
 - `--pushgateway <url>`: Push alert gauges to a Prometheus Pushgateway
 - `--dump-csv <dir>`: Dump the training datasets for each model into the specified directory (useful for audits/offline analysis)

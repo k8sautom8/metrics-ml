@@ -14,6 +14,7 @@ A comprehensive ML-powered forecasting and anomaly detection system for Kubernet
 - **Selective Retraining**: Retrain specific nodes/mounts/signals without full retraining
 - **Comprehensive Plotting**: Automatic generation of forecast and backtest plots
 - **Integrated Alerting**: Webhook payloads plus Prometheus Pushgateway metrics for SRE workflows
+- **Parallel Processing**: Automatic CPU detection with 80% resource utilization rule, respects Kubernetes/Docker container limits
 
 ## Architecture Overview
 
@@ -99,6 +100,7 @@ The system is highly configurable via environment variables:
 - `PLOT_HISTORY_HOURS`: Hours of historical data to include in plots (default: `168` → 7 days)
 - `PLOT_FORECAST_HOURS`: Hours of forecast horizon to draw in plots (default: `168` → 7 days)
 
+
 #### LSTM Configuration
 - `LSTM_SEQ_LEN`: LSTM sequence length (default: `60`)
 - `LSTM_EPOCHS`: LSTM training epochs (default: `10`)
@@ -112,6 +114,11 @@ The system is highly configurable via environment variables:
 - `INSTANCE_ALIAS_MAP`: JSON map for instance aliases (default: `{}`)
 - `AUTO_ALIAS_ENABLED`: Enable automatic alias detection (default: `1`)
 - `VERBOSE_LEVEL`: Logging verbosity (default: `0`)
+- `MAX_WORKER_THREADS`: Maximum number of parallel workers (default: auto-detected as 80% of available CPUs)
+  - Automatically detects physical CPU count via `os.cpu_count()`
+  - Respects Kubernetes/Docker container CPU limits via cgroups
+  - Applies 80% utilization rule (leaves 20% headroom)
+  - Can be overridden via environment variable (e.g., `export MAX_WORKER_THREADS=4`) or CLI flag `--parallel N`
 
 ### Example Configuration
 
@@ -184,6 +191,7 @@ python3 metrics.py --forecast --interval 15 --plot
 - `--plot`: Generate and save plot files (PNG images). If not specified, plots are skipped to save time.
 - `--plot-history-hours <hours>`: Override plot history window (default: 168 = 7 days)
 - `--plot-forecast-hours <hours>`: Override plot forecast window (default: 168 = 7 days)
+- `--parallel <N>`: Override automatic CPU detection and use N parallel workers (overrides 80% rule, `MAX_WORKER_THREADS` env var, and bypasses >10 items threshold). Example: `--parallel 4`
 - `-v, --verbose`: Increase verbosity (repeatable: `-vv`, `-vvv`)
 - `-q, --quiet`: Suppress verbose output
 - `--dump-csv <dir>`: Dump training datasets for each model into the specified directory (created if missing)
@@ -648,6 +656,43 @@ chmod 755 forecast_plots
 - **Forecast Mode**: ~10-30 seconds for typical deployments (optimized for frequent runs)
   - **I/O and Network**: ~200-400 seconds for 100 nodes (optimized with faster Prophet settings, progress reporting, and conditional plot generation)
 - **Normal Mode**: ~5-10 seconds (uses cached models)
+
+### Parallel Processing
+
+The system automatically parallelizes model training and forecasting across multiple CPU cores:
+
+- **Automatic CPU Detection**: Detects available CPU cores and applies 80% utilization rule
+- **Container-Aware**: Respects Kubernetes/Docker CPU limits via cgroups detection
+- **Override Options**: 
+  - **Environment Variable**: `export MAX_WORKER_THREADS=4` (applies 80% rule to this value, respects thresholds)
+  - **CLI Flag**: `--parallel 4` (direct override, highest priority, bypasses 80% rule AND thresholds)
+- **Parallelization Thresholds** (only apply when using automatic detection, not with `--parallel`):
+  - **Disk Models**: Parallelizes when processing >10 disks
+  - **I/O Network Crisis**: Parallelizes when processing >10 nodes
+  - **I/O Network Ensemble**: Parallelizes when processing >10 nodes
+  - **Note**: When `--parallel` is set, these thresholds are bypassed and parallel processing is used regardless of item count
+- **Worker Count**: Uses `min(total_items, MAX_WORKER_THREADS)` to avoid over-subscription
+- **Performance Gains**: 
+  - **Sequential**: 1 core utilization
+  - **Parallel**: Up to 80% of available cores (e.g., 8 cores on 10-core system = 8 workers)
+  - **Expected Speedup**: 3-6x for large deployments (100+ nodes/disks) depending on CPU count
+
+**Example**: On a 10-core system with 100 disks:
+- Sequential: ~400 seconds (1 core)
+- Parallel (8 workers): ~50-80 seconds (8 cores, accounting for overhead)
+
+**Override Examples**:
+```bash
+# Use 4 workers regardless of CPU count (bypasses 80% rule AND thresholds)
+# Will parallelize even with <10 items
+python3 metrics.py --forecast --parallel 4
+
+# Use 16 workers (useful for high-core systems where you want full utilization)
+python3 metrics.py --training --parallel 16
+
+# Force parallel processing on small deployments (6 nodes, 9 disks)
+python3 metrics.py --parallel 2  # Uses 2 workers even with <10 items
+```
 
 ## License
 

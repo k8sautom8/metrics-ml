@@ -30,6 +30,7 @@ import matplotlib.pyplot as plt; plt.ion()
 import matplotlib.dates as mdates
 from datetime import datetime, timedelta
 import joblib
+from joblib import Parallel, delayed
 import warnings
 
 # --- YAML support (optional) ---
@@ -166,6 +167,144 @@ VERBOSE_LEVEL = int(os.getenv("VERBOSE_LEVEL", "0"))
 # DNS domain suffixes to try when resolving hostnames (comma-separated)
 DNS_DOMAIN_SUFFIXES = [d.strip() for d in os.getenv("DNS_DOMAIN_SUFFIXES", ".london.local,.local").split(",") if d.strip()]
 FORCE_TRAINING_RUN = False
+
+# ----------------------------------------------------------------------
+# CPU Detection and Resource Limits (Kubernetes/Docker aware)
+# ----------------------------------------------------------------------
+def get_cpu_limit_from_cgroups():
+    """
+    Detect CPU limits from cgroups (Kubernetes/Docker).
+    Returns the CPU limit in cores (float) or None if not found.
+    
+    Checks:
+    - /sys/fs/cgroup/cpu.max (cgroups v2)
+    - /sys/fs/cgroup/cpu/cpu.cfs_quota_us and cpu.cfs_period_us (v1)
+    """
+    cpu_limit = None
+    
+    # Try cgroups v2 first (newer systems)
+    cpu_max_path = "/sys/fs/cgroup/cpu.max"
+    if os.path.exists(cpu_max_path):
+        try:
+            with open(cpu_max_path, 'r') as f:
+                content = f.read().strip()
+                if content and content != "max":
+                    # Format: "quota period" or "max"
+                    parts = content.split()
+                    if len(parts) == 2 and parts[0] != "max":
+                        quota = int(parts[0])
+                        period = int(parts[1])
+                        if period > 0:
+                            cpu_limit = quota / period
+        except (ValueError, IOError, OSError):
+            pass
+    
+    # Try cgroups v1 (older systems, Docker)
+    if cpu_limit is None:
+        quota_path = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
+        period_path = "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
+        if os.path.exists(quota_path) and os.path.exists(period_path):
+            try:
+                with open(quota_path, 'r') as f:
+                    quota = int(f.read().strip())
+                with open(period_path, 'r') as f:
+                    period = int(f.read().strip())
+                # -1 means unlimited
+                if quota > 0 and period > 0:
+                    cpu_limit = quota / period
+            except (ValueError, IOError, OSError):
+                pass
+    
+    return cpu_limit
+
+def get_effective_cpu_count():
+    """
+    Get effective CPU count for parallel processing.
+    
+    Strategy:
+    1. Check explicit override via MAX_WORKER_THREADS env var
+    2. Check container limits (cgroups) - use 80% of limit
+    3. Use 80% of physical CPU count (thumb rule)
+    4. Minimum of 1 core
+    
+    Returns:
+        int: Number of CPU cores to use for parallel processing
+    """
+    # Explicit override (highest priority)
+    explicit_limit = os.getenv("MAX_WORKER_THREADS")
+    if explicit_limit:
+        try:
+            count = int(explicit_limit)
+            if count > 0:
+                return max(1, count)
+        except ValueError:
+            pass
+    
+    # Get physical CPU count
+    physical_cpus = os.cpu_count() or 1
+    
+    # Check container limits (Kubernetes/Docker)
+    container_limit = get_cpu_limit_from_cgroups()
+    
+    # Determine available CPUs
+    if container_limit is not None:
+        # In container: use 80% of container limit
+        available_cpus = container_limit
+        source = "container limit"
+    else:
+        # On host: use 80% of physical CPUs
+        available_cpus = physical_cpus
+        source = "physical CPUs"
+    
+    # Apply 80% thumb rule (leave 20% headroom for OS and other processes)
+    effective_cpus = int(available_cpus * 0.8)
+    
+    # Ensure minimum of 1 core
+    effective_cpus = max(1, effective_cpus)
+    
+    # Log the decision
+    if VERBOSE_LEVEL >= 1:
+        container_info = f" (container limit: {container_limit:.2f})" if container_limit else ""
+        print(f"CPU Detection: {effective_cpus} workers from {source} ({physical_cpus} physical CPUs{container_info})")
+    
+    return effective_cpus
+
+# Get effective CPU count for parallel processing
+# This can be overridden by --parallel CLI flag or MAX_WORKER_THREADS env var
+MAX_WORKER_THREADS = get_effective_cpu_count()
+# Track CLI override for display purposes
+CLI_PARALLEL_OVERRIDE = None
+
+# Print CPU detection details at startup
+def print_cpu_info(cli_override=None):
+    """Print CPU detection and parallelization configuration."""
+    physical_cpus = os.cpu_count() or 1
+    container_limit = get_cpu_limit_from_cgroups()
+    explicit_limit = os.getenv("MAX_WORKER_THREADS")
+    
+    print("="*80)
+    print("PARALLEL PROCESSING CONFIGURATION")
+    print("="*80)
+    print(f"  Physical CPUs detected: {physical_cpus}")
+    if container_limit:
+        print(f"  Container CPU limit: {container_limit:.2f} cores (cgroups)")
+    else:
+        print(f"  Container CPU limit: None (running on host)")
+    if cli_override is not None:
+        print(f"  CLI override (--parallel): {cli_override}")
+        print(f"  Effective workers: {MAX_WORKER_THREADS} (from --parallel flag)")
+    elif explicit_limit:
+        print(f"  Environment override (MAX_WORKER_THREADS): {explicit_limit}")
+        print(f"  Effective workers: {MAX_WORKER_THREADS} (from environment variable)")
+    else:
+        print(f"  Auto-detection: Using 80% rule")
+        print(f"  Effective workers: {MAX_WORKER_THREADS} (80% of available CPUs)")
+    print(f"  Parallelization thresholds:")
+    print(f"    ├─ Disk Models: >10 disks")
+    print(f"    ├─ I/O Network Crisis: >10 nodes")
+    print(f"    └─ I/O Network Ensemble: >10 nodes")
+    print("="*80)
+
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -744,6 +883,13 @@ def parse_cli_args():
         "--plot",
         action="store_true",
         help="Generate and save plot files (PNG images). If not specified, plots are skipped to save time."
+    )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Override automatic CPU detection and use N parallel workers (overrides 80%% rule and MAX_WORKER_THREADS env var). Example: --parallel 4"
     )
     return parser.parse_args()
 
@@ -1962,6 +2108,228 @@ def fetch_and_preprocess_data(query, start_hours_ago=START_HOURS_AGO, step=STEP)
 # ----------------------------------------------------------------------
 # DISK FULL PREDICTION — HYBRID LINEAR + PROPHET (7-day accurate ETA)
 # ----------------------------------------------------------------------
+def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, threshold_pct,
+                         manifest_snapshot, retrain_targets, FORCE_TRAINING_RUN, forecast_mode,
+                         dump_csv_dir, enable_plots, show_backtest):
+    """
+    Worker function to process a single disk (node/mountpoint) for disk full prediction.
+    This function is designed to be called in parallel.
+    Returns: dict with result, metrics, and model info, or None if skipped
+    """
+    try:
+        raw_label = None
+        if 'raw_instance' in group.columns and not group['raw_instance'].dropna().empty:
+            raw_label = group['raw_instance'].dropna().iloc[-1]
+        node = canonical_node_label(entity, with_ip=True, raw_label=raw_label)
+        key = build_disk_key(entity, mountpoint)
+        dump_label = f"disk_{node}_{mountpoint}"
+        
+        # Enhanced matching logic
+        is_first_training = key not in manifest_snapshot
+        needs_retrain = FORCE_TRAINING_RUN or is_first_training
+        if not needs_retrain and retrain_targets and '__RETRAIN_ALL__' in retrain_targets:
+            needs_retrain = True
+        elif not needs_retrain and retrain_targets:
+            entity_match = entity in retrain_targets
+            key_match = key in retrain_targets
+            mount_match = any(f":{mountpoint}" in t or f"|{mountpoint}" in t for t in retrain_targets)
+            alias_match = False
+            for target in retrain_targets:
+                if '|' in target or ':' in target:
+                    continue
+                target_canon = canonical_identity(target)
+                if target_canon == entity:
+                    alias_match = True
+                    break
+                if target_canon in INSTANCE_ALIAS_MAP:
+                    alias_value = INSTANCE_ALIAS_MAP[target_canon]
+                    if canonical_identity(alias_value) == entity:
+                        alias_match = True
+                        break
+                if alias_match:
+                    break
+            needs_retrain = entity_match or key_match or mount_match or alias_match
+        
+        ts = group.set_index('timestamp')['value'].sort_index()
+        if len(ts) < 50:
+            return None
+        
+        # Train/Test Split
+        split_idx = max(1, int(len(ts) * TRAIN_FRACTION))
+        if split_idx >= len(ts):
+            split_idx = len(ts) - 1
+        train_ts = ts.iloc[:split_idx]
+        test_ts = ts.iloc[split_idx:]
+        
+        # Use cached result if available and not retraining
+        if not needs_retrain and key in manifest_snapshot:
+            cached_record = dict(manifest_snapshot[key])
+            if 'ensemble_eta' not in cached_record:
+                cached_record['ensemble_eta'] = cached_record.get('days_to_90pct', 9999.0)
+            cached_record['days_to_90pct'] = max(0.0, cached_record.get('days_to_90pct', 9999.0))
+            cached_record['ensemble_eta'] = max(0.0, cached_record.get('ensemble_eta', 9999.0))
+            cached_record['linear_eta'] = max(0.0, cached_record.get('linear_eta', 9999.0))
+            cached_record['prophet_eta'] = max(0.0, cached_record.get('prophet_eta', 9999.0))
+            
+            # Minimal update in forecast mode
+            if forecast_mode:
+                try:
+                    pdf = train_ts.reset_index()
+                    pdf.columns = ['ds', 'y']
+                    pdf['y'] = pdf['y'].clip(upper=0.99)
+                    recent_pdf = pdf.tail(min(len(pdf), 7*24*6))
+                    m = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=False)
+                    m.fit(recent_pdf)
+                    future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
+                    forecast = m.predict(future)
+                    now_ts = pd.Timestamp.now()
+                    future_forecast = forecast[forecast['ds'] > now_ts]
+                    over = future_forecast[future_forecast['yhat'] >= threshold_pct/100]
+                    updated_prophet_days = max(0.0, (over.iloc[0]['ds'] - now_ts).total_seconds() / 86400) if not over.empty else 9999.0
+                    daily_increase = train_ts.diff().resample('1D').mean().mean()
+                    current_pct = ts.iloc[-1] * 100
+                    if current_pct >= threshold_pct:
+                        updated_linear_days = 0.0
+                        updated_prophet_days = 0.0
+                        updated_hybrid_days = 0.0
+                    else:
+                        updated_linear_days = max(0.0, (threshold_pct - current_pct) / (daily_increase * 100)) if daily_increase > 0.0001 else 9999.0
+                        updated_hybrid_days = max(0.0, min(updated_linear_days, updated_prophet_days))
+                    cached_record['days_to_90pct'] = round(updated_hybrid_days, 1)
+                    cached_record['ensemble_eta'] = round(updated_hybrid_days, 1)
+                    cached_record['linear_eta'] = round(updated_linear_days, 1)
+                    cached_record['prophet_eta'] = round(updated_prophet_days, 1)
+                    cached_record['alert'] = "CRITICAL" if updated_hybrid_days <= 0 else "CRITICAL" if updated_hybrid_days < 3 else "WARNING" if updated_hybrid_days < 7 else "SOON" if updated_hybrid_days < 30 else "OK"
+                except:
+                    pass
+            
+            return {
+                'result': cached_record,
+                'key': key,
+                'needs_retrain': False,
+                'metrics': None,
+                'train_points': len(train_ts) if show_backtest else None,
+                'test_points': len(test_ts) if show_backtest else None
+            }
+        
+        # Training/retraining logic
+        current_pct = ts.iloc[-1] * 100
+        if current_pct >= threshold_pct:
+            linear_days = 0.0
+            prophet_days = 0.0
+            hybrid_days = 0.0
+            severity = "CRITICAL"
+            prophet_model = None
+            prophet_forecast_df = None
+            prophet_mae = None
+            prophet_pred = None
+            linear_pred = None
+            linear_mae = None
+        else:
+            daily_increase = train_ts.diff().resample('1D').mean().mean()
+            if daily_increase > 0.0001:
+                linear_days = max(0.0, (threshold_pct - current_pct) / (daily_increase * 100))
+                if 0 < linear_days < 0.1:
+                    linear_days = 0.1
+            else:
+                linear_days = 9999.0
+            
+            # Prophet ETA
+            pdf = train_ts.reset_index()
+            pdf.columns = ['ds', 'y']
+            pdf['y'] = pdf['y'].clip(upper=0.99)
+            prophet_days = 9999.0
+            prophet_mae = None
+            prophet_pred = None
+            prophet_model = None
+            prophet_forecast_df = None
+            try:
+                if needs_retrain and key in manifest_snapshot:
+                    fit_pdf = pdf.tail(min(len(pdf), 7*24*6))
+                else:
+                    fit_pdf = pdf
+                if dump_csv_dir:
+                    fit_pdf_for_csv = fit_pdf.copy()
+                    fit_pdf_for_csv['node'] = node
+                    fit_pdf_for_csv['mountpoint'] = mountpoint
+                    dump_dataframe_to_csv(fit_pdf_for_csv, dump_csv_dir, dump_label)
+                else:
+                    dump_dataframe_to_csv(fit_pdf.copy(), dump_csv_dir, dump_label)
+                m = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=False)
+                m.fit(fit_pdf)
+                prophet_model = m
+                if needs_retrain and len(test_ts) > 0:
+                    test_df = test_ts.reset_index()
+                    test_df.columns = ['ds', 'y']
+                    test_forecast = m.predict(test_df[['ds']])
+                    prophet_pred = test_forecast['yhat'].values
+                    prophet_mae = mean_absolute_error(test_df['y'].values, prophet_pred)
+                future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
+                forecast = m.predict(future)
+                prophet_forecast_df = forecast
+                now_ts = pd.Timestamp.now()
+                future_forecast = forecast[forecast['ds'] > now_ts]
+                over = future_forecast[future_forecast['yhat'] >= threshold_pct/100]
+                prophet_days = max(0.0, (over.iloc[0]['ds'] - now_ts).total_seconds() / 86400) if not over.empty else 9999.0
+            except:
+                prophet_days = max(0.0, linear_days) if 'linear_days' in locals() else 9999.0
+            
+            # Linear MAE
+            linear_pred = None
+            linear_mae = None
+            if needs_retrain and len(test_ts) > 1:
+                base_value = train_ts.iloc[-1]
+                time_diffs = (test_ts.index - train_ts.index[-1]).total_seconds() / 86400
+                linear_pred = base_value + time_diffs * daily_increase
+                linear_mae = mean_absolute_error(test_ts.values, linear_pred.values)
+            
+            hybrid_days = max(0.0, min(linear_days, prophet_days))
+            severity = "CRITICAL" if hybrid_days < 3 else "WARNING" if hybrid_days < 7 else "SOON" if hybrid_days < 30 else "OK"
+        
+        # Ensemble MAE
+        ensemble_mae = None
+        if needs_retrain:
+            if linear_pred is not None and prophet_pred is not None and len(test_ts) > 0:
+                ensemble_pred = pd.Series(np.minimum(linear_pred.values, prophet_pred), index=test_ts.index)
+                ensemble_mae = mean_absolute_error(test_ts.values, ensemble_pred.values)
+            elif prophet_pred is not None and len(test_ts) > 0:
+                ensemble_mae = prophet_mae
+            elif linear_pred is not None and len(test_ts) > 0:
+                ensemble_mae = linear_mae
+        
+        record = {
+            'instance': node,
+            'mountpoint': mountpoint,
+            'current_%': round(current_pct, 2),
+            'days_to_90pct': round(hybrid_days, 1),
+            'ensemble_eta': round(hybrid_days, 1),
+            'linear_eta': round(linear_days, 1),
+            'prophet_eta': round(prophet_days, 1),
+            'alert': severity
+        }
+        
+        metrics = {
+            'linear_mae': linear_mae,
+            'prophet_mae': prophet_mae,
+            'ensemble_mae': ensemble_mae
+        } if needs_retrain else None
+        
+        return {
+            'result': record,
+            'key': key,
+            'needs_retrain': needs_retrain,
+            'metrics': metrics,
+            'train_points': len(train_ts),
+            'test_points': len(test_ts),
+            'train_start': str(train_ts.index[0]) if not train_ts.empty else None,
+            'train_end': str(train_ts.index[-1]) if not train_ts.empty else None,
+            'test_start': str(test_ts.index[0]) if not test_ts.empty else None,
+            'test_end': str(test_ts.index[-1]) if not test_ts.empty else None
+        }
+    except Exception as e:
+        log_verbose(f"  Error processing disk {entity}|{mountpoint}: {e}")
+        return None
+
 def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                            manifest=None, retrain_targets=None, show_backtest=False,
                            forecast_mode=False, dump_csv_dir=None, enable_plots=True):
@@ -1991,119 +2359,168 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
     mount_col = 'filesystem' if 'filesystem' in df_disk.columns else 'mountpoint'
     retrained_nodes = set()  # Track which nodes/mounts were retrained
     
-    for (entity, mountpoint), group in df_disk.groupby(['entity', mount_col]):
-        raw_label = None
-        if 'raw_instance' in group.columns and not group['raw_instance'].dropna().empty:
-            raw_label = group['raw_instance'].dropna().iloc[-1]
-        node = canonical_node_label(entity, with_ip=True, raw_label=raw_label)
-        key = build_disk_key(entity, mountpoint)
-        dump_label = f"disk_{node}_{mountpoint}"
+    # Prepare for parallelization
+    disk_groups = list(df_disk.groupby(['entity', mount_col]))
+    total_disks = len(disk_groups)
+    # If --parallel flag is set, bypass threshold and use parallel processing
+    # Otherwise, only parallelize if we have enough items to justify overhead
+    use_parallel = (CLI_PARALLEL_OVERRIDE is not None) or (total_disks > 10 and MAX_WORKER_THREADS > 1)
+    n_workers = min(total_disks, MAX_WORKER_THREADS) if use_parallel else 1
+    
+    if total_disks > 5:
+        if use_parallel:
+            print(f"  Processing {total_disks} disks in PARALLEL mode:")
+            print(f"    ├─ Available workers: {MAX_WORKER_THREADS}")
+            print(f"    ├─ Workers used: {n_workers} (min({total_disks}, {MAX_WORKER_THREADS}))")
+            print(f"    └─ Expected speedup: ~{n_workers}x (vs sequential)")
+        else:
+            print(f"  Processing {total_disks} disks in SEQUENTIAL mode:")
+            print(f"    ├─ Available workers: {MAX_WORKER_THREADS}")
+            if CLI_PARALLEL_OVERRIDE is None:
+                reason = 'Too few items (<10)' if total_disks <= 10 else 'Single worker only'
+            else:
+                reason = 'Single worker only (MAX_WORKER_THREADS=1)'
+            print(f"    ├─ Reason: {reason}")
+            print(f"    └─ Workers used: 1")
+    
+    # Process disks in parallel or sequentially
+    if use_parallel:
+        # Parallel processing
+        manifest_snapshot = manifest.copy()
+        processed_results = Parallel(n_jobs=n_workers, verbose=0)(
+            delayed(_process_single_disk)(
+                entity, mountpoint, group, mount_col, horizon_days, threshold_pct,
+                manifest_snapshot, retrain_targets, FORCE_TRAINING_RUN, forecast_mode,
+                dump_csv_dir, enable_plots, show_backtest
+            )
+            for (entity, mountpoint), group in disk_groups
+        )
         
-        # Enhanced matching logic (similar to I/O and network)
-        # We keep the retrain rules readable: first-time builds always retrain, then we let targets override.
-        is_first_training = key not in manifest
-        needs_retrain = FORCE_TRAINING_RUN or is_first_training
-        # Check for "all" flag first
-        if not needs_retrain and retrain_targets and '__RETRAIN_ALL__' in retrain_targets:
-            needs_retrain = True
-        elif not needs_retrain and retrain_targets:
-            # Direct matches
-            entity_match = entity in retrain_targets
-            key_match = key in retrain_targets
-            mount_match = any(f":{mountpoint}" in t or f"|{mountpoint}" in t for t in retrain_targets)
+        # Process results and aggregate metrics
+        for idx, proc_result in enumerate(processed_results):
+            if proc_result is None:
+                continue
             
-            # Alias matching
-            alias_match = False
-            # Allow retrain targets to reference aliases or informal node names.
-            for target in retrain_targets:
-                if '|' in target or ':' in target:
-                    continue  # Skip keys, only check node names
-                target_canon = canonical_identity(target)
-                # Direct match
-                if target_canon == entity:
-                    alias_match = True
-                    break
-                # Check alias map
-                if target_canon in INSTANCE_ALIAS_MAP:
-                    alias_value = INSTANCE_ALIAS_MAP[target_canon]
-                    if canonical_identity(alias_value) == entity:
-                        alias_match = True
-                        break
-                # Reverse alias check
-                for k, v in INSTANCE_ALIAS_MAP.items():
-                    if canonical_identity(v) == entity and canonical_identity(k) == target_canon:
-                        alias_match = True
-                        break
-                if alias_match:
-                    break
-                # Check source registry IPs
-                target_ip = SOURCE_REGISTRY.get(target_canon) or CANON_SOURCE_MAP.get(target_canon)
-                entity_ip = SOURCE_REGISTRY.get(entity) or CANON_SOURCE_MAP.get(entity)
-                if target_ip and entity_ip and target_ip == entity_ip:
-                    alias_match = True
-                    break
-                # DNS resolution (only if target looks like a hostname)
-                if looks_like_hostname(target) and '(' in node and ')' in node:
-                    node_ip = node.split('(')[1].split(')')[0].strip()
-                    target_variants = [target] + [f"{target}{d}" for d in DNS_DOMAIN_SUFFIXES if d and not target.endswith(d)]
-                    for target_var in target_variants:
-                        try:
-                            target_resolved = socket.gethostbyname(target_var)
-                            if target_resolved == node_ip:
-                                alias_match = True
-                                log_verbose(f"   DNS match: {target_var} → {target_resolved} == {node_ip}")
-                                break
-                        except Exception as e:
-                            log_verbose(f"   DNS resolution failed for {target_var}: {e}")
-                    if alias_match:
-                        break
-            
-            needs_retrain = entity_match or key_match or mount_match or alias_match
-        
-        ts = group.set_index('timestamp')['value'].sort_index()
-        if len(ts) < 50:
-            continue
-            
-        # Train/Test Split (only compute when retraining)
-        split_idx = max(1, int(len(ts) * TRAIN_FRACTION))
-        if split_idx >= len(ts):
-            split_idx = len(ts) - 1
-        train_ts = ts.iloc[:split_idx]
-        test_ts = ts.iloc[split_idx:]
-        
-        # Only collect metrics when retraining
-        if needs_retrain:
-            all_train_points.append(len(train_ts))
-            all_test_points.append(len(test_ts))
-            if not train_ts.empty:
-                train_starts.append(str(train_ts.index[0]))
-                train_ends.append(str(train_ts.index[-1]))
-            if not test_ts.empty:
-                test_starts.append(str(test_ts.index[0]))
-                test_ends.append(str(test_ts.index[-1]))
-        
-        # Use cached result if available and not retraining
-        if not needs_retrain and key in manifest:
-            cached_record = dict(manifest[key])
-            # Ensure ensemble_eta exists (it's the same as days_to_90pct)
-            if 'ensemble_eta' not in cached_record:
-                cached_record['ensemble_eta'] = cached_record.get('days_to_90pct', 9999.0)
-            
-            # Sanitize cached record: ensure all eta values are non-negative
-            # This fixes any negative values that might have been stored in previous runs
-            cached_record['days_to_90pct'] = max(0.0, cached_record.get('days_to_90pct', 9999.0))
-            cached_record['ensemble_eta'] = max(0.0, cached_record.get('ensemble_eta', 9999.0))
-            cached_record['linear_eta'] = max(0.0, cached_record.get('linear_eta', 9999.0))
-            cached_record['prophet_eta'] = max(0.0, cached_record.get('prophet_eta', 9999.0))
-            
-            # Update manifest with sanitized values to prevent future negative values
-            manifest[key] = cached_record
+            alerts.append(proc_result['result'])
+            manifest[proc_result['key']] = proc_result['result']
             manifest_changed = True
             
-            alerts.append(cached_record)
-            # Compute metrics for cached models if show_backtest is true
-            if show_backtest:
-                # Collect metrics for cached models
+            if proc_result['needs_retrain']:
+                retrained_nodes.add(f"{proc_result['result']['instance']} | {proc_result['result']['mountpoint']}")
+            
+            # Collect metrics
+            if proc_result['metrics']:
+                if proc_result['metrics']['linear_mae'] is not None:
+                    all_mae_linear.append(proc_result['metrics']['linear_mae'])
+                if proc_result['metrics']['prophet_mae'] is not None:
+                    all_mae_prophet.append(proc_result['metrics']['prophet_mae'])
+                if proc_result['metrics']['ensemble_mae'] is not None:
+                    all_mae_ensemble.append(proc_result['metrics']['ensemble_mae'])
+            
+            if proc_result['train_points']:
+                all_train_points.append(proc_result['train_points'])
+            if proc_result['test_points']:
+                all_test_points.append(proc_result['test_points'])
+            if proc_result.get('train_start'):
+                train_starts.append(proc_result['train_start'])
+            if proc_result.get('train_end'):
+                train_ends.append(proc_result['train_end'])
+            if proc_result.get('test_start'):
+                test_starts.append(proc_result['test_start'])
+            if proc_result.get('test_end'):
+                test_ends.append(proc_result['test_end'])
+            
+            if total_disks > 5 and (idx + 1) % 10 == 0:
+                print(f"    → Progress: {idx + 1}/{total_disks} disks processed...", end='\r')
+        
+        if total_disks > 5:
+            print()  # New line after progress
+        successful_disks = len([r for r in processed_results if r is not None])
+        print(f"    ✓ Parallel execution complete: {successful_disks}/{total_disks} disks processed successfully")
+    else:
+        # Sequential processing (original code)
+        for (entity, mountpoint), group in disk_groups:
+            raw_label = None
+            if 'raw_instance' in group.columns and not group['raw_instance'].dropna().empty:
+                raw_label = group['raw_instance'].dropna().iloc[-1]
+            node = canonical_node_label(entity, with_ip=True, raw_label=raw_label)
+            key = build_disk_key(entity, mountpoint)
+            dump_label = f"disk_{node}_{mountpoint}"
+            
+            # Enhanced matching logic (similar to I/O and network)
+            # We keep the retrain rules readable: first-time builds always retrain, then we let targets override.
+            is_first_training = key not in manifest
+            needs_retrain = FORCE_TRAINING_RUN or is_first_training
+            # Check for "all" flag first
+            if not needs_retrain and retrain_targets and '__RETRAIN_ALL__' in retrain_targets:
+                needs_retrain = True
+            elif not needs_retrain and retrain_targets:
+                # Direct matches
+                entity_match = entity in retrain_targets
+                key_match = key in retrain_targets
+                mount_match = any(f":{mountpoint}" in t or f"|{mountpoint}" in t for t in retrain_targets)
+                
+                # Alias matching
+                alias_match = False
+                # Allow retrain targets to reference aliases or informal node names.
+                for target in retrain_targets:
+                    if '|' in target or ':' in target:
+                        continue  # Skip keys, only check node names
+                    target_canon = canonical_identity(target)
+                    # Direct match
+                    if target_canon == entity:
+                        alias_match = True
+                        break
+                    # Check alias map
+                    if target_canon in INSTANCE_ALIAS_MAP:
+                        alias_value = INSTANCE_ALIAS_MAP[target_canon]
+                        if canonical_identity(alias_value) == entity:
+                            alias_match = True
+                            break
+                    # Reverse alias check
+                    for k, v in INSTANCE_ALIAS_MAP.items():
+                        if canonical_identity(v) == entity and canonical_identity(k) == target_canon:
+                            alias_match = True
+                            break
+                    if alias_match:
+                        break
+                    # Check source registry IPs
+                    target_ip = SOURCE_REGISTRY.get(target_canon) or CANON_SOURCE_MAP.get(target_canon)
+                    entity_ip = SOURCE_REGISTRY.get(entity) or CANON_SOURCE_MAP.get(entity)
+                    if target_ip and entity_ip and target_ip == entity_ip:
+                        alias_match = True
+                        break
+                    # DNS resolution (only if target looks like a hostname)
+                    if looks_like_hostname(target) and '(' in node and ')' in node:
+                        node_ip = node.split('(')[1].split(')')[0].strip()
+                        target_variants = [target] + [f"{target}{d}" for d in DNS_DOMAIN_SUFFIXES if d and not target.endswith(d)]
+                        for target_var in target_variants:
+                            try:
+                                target_resolved = socket.gethostbyname(target_var)
+                                if target_resolved == node_ip:
+                                    alias_match = True
+                                    log_verbose(f"   DNS match: {target_var} → {target_resolved} == {node_ip}")
+                                    break
+                            except Exception as e:
+                                log_verbose(f"   DNS resolution failed for {target_var}: {e}")
+                        if alias_match:
+                            break
+                
+                needs_retrain = entity_match or key_match or mount_match or alias_match
+            
+            ts = group.set_index('timestamp')['value'].sort_index()
+            if len(ts) < 50:
+                continue
+                
+            # Train/Test Split (only compute when retraining)
+            split_idx = max(1, int(len(ts) * TRAIN_FRACTION))
+            if split_idx >= len(ts):
+                split_idx = len(ts) - 1
+            train_ts = ts.iloc[:split_idx]
+            test_ts = ts.iloc[split_idx:]
+            
+            # Only collect metrics when retraining
+            if needs_retrain:
                 all_train_points.append(len(train_ts))
                 all_test_points.append(len(test_ts))
                 if not train_ts.empty:
@@ -2112,129 +2529,359 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                 if not test_ts.empty:
                     test_starts.append(str(test_ts.index[0]))
                     test_ends.append(str(test_ts.index[-1]))
+            
+            # Use cached result if available and not retraining
+            if not needs_retrain and key in manifest:
+                cached_record = dict(manifest[key])
+                # Ensure ensemble_eta exists (it's the same as days_to_90pct)
+                if 'ensemble_eta' not in cached_record:
+                    cached_record['ensemble_eta'] = cached_record.get('days_to_90pct', 9999.0)
                 
-                # Compute linear MAE
-                daily_increase = train_ts.diff().resample('1D').mean().mean()
-                linear_pred = None
-                if len(test_ts) > 1:
-                    base_value = train_ts.iloc[-1]
-                    time_diffs = (test_ts.index - train_ts.index[-1]).total_seconds() / 86400
-                    linear_pred = base_value + time_diffs * daily_increase
-                    linear_mae = mean_absolute_error(test_ts.values, linear_pred.values)
-                    all_mae_linear.append(linear_mae)
+                # Sanitize cached record: ensure all eta values are non-negative
+                # This fixes any negative values that might have been stored in previous runs
+                cached_record['days_to_90pct'] = max(0.0, cached_record.get('days_to_90pct', 9999.0))
+                cached_record['ensemble_eta'] = max(0.0, cached_record.get('ensemble_eta', 9999.0))
+                cached_record['linear_eta'] = max(0.0, cached_record.get('linear_eta', 9999.0))
+                cached_record['prophet_eta'] = max(0.0, cached_record.get('prophet_eta', 9999.0))
                 
-                # Compute Prophet MAE
+                # Update manifest with sanitized values to prevent future negative values
+                manifest[key] = cached_record
+                manifest_changed = True
+                
+                alerts.append(cached_record)
+                # Compute metrics for cached models if show_backtest is true
+                if show_backtest:
+                    # Collect metrics for cached models
+                    all_train_points.append(len(train_ts))
+                    all_test_points.append(len(test_ts))
+                    if not train_ts.empty:
+                        train_starts.append(str(train_ts.index[0]))
+                        train_ends.append(str(train_ts.index[-1]))
+                    if not test_ts.empty:
+                        test_starts.append(str(test_ts.index[0]))
+                        test_ends.append(str(test_ts.index[-1]))
+                    
+                    # Compute linear MAE
+                    daily_increase = train_ts.diff().resample('1D').mean().mean()
+                    linear_pred = None
+                    if len(test_ts) > 1:
+                        base_value = train_ts.iloc[-1]
+                        time_diffs = (test_ts.index - train_ts.index[-1]).total_seconds() / 86400
+                        linear_pred = base_value + time_diffs * daily_increase
+                        linear_mae = mean_absolute_error(test_ts.values, linear_pred.values)
+                        all_mae_linear.append(linear_mae)
+                    
+                    # Compute Prophet MAE
+                    prophet_pred = None
+                    try:
+                        pdf = train_ts.reset_index()
+                        pdf.columns = ['ds', 'y']
+                        pdf['y'] = pdf['y'].clip(upper=0.99)
+                        m = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=False)
+                        m.fit(pdf)
+                        if len(test_ts) > 0:
+                            test_df = test_ts.reset_index()
+                            test_df.columns = ['ds', 'y']
+                            test_forecast = m.predict(test_df[['ds']])
+                            prophet_pred = test_forecast['yhat'].values
+                            prophet_mae = mean_absolute_error(test_df['y'].values, prophet_pred)
+                            all_mae_prophet.append(prophet_mae)
+                    except:
+                        pass
+                    
+                    # Compute ensemble MAE
+                    if linear_pred is not None and prophet_pred is not None and len(test_ts) > 0:
+                        ensemble_pred = pd.Series(np.minimum(linear_pred.values, prophet_pred), index=test_ts.index)
+                        ensemble_mae = mean_absolute_error(test_ts.values, ensemble_pred.values)
+                        all_mae_ensemble.append(ensemble_mae)
+                    elif prophet_pred is not None and len(test_ts) > 0:
+                        all_mae_ensemble.append(prophet_mae)
+                    elif linear_pred is not None and len(test_ts) > 0:
+                        all_mae_ensemble.append(linear_mae)
+                
+                # Save plot for cached models too (forecast mode only)
+                # Also update forecast with minimal update (use recent data only) - only in forecast mode
+                if forecast_mode:
+                    try:
+                        # MINIMAL UPDATE: Use recent data only (last 7 days) for faster fitting
+                        # This incorporates latest trends while preserving learned patterns
+                        pdf = train_ts.reset_index()
+                        pdf.columns = ['ds', 'y']
+                        pdf['y'] = pdf['y'].clip(upper=0.99)
+                        # Use recent data for minimal update (last 7 days or all if less)
+                        recent_pdf = pdf.tail(min(len(pdf), 7*24*6))  # Last 7 days (6 data points per day for 10m intervals)
+                    
+                        prophet_forecast_df = None
+                        updated_prophet_days = cached_record.get('days_to_90pct', 9999.0)
+                        try:
+                            # Minimal update: fit on recent data only
+                            m = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=False)
+                            m.fit(recent_pdf)
+                            future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
+                            forecast = m.predict(future)
+                            prophet_forecast_df = forecast
+                            # Update forecast with minimal update
+                            # Only look at FUTURE forecast points (not historical)
+                            now_ts = pd.Timestamp.now()
+                            future_forecast = forecast[forecast['ds'] > now_ts]
+                            over = future_forecast[future_forecast['yhat'] >= threshold_pct/100]
+                            if not over.empty:
+                                updated_prophet_days_calc = (over.iloc[0]['ds'] - now_ts).total_seconds() / 86400
+                                # Ensure non-negative (should always be positive for future points, but clamp anyway)
+                                updated_prophet_days = max(0.0, updated_prophet_days_calc)
+                            else:
+                                # No future forecast point exceeds threshold
+                                updated_prophet_days = 9999.0
+                            # Update linear forecast too
+                            daily_increase = train_ts.diff().resample('1D').mean().mean()
+                            current_pct = ts.iloc[-1] * 100
+                            
+                            # Check if already exceeded threshold
+                            if current_pct >= threshold_pct:
+                                updated_linear_days = 0.0
+                                updated_prophet_days = 0.0
+                                updated_hybrid_days = 0.0
+                            else:
+                                if daily_increase > 0.0001:
+                                    updated_linear_days = (threshold_pct - current_pct) / (daily_increase * 100)
+                                    # Ensure non-negative - if calculation gives negative, disk is not approaching threshold
+                                    updated_linear_days = max(0.0, updated_linear_days)
+                                    # If very small positive value, set to minimum 0.1 for display
+                                    if 0 < updated_linear_days < 0.1:
+                                        updated_linear_days = 0.1
+                                else:
+                                    updated_linear_days = 9999.0
+                                # Update hybrid forecast (min of linear and prophet)
+                                updated_hybrid_days = min(updated_linear_days, updated_prophet_days)
+                                
+                                # Ensure all values are non-negative
+                                updated_linear_days = max(0.0, updated_linear_days)
+                                updated_prophet_days = max(0.0, updated_prophet_days)
+                                updated_hybrid_days = max(0.0, updated_hybrid_days)
+                            # Update cached record with fresh forecast - ensure all values are non-negative
+                            cached_record['days_to_90pct'] = round(max(0.0, updated_hybrid_days), 1)
+                            cached_record['ensemble_eta'] = round(max(0.0, updated_hybrid_days), 1)
+                            cached_record['linear_eta'] = round(max(0.0, updated_linear_days), 1)
+                            cached_record['prophet_eta'] = round(max(0.0, updated_prophet_days), 1)
+                            # Set alert severity - if already exceeded (0 days), mark as CRITICAL
+                            if updated_hybrid_days <= 0:
+                                cached_record['alert'] = "CRITICAL"
+                            else:
+                                cached_record['alert'] = "CRITICAL" if updated_hybrid_days < 3 else "WARNING" if updated_hybrid_days < 7 else "SOON" if updated_hybrid_days < 30 else "OK"
+                            manifest[key] = cached_record
+                            manifest_changed = True
+                            log_verbose(f"  → Disk forecast updated with minimal update: {node} | {mountpoint} → {updated_hybrid_days:.1f} days")
+                        except Exception as e:
+                            log_verbose(f"  → Minimal update failed, using cached forecast: {e}")
+                            pass
+                        
+                        # Compute linear trend for plotting (even if not computing backtest metrics)
+                        linear_pred = None
+                        if len(test_ts) > 1 and len(train_ts) > 0:
+                            daily_increase = train_ts.diff().resample('1D').mean().mean()
+                            base_value = train_ts.iloc[-1]
+                            time_diffs = (test_ts.index - train_ts.index[-1]).total_seconds() / 86400
+                            linear_pred = base_value + time_diffs * daily_increase
+                        
+                        plt.figure(figsize=(14, 7))
+                        # Plot historical data
+                        if len(train_ts) > 0:
+                            plt.plot(train_ts.index, train_ts.values * 100, label='Train Data', color='#1f77b4', alpha=0.7)
+                        if len(test_ts) > 0:
+                            plt.plot(test_ts.index, test_ts.values * 100, label='Test Data', color='#2ca02c', alpha=0.7)
+                        # Plot forecast if Prophet model was created successfully
+                        if prophet_forecast_df is not None:
+                            forecast_future = prophet_forecast_df[prophet_forecast_df['ds'] > ts.index[-1]]
+                            if not forecast_future.empty:
+                                plt.plot(forecast_future['ds'], forecast_future['yhat'] * 100, label='Prophet Forecast', color='#ff7f0e', linewidth=2)
+                                plt.fill_between(forecast_future['ds'], 
+                                                forecast_future['yhat_lower'] * 100, 
+                                                forecast_future['yhat_upper'] * 100, 
+                                                alpha=0.2, color='#ff7f0e')
+                        # Plot threshold line
+                        plt.axhline(threshold_pct, color='red', linestyle='--', linewidth=2, label=f'{threshold_pct}% Threshold')
+                        # Plot train/test split if available
+                        if len(test_ts) > 0 and len(train_ts) > 0:
+                            split_time = test_ts.index[0]
+                            plt.axvline(split_time, color='gray', linestyle=':', alpha=0.7, label='Train/Test Split')
+                        # Plot linear trend if available
+                        if linear_pred is not None and len(test_ts) > 0:
+                            plt.plot(test_ts.index, linear_pred.values * 100, label='Linear Trend', color='green', linestyle='--', alpha=0.7)
+                        plt.xlabel('Date')
+                        plt.ylabel('Disk Usage (%)')
+                        safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
+                        safe_mount = mountpoint.replace('/', '_')
+                        current_pct = ts.iloc[-1] * 100
+                        # Use updated forecast if available, otherwise use cached
+                        hybrid_days = cached_record.get('days_to_90pct', 9999.0)
+                        severity = cached_record.get('alert', 'OK')
+                        plt.title(f"{node} | {mountpoint}\nCurrent: {current_pct:.2f}% | ETA to {threshold_pct}%: {hybrid_days:.1f} days → {severity}")
+                        plt.legend()
+                        plt.grid(alpha=0.3)
+                        plt.tight_layout()
+                        if enable_plots:
+                            plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_forecast.png")
+                            plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                            print(f"  → Disk plot saved: {plot_file}")
+                        plt.close()
+                    except Exception as e:
+                        print(f"  ✗ Failed to save disk plot for cached model: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        try:
+                            plt.close()
+                        except:
+                            pass
+                continue
+            
+            # Track retrained nodes (including first-time training)
+            if needs_retrain:
+                retrained_nodes.add(f"{node} | {mountpoint}")
+                if should_verbose():
+                    logger.info("Disk forecast start → node=%s mount=%s", node, mountpoint)
+            elif should_verbose():
+                logger.info("Disk forecast start → node=%s mount=%s", node, mountpoint)
+            
+            current_pct = ts.iloc[-1] * 100
+            
+            # Check if already exceeded threshold
+            if current_pct >= threshold_pct:
+                # Already exceeded - set to 0 days
+                linear_days = 0.0
+                prophet_days = 0.0
+                hybrid_days = 0.0
+                severity = "CRITICAL"
+                # Skip Prophet calculation since already exceeded
+                prophet_model = None
+                prophet_forecast_df = None
+                prophet_mae = None
                 prophet_pred = None
+            else:
+                # Linear ETA (fast & reliable)
+                daily_increase = train_ts.diff().resample('1D').mean().mean()
+                if daily_increase > 0.0001:  # 0.01% per day
+                    linear_days = (threshold_pct - current_pct) / (daily_increase * 100)
+                    # Ensure non-negative - if calculation gives negative, disk is not approaching threshold
+                    linear_days = max(0.0, linear_days)
+                    # If very small positive value, set to minimum 0.1 for display
+                    if 0 < linear_days < 0.1:
+                        linear_days = 0.1
+                else:
+                    # No significant increase, disk not approaching threshold
+                    linear_days = 9999.0
+            
+            # Compute linear MAE on test set (only when retraining)
+            linear_pred = None
+            if needs_retrain and len(test_ts) > 1:
+                base_value = train_ts.iloc[-1]
+                time_diffs = (test_ts.index - train_ts.index[-1]).total_seconds() / 86400
+                linear_pred = base_value + time_diffs * daily_increase
+                linear_mae = mean_absolute_error(test_ts.values, linear_pred.values)
+                all_mae_linear.append(linear_mae)
+
+            # Prophet ETA (seasonal correction) - only if not already exceeded
+            if current_pct < threshold_pct:
+                pdf = train_ts.reset_index()
+                pdf.columns = ['ds', 'y']
+                pdf['y'] = pdf['y'].clip(upper=0.99)
+                
+                prophet_days = 9999.0
+                prophet_mae = None
+                prophet_pred = None
+                prophet_model = None
+                prophet_forecast_df = None
                 try:
-                    pdf = train_ts.reset_index()
-                    pdf.columns = ['ds', 'y']
-                    pdf['y'] = pdf['y'].clip(upper=0.99)
+                    # For retraining: use minimal update (recent data) if not first-time training
+                    # For first-time training: use all data to learn patterns
+                    if needs_retrain and key in manifest:
+                        # Minimal update: use recent data (last 7 days) to incorporate latest trends
+                        fit_pdf = pdf.tail(min(len(pdf), 7*24*6))  # Last 7 days
+                        log_verbose(f"  → Disk model minimal update (recent 7 days): {node} | {mountpoint}")
+                    else:
+                        # First-time training: use all data to learn patterns
+                        fit_pdf = pdf
+                    # Add node and mountpoint metadata to CSV
+                    if dump_csv_dir:
+                        fit_pdf_for_csv = fit_pdf.copy()
+                        fit_pdf_for_csv['node'] = node
+                        fit_pdf_for_csv['mountpoint'] = mountpoint
+                        dump_dataframe_to_csv(fit_pdf_for_csv, dump_csv_dir, dump_label)
+                    else:
+                        dump_dataframe_to_csv(fit_pdf.copy(), dump_csv_dir, dump_label)
                     m = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=False)
-                    m.fit(pdf)
-                    if len(test_ts) > 0:
+                    m.fit(fit_pdf)
+                    prophet_model = m  # Store for plotting
+                    
+                    # Compute Prophet MAE on test set (only when retraining)
+                    if needs_retrain and len(test_ts) > 0:
                         test_df = test_ts.reset_index()
                         test_df.columns = ['ds', 'y']
                         test_forecast = m.predict(test_df[['ds']])
                         prophet_pred = test_forecast['yhat'].values
                         prophet_mae = mean_absolute_error(test_df['y'].values, prophet_pred)
                         all_mae_prophet.append(prophet_mae)
+                    
+                    future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
+                    forecast = m.predict(future)
+                    prophet_forecast_df = forecast  # Store for plotting
+                    # Only look at FUTURE forecast points (not historical)
+                    now_ts = pd.Timestamp.now()
+                    future_forecast = forecast[forecast['ds'] > now_ts]
+                    over = future_forecast[future_forecast['yhat'] >= threshold_pct/100]
+                    if not over.empty:
+                        prophet_days_calc = (over.iloc[0]['ds'] - now_ts).total_seconds() / 86400
+                        # Ensure non-negative (should always be positive for future points, but clamp anyway)
+                        prophet_days = max(0.0, prophet_days_calc)
+                    else:
+                        # No future forecast point exceeds threshold
+                        prophet_days = 9999.0
                 except:
-                    pass
-                
-                # Compute ensemble MAE
+                    # Fallback to linear_days, but ensure it's non-negative
+                    prophet_days = max(0.0, linear_days) if 'linear_days' in locals() else 9999.0
+
+            # Compute ensemble MAE (min of linear and prophet) - only when retraining
+            if needs_retrain:
                 if linear_pred is not None and prophet_pred is not None and len(test_ts) > 0:
                     ensemble_pred = pd.Series(np.minimum(linear_pred.values, prophet_pred), index=test_ts.index)
                     ensemble_mae = mean_absolute_error(test_ts.values, ensemble_pred.values)
                     all_mae_ensemble.append(ensemble_mae)
                 elif prophet_pred is not None and len(test_ts) > 0:
+                    # Fallback to prophet if linear not available
                     all_mae_ensemble.append(prophet_mae)
                 elif linear_pred is not None and len(test_ts) > 0:
+                    # Fallback to linear if prophet not available
                     all_mae_ensemble.append(linear_mae)
+
+            # Only calculate hybrid_days if not already exceeded
+            if current_pct < threshold_pct:
+                hybrid_days = min(linear_days, prophet_days)
+                severity = "CRITICAL" if hybrid_days < 3 else "WARNING" if hybrid_days < 7 else "SOON" if hybrid_days < 30 else "OK"
+
+            # Ensure all values are non-negative before storing
+            linear_days = max(0.0, linear_days)
+            prophet_days = max(0.0, prophet_days)
+            hybrid_days = max(0.0, hybrid_days)
+
+            if should_verbose():
+                logger.info("Disk forecast done → node=%s mount=%s", node, mountpoint)
+
+            record = {
+                'instance': node,
+                'mountpoint': mountpoint,
+                'current_%': round(current_pct, 2),
+                'days_to_90pct': round(hybrid_days, 1),
+                'ensemble_eta': round(hybrid_days, 1),
+                'linear_eta': round(linear_days, 1),
+                'prophet_eta': round(prophet_days, 1),
+                'alert': severity
+            }
+            manifest[key] = record
+            manifest_changed = True
+            alerts.append(record)
             
-            # Save plot for cached models too (forecast mode only)
-            # Also update forecast with minimal update (use recent data only) - only in forecast mode
-            if forecast_mode:
+            # Save plot when retraining or when show_backtest is True
+            if needs_retrain or show_backtest:
                 try:
-                    # MINIMAL UPDATE: Use recent data only (last 7 days) for faster fitting
-                    # This incorporates latest trends while preserving learned patterns
-                    pdf = train_ts.reset_index()
-                    pdf.columns = ['ds', 'y']
-                    pdf['y'] = pdf['y'].clip(upper=0.99)
-                    # Use recent data for minimal update (last 7 days or all if less)
-                    recent_pdf = pdf.tail(min(len(pdf), 7*24*6))  # Last 7 days (6 data points per day for 10m intervals)
-                    
-                    prophet_forecast_df = None
-                    updated_prophet_days = cached_record.get('days_to_90pct', 9999.0)
-                    try:
-                        # Minimal update: fit on recent data only
-                        m = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=False)
-                        m.fit(recent_pdf)
-                        future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
-                        forecast = m.predict(future)
-                        prophet_forecast_df = forecast
-                        # Update forecast with minimal update
-                        # Only look at FUTURE forecast points (not historical)
-                        now_ts = pd.Timestamp.now()
-                        future_forecast = forecast[forecast['ds'] > now_ts]
-                        over = future_forecast[future_forecast['yhat'] >= threshold_pct/100]
-                        if not over.empty:
-                            updated_prophet_days_calc = (over.iloc[0]['ds'] - now_ts).total_seconds() / 86400
-                            # Ensure non-negative (should always be positive for future points, but clamp anyway)
-                            updated_prophet_days = max(0.0, updated_prophet_days_calc)
-                        else:
-                            # No future forecast point exceeds threshold
-                            updated_prophet_days = 9999.0
-                        # Update linear forecast too
-                        daily_increase = train_ts.diff().resample('1D').mean().mean()
-                        current_pct = ts.iloc[-1] * 100
-                        
-                        # Check if already exceeded threshold
-                        if current_pct >= threshold_pct:
-                            updated_linear_days = 0.0
-                            updated_prophet_days = 0.0
-                            updated_hybrid_days = 0.0
-                        else:
-                            if daily_increase > 0.0001:
-                                updated_linear_days = (threshold_pct - current_pct) / (daily_increase * 100)
-                                # Ensure non-negative - if calculation gives negative, disk is not approaching threshold
-                                updated_linear_days = max(0.0, updated_linear_days)
-                                # If very small positive value, set to minimum 0.1 for display
-                                if 0 < updated_linear_days < 0.1:
-                                    updated_linear_days = 0.1
-                            else:
-                                updated_linear_days = 9999.0
-                            # Update hybrid forecast (min of linear and prophet)
-                            updated_hybrid_days = min(updated_linear_days, updated_prophet_days)
-                            
-                            # Ensure all values are non-negative
-                            updated_linear_days = max(0.0, updated_linear_days)
-                            updated_prophet_days = max(0.0, updated_prophet_days)
-                            updated_hybrid_days = max(0.0, updated_hybrid_days)
-                        # Update cached record with fresh forecast - ensure all values are non-negative
-                        cached_record['days_to_90pct'] = round(max(0.0, updated_hybrid_days), 1)
-                        cached_record['ensemble_eta'] = round(max(0.0, updated_hybrid_days), 1)
-                        cached_record['linear_eta'] = round(max(0.0, updated_linear_days), 1)
-                        cached_record['prophet_eta'] = round(max(0.0, updated_prophet_days), 1)
-                        # Set alert severity - if already exceeded (0 days), mark as CRITICAL
-                        if updated_hybrid_days <= 0:
-                            cached_record['alert'] = "CRITICAL"
-                        else:
-                            cached_record['alert'] = "CRITICAL" if updated_hybrid_days < 3 else "WARNING" if updated_hybrid_days < 7 else "SOON" if updated_hybrid_days < 30 else "OK"
-                        manifest[key] = cached_record
-                        manifest_changed = True
-                        log_verbose(f"  → Disk forecast updated with minimal update: {node} | {mountpoint} → {updated_hybrid_days:.1f} days")
-                    except Exception as e:
-                        log_verbose(f"  → Minimal update failed, using cached forecast: {e}")
-                        pass
-                    
-                    # Compute linear trend for plotting (even if not computing backtest metrics)
-                    linear_pred = None
-                    if len(test_ts) > 1 and len(train_ts) > 0:
-                        daily_increase = train_ts.diff().resample('1D').mean().mean()
-                        base_value = train_ts.iloc[-1]
-                        time_diffs = (test_ts.index - train_ts.index[-1]).total_seconds() / 86400
-                        linear_pred = base_value + time_diffs * daily_increase
-                    
                     plt.figure(figsize=(14, 7))
                     # Plot historical data
                     if len(train_ts) > 0:
@@ -2263,10 +2910,6 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                     plt.ylabel('Disk Usage (%)')
                     safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
                     safe_mount = mountpoint.replace('/', '_')
-                    current_pct = ts.iloc[-1] * 100
-                    # Use updated forecast if available, otherwise use cached
-                    hybrid_days = cached_record.get('days_to_90pct', 9999.0)
-                    severity = cached_record.get('alert', 'OK')
                     plt.title(f"{node} | {mountpoint}\nCurrent: {current_pct:.2f}% | ETA to {threshold_pct}%: {hybrid_days:.1f} days → {severity}")
                     plt.legend()
                     plt.grid(alpha=0.3)
@@ -2277,206 +2920,11 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                         print(f"  → Disk plot saved: {plot_file}")
                     plt.close()
                 except Exception as e:
-                    print(f"  ✗ Failed to save disk plot for cached model: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    log_verbose(f"  → Failed to save disk plot: {e}")
                     try:
                         plt.close()
                     except:
                         pass
-            continue
-        
-        # Track retrained nodes (including first-time training)
-        if needs_retrain:
-            retrained_nodes.add(f"{node} | {mountpoint}")
-            if should_verbose():
-                logger.info("Disk forecast start → node=%s mount=%s", node, mountpoint)
-        elif should_verbose():
-            logger.info("Disk forecast start → node=%s mount=%s", node, mountpoint)
-            
-        current_pct = ts.iloc[-1] * 100
-        
-        # Check if already exceeded threshold
-        if current_pct >= threshold_pct:
-            # Already exceeded - set to 0 days
-            linear_days = 0.0
-            prophet_days = 0.0
-            hybrid_days = 0.0
-            severity = "CRITICAL"
-            # Skip Prophet calculation since already exceeded
-            prophet_model = None
-            prophet_forecast_df = None
-            prophet_mae = None
-            prophet_pred = None
-        else:
-            # Linear ETA (fast & reliable)
-            daily_increase = train_ts.diff().resample('1D').mean().mean()
-            if daily_increase > 0.0001:  # 0.01% per day
-                linear_days = (threshold_pct - current_pct) / (daily_increase * 100)
-                # Ensure non-negative - if calculation gives negative, disk is not approaching threshold
-                linear_days = max(0.0, linear_days)
-                # If very small positive value, set to minimum 0.1 for display
-                if 0 < linear_days < 0.1:
-                    linear_days = 0.1
-            else:
-                # No significant increase, disk not approaching threshold
-                linear_days = 9999.0
-        
-        # Compute linear MAE on test set (only when retraining)
-        linear_pred = None
-        if needs_retrain and len(test_ts) > 1:
-            base_value = train_ts.iloc[-1]
-            time_diffs = (test_ts.index - train_ts.index[-1]).total_seconds() / 86400
-            linear_pred = base_value + time_diffs * daily_increase
-            linear_mae = mean_absolute_error(test_ts.values, linear_pred.values)
-            all_mae_linear.append(linear_mae)
-
-        # Prophet ETA (seasonal correction) - only if not already exceeded
-        if current_pct < threshold_pct:
-            pdf = train_ts.reset_index()
-            pdf.columns = ['ds', 'y']
-            pdf['y'] = pdf['y'].clip(upper=0.99)
-            
-            prophet_days = 9999.0
-            prophet_mae = None
-            prophet_pred = None
-            prophet_model = None
-            prophet_forecast_df = None
-            try:
-                # For retraining: use minimal update (recent data) if not first-time training
-                # For first-time training: use all data to learn patterns
-                if needs_retrain and key in manifest:
-                    # Minimal update: use recent data (last 7 days) to incorporate latest trends
-                    fit_pdf = pdf.tail(min(len(pdf), 7*24*6))  # Last 7 days
-                    log_verbose(f"  → Disk model minimal update (recent 7 days): {node} | {mountpoint}")
-                else:
-                    # First-time training: use all data to learn patterns
-                    fit_pdf = pdf
-                # Add node and mountpoint metadata to CSV
-                if dump_csv_dir:
-                    fit_pdf_for_csv = fit_pdf.copy()
-                    fit_pdf_for_csv['node'] = node
-                    fit_pdf_for_csv['mountpoint'] = mountpoint
-                    dump_dataframe_to_csv(fit_pdf_for_csv, dump_csv_dir, dump_label)
-                else:
-                    dump_dataframe_to_csv(fit_pdf.copy(), dump_csv_dir, dump_label)
-                m = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=False)
-                m.fit(fit_pdf)
-                prophet_model = m  # Store for plotting
-                
-                # Compute Prophet MAE on test set (only when retraining)
-                if needs_retrain and len(test_ts) > 0:
-                    test_df = test_ts.reset_index()
-                    test_df.columns = ['ds', 'y']
-                    test_forecast = m.predict(test_df[['ds']])
-                    prophet_pred = test_forecast['yhat'].values
-                    prophet_mae = mean_absolute_error(test_df['y'].values, prophet_pred)
-                    all_mae_prophet.append(prophet_mae)
-                
-                future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
-                forecast = m.predict(future)
-                prophet_forecast_df = forecast  # Store for plotting
-                # Only look at FUTURE forecast points (not historical)
-                now_ts = pd.Timestamp.now()
-                future_forecast = forecast[forecast['ds'] > now_ts]
-                over = future_forecast[future_forecast['yhat'] >= threshold_pct/100]
-                if not over.empty:
-                    prophet_days_calc = (over.iloc[0]['ds'] - now_ts).total_seconds() / 86400
-                    # Ensure non-negative (should always be positive for future points, but clamp anyway)
-                    prophet_days = max(0.0, prophet_days_calc)
-                else:
-                    # No future forecast point exceeds threshold
-                    prophet_days = 9999.0
-            except:
-                # Fallback to linear_days, but ensure it's non-negative
-                prophet_days = max(0.0, linear_days) if 'linear_days' in locals() else 9999.0
-
-        # Compute ensemble MAE (min of linear and prophet) - only when retraining
-        if needs_retrain:
-            if linear_pred is not None and prophet_pred is not None and len(test_ts) > 0:
-                ensemble_pred = pd.Series(np.minimum(linear_pred.values, prophet_pred), index=test_ts.index)
-                ensemble_mae = mean_absolute_error(test_ts.values, ensemble_pred.values)
-                all_mae_ensemble.append(ensemble_mae)
-            elif prophet_pred is not None and len(test_ts) > 0:
-                # Fallback to prophet if linear not available
-                all_mae_ensemble.append(prophet_mae)
-            elif linear_pred is not None and len(test_ts) > 0:
-                # Fallback to linear if prophet not available
-                all_mae_ensemble.append(linear_mae)
-
-        # Only calculate hybrid_days if not already exceeded
-        if current_pct < threshold_pct:
-            hybrid_days = min(linear_days, prophet_days)
-            severity = "CRITICAL" if hybrid_days < 3 else "WARNING" if hybrid_days < 7 else "SOON" if hybrid_days < 30 else "OK"
-
-        # Ensure all values are non-negative before storing
-        linear_days = max(0.0, linear_days)
-        prophet_days = max(0.0, prophet_days)
-        hybrid_days = max(0.0, hybrid_days)
-
-        if should_verbose():
-            logger.info("Disk forecast done → node=%s mount=%s", node, mountpoint)
-
-        record = {
-            'instance': node,
-            'mountpoint': mountpoint,
-            'current_%': round(current_pct, 2),
-            'days_to_90pct': round(hybrid_days, 1),
-            'ensemble_eta': round(hybrid_days, 1),
-            'linear_eta': round(linear_days, 1),
-            'prophet_eta': round(prophet_days, 1),
-            'alert': severity
-        }
-        manifest[key] = record
-        manifest_changed = True
-        alerts.append(record)
-        
-        # Save plot when retraining or when show_backtest is True
-        if needs_retrain or show_backtest:
-            try:
-                plt.figure(figsize=(14, 7))
-                # Plot historical data
-                if len(train_ts) > 0:
-                    plt.plot(train_ts.index, train_ts.values * 100, label='Train Data', color='#1f77b4', alpha=0.7)
-                if len(test_ts) > 0:
-                    plt.plot(test_ts.index, test_ts.values * 100, label='Test Data', color='#2ca02c', alpha=0.7)
-                # Plot forecast if Prophet model was created successfully
-                if prophet_forecast_df is not None:
-                    forecast_future = prophet_forecast_df[prophet_forecast_df['ds'] > ts.index[-1]]
-                    if not forecast_future.empty:
-                        plt.plot(forecast_future['ds'], forecast_future['yhat'] * 100, label='Prophet Forecast', color='#ff7f0e', linewidth=2)
-                        plt.fill_between(forecast_future['ds'], 
-                                        forecast_future['yhat_lower'] * 100, 
-                                        forecast_future['yhat_upper'] * 100, 
-                                        alpha=0.2, color='#ff7f0e')
-                # Plot threshold line
-                plt.axhline(threshold_pct, color='red', linestyle='--', linewidth=2, label=f'{threshold_pct}% Threshold')
-                # Plot train/test split if available
-                if len(test_ts) > 0 and len(train_ts) > 0:
-                    split_time = test_ts.index[0]
-                    plt.axvline(split_time, color='gray', linestyle=':', alpha=0.7, label='Train/Test Split')
-                # Plot linear trend if available
-                if linear_pred is not None and len(test_ts) > 0:
-                    plt.plot(test_ts.index, linear_pred.values * 100, label='Linear Trend', color='green', linestyle='--', alpha=0.7)
-                plt.xlabel('Date')
-                plt.ylabel('Disk Usage (%)')
-                safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
-                safe_mount = mountpoint.replace('/', '_')
-                plt.title(f"{node} | {mountpoint}\nCurrent: {current_pct:.2f}% | ETA to {threshold_pct}%: {hybrid_days:.1f} days → {severity}")
-                plt.legend()
-                plt.grid(alpha=0.3)
-                plt.tight_layout()
-                if enable_plots:
-                    plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_forecast.png")
-                    plt.savefig(plot_file, dpi=180, bbox_inches='tight')
-                    print(f"  → Disk plot saved: {plot_file}")
-                plt.close()
-            except Exception as e:
-                log_verbose(f"  → Failed to save disk plot: {e}")
-                try:
-                    plt.close()
-                except:
-                    pass
 
     alerts_df = (pd.DataFrame(alerts).sort_values('days_to_90pct')
                  if alerts else pd.DataFrame(columns=["instance","mountpoint","current_%","days_to_90pct","ensemble_eta","linear_eta","prophet_eta","alert"]))
@@ -4253,6 +4701,147 @@ def detect_golden_anomaly_signals(hours=1):
 # ----------------------------------------------------------------------
 # 7. IO and NETWORK
 # ----------------------------------------------------------------------
+def _process_single_node_io_crisis(inst, group, name, thresholds, units, test_days, horizon_days, 
+                                    force_retrain, retrain_targets_set, retrain_all, retrain_targets_canon,
+                                    manifest_snapshot, forecast_mode, dump_csv_dir, plot_dir, enable_plots, show_backtest):
+    """
+    Worker function to process a single node for I/O crisis prediction.
+    This function is designed to be called in parallel.
+    Returns: (result_dict, updated_model_dict, manifest_changed_bool) or None if skipped
+    """
+    try:
+        node = canonical_node_label(inst, with_ip=True)
+        entity = canonical_identity(inst)
+        ts = group.set_index('timestamp')['value'].sort_index()
+        if len(ts) < 100:
+            return None
+        
+        dump_label = f"io_crisis_{node}_{name}"
+        
+        # Train/test split
+        test_cutoff = ts.index[-1] - pd.Timedelta(days=test_days)
+        train = ts[ts.index <= test_cutoff]
+        test = ts[ts.index > test_cutoff]
+        
+        if len(train) < 50 or len(test) < 10:
+            return None
+        
+        current = ts.iloc[-1]
+        threshold = thresholds[name]
+        
+        # Linear 7d burst
+        train_last_7d = train.loc[train.index >= (train.index[-1] - pd.Timedelta(days=7))]
+        trend_7d = train_last_7d.diff().mean() * 1440
+        linear_eta = 9999.0
+        if trend_7d > 0:
+            remaining = threshold - current
+            divisor = trend_7d / 100 if units[name] == "ratio" else trend_7d
+            linear_eta_calc = remaining / divisor
+            linear_eta = max(0.0, linear_eta_calc)
+        
+        # Prophet - use manifest (with _backtest suffix to avoid conflicts)
+        key = f"{build_io_net_key(entity, name)}_backtest"
+        
+        # Determine if retraining is needed
+        needs_retrain = force_retrain or retrain_all
+        if not needs_retrain and retrain_targets_set:
+            entity_match = entity in retrain_targets_set
+            key_match = key in retrain_targets_set
+            instance_canon = canonical_identity(inst)
+            instance_match = instance_canon in retrain_targets_set
+            node_base = node.split('(')[0].strip() if '(' in node else node
+            node_base_canon = canonical_identity(node_base)
+            node_match = node_base_canon in retrain_targets_set
+            
+            alias_match = False
+            if not (entity_match or key_match or instance_match or node_match):
+                for target, target_canon in retrain_targets_canon.items():
+                    if target_canon == entity:
+                        alias_match = True
+                        break
+                    if target_canon in INSTANCE_ALIAS_MAP:
+                        alias_value = INSTANCE_ALIAS_MAP[target_canon]
+                        if canonical_identity(alias_value) == entity:
+                            alias_match = True
+                            break
+                    if alias_match:
+                        break
+            
+            needs_retrain = entity_match or key_match or instance_match or node_match or alias_match
+        
+        # Load or train model
+        m = None
+        model_updated = False
+        
+        if not needs_retrain and key in manifest_snapshot:
+            m = manifest_snapshot[key].get('model')
+            if m is not None and forecast_mode:
+                recent_train = train.loc[train.index >= (train.index[-1] - pd.Timedelta(days=7))] if len(train) > 7*24*6 else train
+                if len(recent_train) >= 50:
+                    pdf = recent_train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
+                    m_updated = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, 
+                                      weekly_seasonality=True, n_changepoints=10)
+                    m_updated.fit(pdf)
+                    m = m_updated
+                    model_updated = True
+        
+        if needs_retrain or key not in manifest_snapshot or m is None:
+            if needs_retrain and key in manifest_snapshot:
+                recent_train = train.loc[train.index >= (train.index[-1] - pd.Timedelta(days=7))] if len(train) > 7*24*6 else train
+                pdf = recent_train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
+                m = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, 
+                           weekly_seasonality=True, n_changepoints=10)
+                m.fit(pdf)
+                model_updated = True
+            else:
+                pdf = train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
+                m = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, 
+                           weekly_seasonality=True, n_changepoints=15)
+                m.fit(pdf)
+                model_updated = True
+        
+        if m is None:
+            return None
+        
+        # Forecast
+        future = m.make_future_dataframe(periods=(test_days + horizon_days) * 1440, freq='min')
+        forecast = m.predict(future)
+        
+        # Backtest
+        test_forecast = forecast.set_index('ds').reindex(test.index, method='nearest')
+        mae = mean_absolute_error(test, test_forecast['yhat'])
+        rmse = np.sqrt(mean_squared_error(test, test_forecast['yhat']))
+        
+        # Prophet ETA
+        future_pred = forecast[forecast['ds'] > ts.index[-1]]
+        crisis = future_pred[future_pred['yhat'] >= threshold]
+        prophet_eta = max(0.0, (crisis.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400) if not crisis.empty else 9999.0
+        
+        hybrid_eta = max(0.0, min(linear_eta, prophet_eta))
+        
+        severity = "CRITICAL" if hybrid_eta < 3 else "WARNING" if hybrid_eta < 7 else "SOON" if hybrid_eta < 30 else "OK"
+        
+        # Build result
+        result = {
+            "node": node,
+            "signal": name.replace("_", " "),
+            "current": f"{current*100:.2f}%" if units[name] == "ratio" else f"{current/1e9:.2f} GB/s",
+            "mae": round(mae, 6),
+            "hybrid_eta_days": round(hybrid_eta, 1),
+            "severity": severity
+        } if hybrid_eta < 30 else None
+        
+        # Return result with model update info
+        return {
+            'result': result,
+            'key': key,
+            'model': m if model_updated else None,
+            'needs_retrain': needs_retrain
+        }
+    except Exception as e:
+        log_verbose(f"  Error processing {inst}: {e}")
+        return None
+
 def predict_io_and_network_crisis_with_backtest(
     horizon_days: int = 7,
     test_days: int = 7,
@@ -4324,15 +4913,72 @@ def predict_io_and_network_crisis_with_backtest(
                     retrain_targets_canon[target] = canonical_identity(target)
         
         # Progress reporting for large node counts (reduces perceived slowness)
-        total_nodes = len(df.groupby('instance'))
+        node_groups = list(df.groupby('instance'))
+        total_nodes = len(node_groups)
         show_progress = total_nodes > 20
-        if show_progress:
-            print(f"  Processing {total_nodes} nodes for {name}...")
+        # If --parallel flag is set, bypass threshold and use parallel processing
+        # Otherwise, only parallelize if we have enough nodes to justify the overhead
+        # Use min of available workers and node count to avoid over-subscription
+        use_parallel = (CLI_PARALLEL_OVERRIDE is not None) or (total_nodes > 10 and MAX_WORKER_THREADS > 1)
+        n_workers = min(total_nodes, MAX_WORKER_THREADS) if use_parallel else 1
         
-        for idx, (inst, group) in enumerate(df.groupby('instance'), 1):
-            if show_progress and idx % 10 == 0:
-                print(f"  Progress: {idx}/{total_nodes} nodes processed...", end='\r')
-            node = canonical_node_label(inst, with_ip=True)
+        if show_progress or use_parallel or total_nodes > 5:
+            if use_parallel:
+                print(f"  Processing {total_nodes} nodes for {name} in PARALLEL mode:")
+                print(f"    ├─ Available workers: {MAX_WORKER_THREADS}")
+                print(f"    ├─ Workers used: {n_workers} (min({total_nodes}, {MAX_WORKER_THREADS}))")
+                print(f"    └─ Expected speedup: ~{n_workers}x (vs sequential)")
+            else:
+                print(f"  Processing {total_nodes} nodes for {name} in SEQUENTIAL mode:")
+                print(f"    ├─ Available workers: {MAX_WORKER_THREADS}")
+                if CLI_PARALLEL_OVERRIDE is None:
+                    reason = 'Too few items (<10)' if total_nodes <= 10 else 'Single worker only'
+                else:
+                    reason = 'Single worker only (MAX_WORKER_THREADS=1)'
+                print(f"    ├─ Reason: {reason}")
+                print(f"    └─ Workers used: 1")
+        
+        # Process nodes in parallel or sequentially
+        if use_parallel:
+            # Parallel processing
+            print(f"    → Starting parallel execution with {n_workers} workers...")
+            manifest_snapshot = manifest.copy()  # Snapshot for parallel workers
+            processed_results = Parallel(n_jobs=n_workers, verbose=0)(
+                delayed(_process_single_node_io_crisis)(
+                    inst, group, name, thresholds, units, test_days, horizon_days,
+                    force_retrain, retrain_targets_set, retrain_all, retrain_targets_canon,
+                    manifest_snapshot, forecast_mode, dump_csv_dir, plot_dir, enable_plots, show_backtest
+                )
+                for inst, group in node_groups
+            )
+            
+            # Process results and update manifest
+            for idx, proc_result in enumerate(processed_results):
+                if proc_result is None:
+                    continue
+                
+                if proc_result['result']:
+                    results.append(proc_result['result'])
+                
+                # Update manifest with new/updated models
+                if proc_result['model'] is not None:
+                    manifest[proc_result['key']] = {'model': proc_result['model']}
+                    manifest_changed = True
+                
+                processed_nodes += 1
+                if show_progress and (idx + 1) % 10 == 0:
+                    print(f"    → Progress: {idx + 1}/{total_nodes} nodes processed...", end='\r')
+            
+            if use_parallel:
+                print()  # New line after progress indicator
+                successful_nodes = len([r for r in processed_results if r is not None])
+                print(f"    ✓ Parallel execution complete: {successful_nodes}/{total_nodes} nodes processed successfully")
+        else:
+            # Sequential processing (original code)
+            for idx, (inst, group) in enumerate(node_groups, 1):
+                if show_progress and idx % 10 == 0:
+                    print(f"  Progress: {idx}/{total_nodes} nodes processed...", end='\r')
+                node = canonical_node_label(inst, with_ip=True)
             entity = canonical_identity(inst)  # Canonical name for matching
             ts = group.set_index('timestamp')['value'].sort_index()
             if len(ts) < 100:
@@ -4351,7 +4997,8 @@ def predict_io_and_network_crisis_with_backtest(
             threshold = thresholds[name]
 
             # Linear 7d burst
-            trend_7d = train.last('7D').diff().mean() * 1440
+            train_last_7d = train.loc[train.index >= (train.index[-1] - pd.Timedelta(days=7))]
+            trend_7d = train_last_7d.diff().mean() * 1440
             linear_eta = 9999.0
             if trend_7d > 0:
                 remaining = threshold - current
@@ -4440,7 +5087,7 @@ def predict_io_and_network_crisis_with_backtest(
                     if forecast_mode:
                         # This incorporates latest trends while preserving learned patterns
                         # train is a Series with timestamp index, so use last('7D')
-                        recent_train = train.last('7D') if len(train) > 7*24*6 else train
+                        recent_train = train.loc[train.index >= (train.index[-1] - pd.Timedelta(days=7))] if len(train) > 7*24*6 else train
                         if len(recent_train) >= 50:  # Only update if we have enough recent data
                             pdf = recent_train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
                             # OPTIMIZATION: Use faster Prophet settings for minimal updates
@@ -4463,7 +5110,7 @@ def predict_io_and_network_crisis_with_backtest(
                 # For retraining: use minimal update if model exists, full training if first-time
                 if needs_retrain and key in manifest:
                     # Minimal update: use recent data (last 7 days) to incorporate latest trends
-                    recent_train = train.last('7D') if len(train) > 7*24*6 else train
+                    recent_train = train.loc[train.index >= (train.index[-1] - pd.Timedelta(days=7))] if len(train) > 7*24*6 else train
                     pdf = recent_train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
                     # OPTIMIZATION: Use faster Prophet settings for minimal updates
                     m = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, weekly_seasonality=True, n_changepoints=10)
@@ -4550,7 +5197,7 @@ def predict_io_and_network_crisis_with_backtest(
             if forecast_mode and enable_plots:
                 plt.figure(figsize=(14, 7))
                 # Plot last 24 hours of historical data
-                historical = ts.last('24H')
+                historical = ts.loc[ts.index >= (ts.index[-1] - pd.Timedelta(hours=24))]
                 if len(historical) > 0:
                     plt.plot(historical.index, historical.values, label="Historical Data", color="#1f77b4", linewidth=1.5)
                 # Plot forecast (future predictions only)
@@ -4676,6 +5323,309 @@ def format_anomaly_description(node, signal, current_val, current_str, mae_ensem
     
     return description
 
+def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_days, force_retrain, retrain_targets_set,
+                                     retrain_all, retrain_targets_canon, manifest_snapshot, forecast_mode,
+                                     dump_csv_dir, plot_dir, enable_plots, show_backtest):
+    """
+    Worker function to process a single node for I/O and Network ensemble forecasting.
+    This function is designed to be called in parallel.
+    Returns: dict with crisis_result, anomaly_result, backtest_metrics, retrained_node, key, model, or None if skipped
+    """
+    try:
+        node = canonical_node_label(instance, with_ip=True)
+        entity = canonical_identity(instance)
+        ts = group.set_index('timestamp')['value'].sort_index()
+        if len(ts) < 200:
+            return None
+        
+        cutoff = ts.index[-1] - pd.Timedelta(days=test_days)
+        train_raw = ts[ts.index <= cutoff]
+        if len(train_raw) < 100:
+            return None
+        
+        current = ts.iloc[-1]
+        train_df = train_raw.reset_index()
+        train_df.columns = ['timestamp', 'value']
+        
+        key = f"{build_io_net_key(entity, res['name'])}_ensemble"
+        log_verbose(f"  Running ensemble forecast for {node} | {res['name']} ({len(train_df)} points)...")
+        
+        # ———— RETRAIN MATCHING LOGIC ————
+        # Check if retraining is needed - match against entity, key, or any aliases
+        needs_retrain = force_retrain or retrain_all
+        if not needs_retrain and retrain_targets_set:
+            entity_match = entity in retrain_targets_set
+            key_match = key in retrain_targets_set
+            instance_canon = canonical_identity(instance)
+            instance_match = instance_canon in retrain_targets_set
+            node_base = node.split('(')[0].strip() if '(' in node else node
+            node_base_canon = canonical_identity(node_base)
+            node_match = node_base_canon in retrain_targets_set
+            alias_match = False
+            if not (entity_match or key_match or instance_match or node_match):
+                for target, target_canon in retrain_targets_canon.items():
+                    if target_canon == entity:
+                        alias_match = True
+                        break
+            needs_retrain = entity_match or key_match or instance_match or node_match or alias_match
+        
+        retrained_node = None
+        if needs_retrain:
+            retrained_node = f"{node} ({entity})"
+            log_verbose(f"   Retraining requested for {node} | {res['name']} (entity: {entity})")
+        
+        # ———— MODEL CACHING AND TRAINING ————
+        forecast_result = None
+        manifest_key_updated = False
+        
+        if not needs_retrain and key in manifest_snapshot:
+            forecast_result = manifest_snapshot[key].get('model')
+            if forecast_result is not None:
+                log_verbose(f"   Loaded ENSEMBLE model from manifest: {key}")
+                # MINIMAL UPDATE: Use recent data only (last 7 days) for forecast mode only
+                if forecast_mode:
+                    train_df_sorted = train_df.sort_values('timestamp')
+                    cutoff_time = train_df_sorted['timestamp'].max() - pd.Timedelta(days=7)
+                    recent_train_df = train_df_sorted[train_df_sorted['timestamp'] >= cutoff_time]
+                    if len(recent_train_df) < 50:
+                        recent_train_df = train_df_sorted.tail(min(len(train_df_sorted), 7*24*6))
+                    forecast_result = build_ensemble_forecast_model(
+                        df_cpu=recent_train_df,
+                        df_mem=None,
+                        horizon_min=horizon_days * 24 * 60,
+                        model_path=None,
+                        context={'node': node, 'signal': res['name']},
+                        save_forecast_plot=True,
+                        save_backtest_plot=False,
+                        print_backtest_metrics=False,
+                        dump_csv_dir=dump_csv_dir,
+                        enable_plots=enable_plots
+                    )
+                    if forecast_result is not None:
+                        manifest_key_updated = True
+                        log_verbose(f"   Minimal update applied (recent 7 days): {key}")
+                # If show_backtest is true, compute metrics even for cached models
+                if show_backtest:
+                    has_metrics = isinstance(forecast_result, tuple) and len(forecast_result) >= 3
+                    if not has_metrics:
+                        log_verbose(f"   Computing backtest metrics for cached model (display only, not saving)...")
+                        forecast_result = build_ensemble_forecast_model(
+                            df_cpu=train_df,
+                            df_mem=None,
+                            horizon_min=horizon_days * 24 * 60,
+                            model_path=None,
+                            context={'node': node, 'signal': res['name']},
+                            save_forecast_plot=False,
+                            save_backtest_plot=False,
+                            print_backtest_metrics=False,
+                            save_model=False,
+                            dump_csv_dir=dump_csv_dir,
+                            enable_plots=enable_plots
+                        )
+            else:
+                needs_retrain = True
+        
+        if needs_retrain or key not in manifest_snapshot:
+            if key in manifest_snapshot:
+                log_verbose(f"   Retraining cached model → MINIMAL UPDATE (recent 7 days)...")
+                train_df_sorted = train_df.sort_values('timestamp')
+                cutoff_time = train_df_sorted['timestamp'].max() - pd.Timedelta(days=7)
+                recent_train_df = train_df_sorted[train_df_sorted['timestamp'] >= cutoff_time]
+                if len(recent_train_df) < 50:
+                    recent_train_df = train_df_sorted.tail(min(len(train_df_sorted), 7*24*6))
+                forecast_result = build_ensemble_forecast_model(
+                    df_cpu=recent_train_df,
+                    df_mem=None,
+                    horizon_min=horizon_days * 24 * 60,
+                    model_path=None,
+                    context={'node': node, 'signal': res['name']},
+                    save_forecast_plot=False,
+                    save_backtest_plot=False,
+                    print_backtest_metrics=False,
+                    dump_csv_dir=dump_csv_dir,
+                    enable_plots=enable_plots
+                )
+            else:
+                log_verbose(f"   No cached model → FULL TRAINING...")
+                forecast_result = build_ensemble_forecast_model(
+                    df_cpu=train_df,
+                    df_mem=None,
+                    horizon_min=horizon_days * 24 * 60,
+                    model_path=None,
+                    context={'node': node, 'signal': res['name']},
+                    save_forecast_plot=False,
+                    save_backtest_plot=False,
+                    enable_plots=enable_plots,
+                    print_backtest_metrics=False,
+                    dump_csv_dir=dump_csv_dir
+                )
+            if forecast_result is not None:
+                manifest_key_updated = True
+                log_verbose(f"   Saved ENSEMBLE to manifest → {key}")
+        
+        if forecast_result is None:
+            return None
+        
+        # ———— SAFE UNPACK ————
+        if isinstance(forecast_result, tuple):
+            if len(forecast_result) == 3:
+                _, forecast_df, metrics = forecast_result
+            else:
+                _, forecast_df = forecast_result
+                metrics = {"mae_ensemble": 0.0}
+        else:
+            log_verbose(f"   Warning: unexpected forecast_result type for {key}, skipping")
+            return None
+        
+        # ———— CRISIS DETECTION ————
+        future_threshold = forecast_df[forecast_df['yhat'] >= res["threshold"]]
+        eta_days = 9999.0
+        if not future_threshold.empty:
+            eta_days_calc = (future_threshold.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400
+            eta_days = max(0.0, eta_days_calc)
+        
+        log_verbose(f"  Done → ETA: {eta_days:.1f} days | MAE: {metrics['mae_ensemble']:.6f}")
+        
+        crisis_result = None
+        if eta_days < 30:
+            severity = "CRITICAL" if eta_days < 3 else "WARNING" if eta_days < 7 else "SOON"
+            crisis_result = {
+                "node": node,
+                "signal": res["name"].replace("_", " "),
+                "current": f"{current*100:.2f}%" if res["unit"] == "ratio" else f"{current/1e6:.1f} MB/s",
+                "mae_ensemble": round(metrics.get('mae_ensemble', 0.0), 6),
+                "hybrid_eta_days": round(max(0.0, eta_days), 1),
+                "severity": severity
+            }
+        
+        # ———— ANOMALY DETECTION ————
+        anomaly_result = None
+        mae_ensemble = metrics.get('mae_ensemble', 0.0)
+        recent_window = pd.Timedelta(hours=24)
+        now = pd.Timestamp.now()
+        recent_start = now - recent_window
+        recent_actual = ts[ts.index >= recent_start]
+        
+        if len(recent_actual) >= 6:
+            forecast_df_sorted = forecast_df.sort_values('ds')
+            if not forecast_df_sorted.empty:
+                past_forecasts = forecast_df_sorted[forecast_df_sorted['ds'] <= now]
+                if not past_forecasts.empty:
+                    baseline_forecast = past_forecasts.iloc[-1]['yhat']
+                else:
+                    baseline_forecast = forecast_df_sorted.iloc[0]['yhat']
+                
+                recent_mean = recent_actual.mean()
+                recent_std = recent_actual.std()
+                recent_max = recent_actual.max()
+                recent_min = recent_actual.min()
+                
+                current_deviation_abs = abs(current - baseline_forecast)
+                current_deviation_pct = abs((current - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (current_deviation_abs if current != 0 else 0)
+                mean_deviation_abs = abs(recent_mean - baseline_forecast)
+                mean_deviation_pct = abs((recent_mean - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (mean_deviation_abs if recent_mean != 0 else 0)
+                spike_deviation_abs = abs(recent_max - baseline_forecast)
+                spike_deviation = abs((recent_max - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (spike_deviation_abs if recent_max != 0 else 0)
+                drop_deviation_abs = abs(baseline_forecast - recent_min)
+                drop_deviation = abs((baseline_forecast - recent_min) / baseline_forecast) if baseline_forecast != 0 else (drop_deviation_abs if recent_min != 0 else 0)
+                
+                if res["unit"] == "ratio":
+                    min_abs_threshold = 0.01
+                    mae_threshold = 0.05
+                    concerning_threshold = 0.05
+                    baseline_too_small = baseline_forecast < 0.01
+                else:
+                    min_abs_threshold = 5_000_000
+                    mae_threshold = res["threshold"] * 0.10
+                    concerning_threshold = res["threshold"] * 0.30
+                    baseline_too_small = baseline_forecast < 5_000_000
+                
+                if res["unit"] == "ratio":
+                    mae_confidence_factor = 1.0 if mae_ensemble < 0.005 else (0.7 if mae_ensemble < 0.01 else 0.3)
+                else:
+                    mae_confidence_factor = 1.0 if mae_ensemble < mae_threshold * 0.1 else (0.7 if mae_ensemble < mae_threshold * 0.3 else 0.3)
+                
+                is_concerning_value = (
+                    (res["unit"] == "ratio" and current >= concerning_threshold) or
+                    (res["unit"] != "ratio" and current >= concerning_threshold)
+                )
+                has_significant_abs_diff = (
+                    current_deviation_abs >= min_abs_threshold or
+                    mean_deviation_abs >= min_abs_threshold
+                )
+                
+                if baseline_too_small:
+                    is_anomaly = has_significant_abs_diff and is_concerning_value
+                else:
+                    has_significant_pct_diff = (
+                        current_deviation_pct > 0.50 or
+                        mean_deviation_pct > 0.30
+                    )
+                    is_anomaly = (
+                        has_significant_abs_diff and
+                        has_significant_pct_diff and
+                        (is_concerning_value or mae_confidence_factor < 0.5 or mae_ensemble > mae_threshold)
+                    )
+                
+                if is_anomaly:
+                    anomaly_score = min(1.0, max(
+                        current_deviation_pct,
+                        mean_deviation_pct,
+                        spike_deviation / 2.0,
+                        drop_deviation / 2.0,
+                        min(1.0, mae_ensemble / mae_threshold) if mae_threshold > 0 else 0
+                    ))
+                    
+                    if anomaly_score > 0.8:
+                        severity = "CRITICAL"
+                    elif anomaly_score > 0.5:
+                        severity = "WARNING"
+                    else:
+                        severity = "INFO"
+                    
+                    signal_display = res["name"].replace("_", " ")
+                    current_str = f"{current*100:.2f}%" if res["unit"] == "ratio" else f"{current/1e6:.1f} MB/s"
+                    
+                    description = format_anomaly_description(
+                        node, signal_display, current, current_str, mae_ensemble, 
+                        anomaly_score, severity, current_deviation_pct * 100, res["unit"]
+                    )
+                    
+                    anomaly_result = {
+                        "node": node,
+                        "signal": signal_display,
+                        "current": current_str,
+                        "mae_ensemble": round(mae_ensemble, 6),
+                        "score": round(anomaly_score, 3),
+                        "severity": severity,
+                        "deviation_pct": round(current_deviation_pct * 100, 1),
+                        "description": description
+                    }
+                    
+                    log_verbose(f"   ⚠️  Anomaly detected: {node} | {res['name']} (score: {anomaly_score:.3f}, deviation: {current_deviation_pct*100:.1f}%)")
+        
+        # ———— COLLECT BACKTEST METRICS ————
+        backtest_metrics = None
+        if (show_backtest or (needs_retrain and not forecast_mode)) and metrics:
+            backtest_metrics = {
+                'node': node,
+                'signal': res['name'],
+                'metrics': metrics
+            }
+        
+        return {
+            'crisis_result': crisis_result,
+            'anomaly_result': anomaly_result,
+            'backtest_metrics': backtest_metrics,
+            'retrained_node': retrained_node,
+            'key': key,
+            'model': forecast_result if manifest_key_updated else None,
+            'needs_retrain': needs_retrain
+        }
+    except Exception as e:
+        log_verbose(f"  Error processing {instance}: {e}")
+        return None
+
 def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forecast_plots", force_retrain: bool | None = None,
                                     manifest: dict | None = None, retrain_targets: set | None = None, show_backtest: bool = False,
                                     forecast_mode: bool = False, dump_csv_dir: str | None = None, enable_plots: bool = True):
@@ -4765,8 +5715,85 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
             log_verbose(f"  Found {len(all_instances)} nodes in {res['name']} data: {', '.join(all_nodes)}")
             log_verbose(f"  Entity names: {', '.join(all_entities)}")
 
-        for instance, group in df.groupby('instance'):
-            node = canonical_node_label(instance, with_ip=True)
+        # Prepare for parallelization
+        node_groups = list(df.groupby('instance'))
+        total_nodes = len(node_groups)
+        # If --parallel flag is set, bypass threshold and use parallel processing
+        # Otherwise, only parallelize if we have enough nodes to justify the overhead
+        use_parallel = (CLI_PARALLEL_OVERRIDE is not None) or (total_nodes > 10 and MAX_WORKER_THREADS > 1)
+        n_workers = min(total_nodes, MAX_WORKER_THREADS) if use_parallel else 1
+        
+        # Pre-compute retrain matching logic
+        retrain_targets_set = set(retrain_targets) if retrain_targets else set()
+        retrain_all = '__RETRAIN_ALL__' in retrain_targets_set if retrain_targets_set else False
+        retrain_targets_canon = {}
+        if retrain_targets_set and not retrain_all:
+            for target in retrain_targets_set:
+                if '|' not in target and '_' not in target:
+                    retrain_targets_canon[target] = canonical_identity(target)
+        
+        if total_nodes > 5:
+            if use_parallel:
+                print(f"  Processing {total_nodes} nodes for {res['name']} ensemble in PARALLEL mode:")
+                print(f"    ├─ Available workers: {MAX_WORKER_THREADS}")
+                print(f"    ├─ Workers used: {n_workers} (min({total_nodes}, {MAX_WORKER_THREADS}))")
+                print(f"    └─ Expected speedup: ~{n_workers}x (vs sequential)")
+            else:
+                print(f"  Processing {total_nodes} nodes for {res['name']} ensemble in SEQUENTIAL mode:")
+                print(f"    ├─ Available workers: {MAX_WORKER_THREADS}")
+                if CLI_PARALLEL_OVERRIDE is None:
+                    reason = 'Too few items (<10)' if total_nodes <= 10 else 'Single worker only'
+                else:
+                    reason = 'Single worker only (MAX_WORKER_THREADS=1)'
+                print(f"    ├─ Reason: {reason}")
+                print(f"    └─ Workers used: 1")
+        
+        if use_parallel:
+            # Parallel processing
+            print(f"    → Starting parallel execution with {n_workers} workers...")
+            manifest_snapshot = manifest.copy()  # Snapshot for parallel workers
+            processed_results = Parallel(n_jobs=n_workers, verbose=0)(
+                delayed(_process_single_node_io_ensemble)(
+                    instance, group, res, test_days, horizon_days, force_retrain,
+                    retrain_targets_set, retrain_all, retrain_targets_canon, manifest_snapshot,
+                    forecast_mode, dump_csv_dir, plot_dir, enable_plots, show_backtest
+                )
+                for instance, group in node_groups
+            )
+            
+            # Process results and aggregate
+            for proc_result in processed_results:
+                if proc_result is None:
+                    continue
+                
+                # Update manifest with new/updated models
+                if proc_result['model'] is not None:
+                    manifest[proc_result['key']] = {'model': proc_result['model']}
+                    manifest_changed = True
+                
+                # Collect crisis results
+                if proc_result['crisis_result']:
+                    crisis_results.append(proc_result['crisis_result'])
+                
+                # Collect anomaly results
+                if proc_result['anomaly_result']:
+                    anomaly_results.append(proc_result['anomaly_result'])
+                
+                # Collect backtest metrics
+                if proc_result['backtest_metrics']:
+                    backtest_metrics_list.append(proc_result['backtest_metrics'])
+                
+                # Track retrained nodes
+                if proc_result['retrained_node']:
+                    retrained_nodes.add(proc_result['retrained_node'])
+            
+            print()  # New line after progress indicator
+            successful_nodes = len([r for r in processed_results if r is not None])
+            print(f"    ✓ Parallel execution complete: {successful_nodes}/{total_nodes} nodes processed successfully")
+        else:
+            # Sequential processing (original code)
+            for instance, group in node_groups:
+                node = canonical_node_label(instance, with_ip=True)
             entity = canonical_identity(instance)  # Canonical name for matching
             ts = group.set_index('timestamp')['value'].sort_index()
             if len(ts) < 200:
@@ -5580,6 +6607,7 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Forecast Mode\n")
     print("Execution mode: FORECAST (using cached models, latest Prometheus data)")
     print("Running all forecasting models and displaying predictions + anomalies")
+    print_cpu_info(cli_override=CLI_PARALLEL_OVERRIDE)
     # Steps: fetch metrics, run models, print summaries, dispatch alerts.
     
     refresh_dynamic_aliases()
@@ -6043,6 +7071,17 @@ if __name__ == "__main__":
     args = parse_cli_args()
     csv_dump_dir = args.dump_csv
     
+    # Override MAX_WORKER_THREADS if --parallel flag is provided
+    # Note: We're at module level, so we can modify module-level variables directly
+    if args.parallel is not None:
+        if args.parallel < 1:
+            print(f"⚠️  Warning: --parallel value must be >= 1, got {args.parallel}. Using 1 worker.")
+            MAX_WORKER_THREADS = 1
+            CLI_PARALLEL_OVERRIDE = 1
+        else:
+            MAX_WORKER_THREADS = args.parallel
+            CLI_PARALLEL_OVERRIDE = args.parallel
+    
     # Forecast mode: lightweight, frequent runs
     if args.forecast:
         if args.quiet:
@@ -6084,6 +7123,7 @@ if __name__ == "__main__":
     refresh_dynamic_aliases()
 
     print_config_summary()
+    print_cpu_info(cli_override=CLI_PARALLEL_OVERRIDE)
 
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Dual-Layer + LSTM AI\n")
     mode_label = "TRAINING" if force_training else "PRE-TRAINED"
