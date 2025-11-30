@@ -227,33 +227,39 @@ graph LR
 
 ```mermaid
 flowchart TD
-    Start([Start: --training]) --> Fetch[Fetch Data from Prometheus<br/>START_HOURS_AGO, STEP]
+    Start([Start: --training]) --> Fetch[Fetch Host/Pod Data<br/>START_HOURS_AGO, STEP]
     
-    Fetch --> HostData[Host CPU/Memory Data]
-    Fetch --> PodData[Pod CPU/Memory Data]
-    Fetch --> DiskData[Disk Usage Data]
-    Fetch --> IOData[I/O Wait Data]
-    Fetch --> NetData[Network Bandwidth Data]
+    Fetch --> Alias[Alias Resolution<br/>& Entity Canonicalization]
+    Alias --> ClusterID[Identify Clusters<br/>LOOKBACK_HOURS]
+    ClusterID --> GroupNodes[Group Nodes by Cluster<br/>K8s / Standalone / Unknown]
     
-    HostData --> ClusterID[Identify Clusters<br/>LOOKBACK_HOURS]
-    PodData --> ClusterID
+    GroupNodes --> K8sTrain[Train K8s Cluster Models<br/>Per Cluster: Host+Pod Ensemble]
+    K8sTrain --> K8sHost[Train K8s Host Model<br/>For Divergence Calculation]
+    K8sHost --> UnknownTrain{Unknown Cluster<br/>Nodes?}
+    UnknownTrain -->|Yes| UnknownModel[Train Unknown Cluster Model]
+    UnknownTrain -->|No| StandaloneCheck{Standalone<br/>Nodes?}
+    UnknownModel --> StandaloneCheck
+    StandaloneCheck -->|Yes| StandaloneModel[Train Standalone Model<br/>Host Only]
+    StandaloneCheck -->|No| Divergence[Calculate Divergence<br/>K8s Host vs Combined]
+    StandaloneModel --> Divergence
     
-    ClusterID --> GroupNodes[Group Nodes by Cluster]
+    Divergence --> ClassTrain[Train Classification Model<br/>IsolationForest]
+    ClassTrain --> FetchDisk[Fetch Disk Data<br/>Last 30 days]
+    FetchDisk --> DiskTrain[Train Disk Models<br/>Per Disk: Linear + Prophet]
+    DiskTrain --> GoldenAnomaly[Golden Anomaly Detection<br/>Root-Cause Analysis]
+    GoldenAnomaly --> FetchIO[Fetch I/O & Network Data<br/>Last 30-35 days]
+    FetchIO --> IOCrisis[Train I/O Network Crisis Models<br/>Prophet per Node/Signal]
+    IOCrisis --> IOEnsemble[Train I/O Network Ensemble<br/>Prophet + ARIMA + LSTM]
     
-    GroupNodes --> HostPodTrain[Train Host/Pod Ensemble Models]
-    GroupNodes --> DiskTrain[Train Disk Models]
-    GroupNodes --> IOTrain[Train I/O Network Models]
-    GroupNodes --> ClassTrain[Train Classification Models]
-    
-    HostPodTrain --> HPSplit[Train/Test Split<br/>TRAIN_FRACTION]
-    HPSplit --> HPProphet[Train Prophet<br/>HORIZON_MIN]
-    HPSplit --> HPARIMA[Train ARIMA<br/>HORIZON_MIN]
-    HPSplit --> HPLSTM[Train LSTM<br/>LSTM_SEQ_LEN, LSTM_EPOCHS, HORIZON_MIN]
-    HPProphet --> HPEnsemble[Create Ensemble]
-    HPARIMA --> HPEnsemble
-    HPLSTM --> HPEnsemble
-    HPEnsemble --> HPBacktest[Backtest on Test Set]
-    HPBacktest --> HPSave[Save Models]
+    K8sTrain --> K8sSplit[Train/Test Split<br/>TRAIN_FRACTION]
+    K8sSplit --> K8sProphet[Train Prophet<br/>HORIZON_MIN]
+    K8sSplit --> K8sARIMA[Train ARIMA<br/>HORIZON_MIN]
+    K8sSplit --> K8sLSTM[Train LSTM<br/>LSTM_SEQ_LEN, LSTM_EPOCHS]
+    K8sProphet --> K8sEnsemble[Create Ensemble]
+    K8sARIMA --> K8sEnsemble
+    K8sLSTM --> K8sEnsemble
+    K8sEnsemble --> K8sBacktest[Backtest on Test Set]
+    K8sBacktest --> K8sSave[Save Models]
     
     DiskTrain --> DiskSplit[Train/Test Split<br/>TRAIN_FRACTION]
     DiskSplit --> DiskLinear[Train Linear Trend]
@@ -262,19 +268,28 @@ flowchart TD
     DiskProphet --> DiskETA
     DiskETA --> DiskSave[Save to Manifest]
     
-    IOTrain --> IOSplit[Train/Test Split<br/>TRAIN_FRACTION]
-    IOSplit --> IOCrisis[Train Crisis Models<br/>Prophet, horizon_days]
-    IOSplit --> IOEnsemble[Train Ensemble Models<br/>Prophet + ARIMA + LSTM, HORIZON_MIN]
-    IOCrisis --> IOSave[Save to Manifest]
-    IOEnsemble --> IOSave
+    IOCrisis --> IOSplit[Train/Test Split<br/>TRAIN_FRACTION]
+    IOSplit --> IOCrisisProphet[Train Crisis Prophet]
+    IOCrisisProphet --> IOCrisisSave[Save to Manifest]
+    
+    IOEnsemble --> IOESplit[Train/Test Split<br/>TRAIN_FRACTION]
+    IOESplit --> IOEProphet[Train Prophet<br/>HORIZON_MIN]
+    IOESplit --> IOEARIMA[Train ARIMA<br/>HORIZON_MIN]
+    IOESplit --> IOELSTM[Train LSTM<br/>LSTM_SEQ_LEN, LSTM_EPOCHS]
+    IOEProphet --> IOEEnsemble[Create Ensemble]
+    IOEARIMA --> IOEEnsemble
+    IOELSTM --> IOEEnsemble
+    IOEEnsemble --> IOEBacktest[Backtest on Test Set]
+    IOEBacktest --> IOESave[Save to Manifest]
     
     ClassTrain --> ClassFeat[Extract Features<br/>LOOKBACK_HOURS]
     ClassFeat --> ClassISO[Train IsolationForest<br/>CONTAMINATION]
     ClassISO --> ClassSave[Save Models]
     
-    HPSave --> AllDone[All Models Trained]
+    K8sSave --> AllDone[All Models Trained]
     DiskSave --> AllDone
-    IOSave --> AllDone
+    IOCrisisSave --> AllDone
+    IOESave --> AllDone
     ClassSave --> AllDone
     
     AllDone --> GeneratePlots[Generate Plots]
@@ -284,6 +299,7 @@ flowchart TD
     classDef dataFetch fill:#107C10,stroke:#0B5A0B,stroke-width:3px,color:#fff
     classDef dataProcess fill:#00B7C3,stroke:#00929A,stroke-width:2px,color:#fff
     classDef modelTrain fill:#FF8C00,stroke:#CC7000,stroke-width:3px,color:#fff
+    classDef decision fill:#6B6B6B,stroke:#555555,stroke-width:3px,color:#fff
     classDef prophet fill:#0078D4,stroke:#005A9E,stroke-width:2px,color:#fff
     classDef arima fill:#00B7C3,stroke:#00929A,stroke-width:2px,color:#fff
     classDef lstm fill:#5C2D91,stroke:#4A2473,stroke-width:2px,color:#fff
@@ -292,15 +308,16 @@ flowchart TD
     classDef output fill:#FF8C00,stroke:#CC7000,stroke-width:3px,color:#fff
     
     class Start,End startEnd
-    class Fetch,HostData,PodData,DiskData,IOData,NetData dataFetch
-    class ClusterID,GroupNodes dataProcess
-    class HostPodTrain,DiskTrain,IOTrain,ClassTrain,HPSplit,DiskSplit,IOSplit modelTrain
-    class HPProphet,DiskProphet,IOCrisis prophet
-    class HPARIMA arima
-    class HPLSTM,IOEnsemble lstm
-    class HPEnsemble,DiskETA,AllDone ensemble
-    class HPSave,DiskSave,IOSave,ClassSave save
-    class HPBacktest,GeneratePlots output
+    class Fetch,FetchDisk,FetchIO dataFetch
+    class Alias,ClusterID,GroupNodes,Divergence,GoldenAnomaly dataProcess
+    class K8sTrain,K8sHost,UnknownModel,StandaloneModel,ClassTrain,DiskTrain,IOCrisis,IOEnsemble,K8sSplit,DiskSplit,IOSplit,IOESplit modelTrain
+    class UnknownTrain,StandaloneCheck decision
+    class K8sProphet,DiskProphet,IOCrisisProphet,IOEProphet prophet
+    class K8sARIMA,IOEARIMA arima
+    class K8sLSTM,IOELSTM lstm
+    class K8sEnsemble,DiskETA,IOEEnsemble ensemble
+    class K8sSave,DiskSave,IOCrisisSave,IOESave,ClassSave save
+    class K8sBacktest,IOEBacktest,GeneratePlots output
 ```
 
 ### Host/Pod Ensemble Training Detail
@@ -375,13 +392,14 @@ flowchart TD
     Split --> Linear[Train Linear Trend<br/>Calculate slope]
     Split --> Prophet[Train Prophet<br/>horizon_days=7]
     
-    Linear --> LinearETA[Calculate Days to 90%<br/>Linear Model]
+    Linear --> LinearETA[Calculate Days to 90%<br/>Linear Trend]
     Prophet --> ProphetETA[Calculate Days to 90%<br/>Prophet Forecast]
     
     LinearETA --> EnsembleETA[Ensemble ETA<br/>min of both]
     ProphetETA --> EnsembleETA
     
     EnsembleETA --> Severity{Determine Severity}
+    Severity -->|ETA <= 0 days| Critical[CRITICAL]
     Severity -->|ETA < 3 days| Critical[CRITICAL]
     Severity -->|ETA < 7 days| Warning[WARNING]
     Severity -->|ETA < 30 days| Soon[SOON]
@@ -430,15 +448,14 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    Start([Start: --forecast]) --> Fetch[Fetch Latest Data<br/>START_HOURS_AGO, STEP]
+    Start([Start: --forecast]) --> Fetch[Fetch Host/Pod Data<br/>START_HOURS_AGO, STEP]
     
-    Fetch --> Load[Load Cached Models]
+    Fetch --> Alias[Alias Resolution<br/>& Entity Canonicalization]
+    Alias --> ClusterID[Identify Clusters<br/>LOOKBACK_HOURS]
+    ClusterID --> GroupNodes[Group Nodes by Cluster]
     
-    Load --> UpdateHP[Update Host/Pod Models]
-    Load --> UpdateDisk[Update Disk Models]
-    Load --> UpdateIO[Update I/O Network Models]
-    Load --> UpdateClass[Update Classification]
-    
+    GroupNodes --> LoadHP[Load Cached Host/Pod Models]
+    LoadHP --> UpdateHP[Update Host/Pod Models<br/>Minimal Updates]
     UpdateHP --> HPProphet[Prophet: Last 7 days]
     UpdateHP --> HPARIMA[ARIMA: Latest data]
     UpdateHP --> HPLSTM[LSTM: Last 2 days, 2 epochs]
@@ -446,19 +463,33 @@ flowchart TD
     HPARIMA --> HPForecast
     HPLSTM --> HPForecast
     
+    HPForecast --> UpdateClass[Update Classification Model]
+    UpdateClass --> ClassFeat[Extract Features<br/>LOOKBACK_HOURS]
+    ClassFeat --> ClassPredict[Predict Anomalies<br/>CONTAMINATION]
+    
+    ClassPredict --> FetchDisk[Fetch Disk Data<br/>Last 30 days]
+    FetchDisk --> LoadDisk[Load Disk Manifest]
+    LoadDisk --> UpdateDisk[Update Disk Models<br/>Per Disk: Minimal Updates]
     UpdateDisk --> DiskProphet[Prophet: Last 7 days]
     UpdateDisk --> DiskLinear[Recalculate Linear Trend]
     DiskProphet --> DiskForecast[Calculate ETA to 90%]
     DiskLinear --> DiskForecast
     
-    UpdateIO --> IOCrisis[I/O Crisis: Prophet Last 7 days]
-    UpdateIO --> IOEnsemble[I/O Ensemble: All 3 models]
-    IOCrisis --> IOCheck[Check Crisis Threshold]
-    IOEnsemble --> IOForecast[Generate Forecast<br/>HORIZON_MIN]
-    IOEnsemble --> IOAnomaly[Detect Anomalies]
+    DiskForecast --> GoldenAnomaly[Golden Anomaly Detection<br/>Root-Cause Analysis]
     
-    UpdateClass --> ClassFeat[Extract Features<br/>LOOKBACK_HOURS]
-    ClassFeat --> ClassPredict[Predict Anomalies<br/>CONTAMINATION]
+    GoldenAnomaly --> FetchIO[Fetch I/O & Network Data<br/>Last 30-35 days]
+    FetchIO --> LoadIO[Load I/O Network Manifest]
+    LoadIO --> UpdateIOCrisis[Update I/O Crisis Models<br/>Prophet: Last 7 days]
+    UpdateIOCrisis --> IOCheck[Check Crisis Threshold]
+    
+    IOCheck --> UpdateIOEnsemble[Update I/O Ensemble Models<br/>Prophet + ARIMA + LSTM]
+    UpdateIOEnsemble --> IOEProphet[Prophet: Last 7 days]
+    UpdateIOEnsemble --> IOEARIMA[ARIMA: Latest data]
+    UpdateIOEnsemble --> IOELSTM[LSTM: Last 2 days, 2 epochs]
+    IOEProphet --> IOForecast[Generate Forecast<br/>HORIZON_MIN]
+    IOEARIMA --> IOForecast
+    IOELSTM --> IOForecast
+    IOForecast --> IOAnomaly[Detect Anomalies]
     
     HPForecast --> Aggregate[Aggregate Results]
     DiskForecast --> Aggregate
@@ -474,6 +505,7 @@ flowchart TD
     
     classDef startEnd fill:#0078D4,stroke:#005A9E,stroke-width:4px,color:#fff
     classDef dataFetch fill:#107C10,stroke:#0B5A0B,stroke-width:3px,color:#fff
+    classDef dataProcess fill:#00B7C3,stroke:#00929A,stroke-width:2px,color:#fff
     classDef load fill:#00B7C3,stroke:#00929A,stroke-width:3px,color:#fff
     classDef update fill:#FF8C00,stroke:#CC7000,stroke-width:2px,color:#fff
     classDef prophet fill:#0078D4,stroke:#005A9E,stroke-width:2px,color:#fff
@@ -485,12 +517,13 @@ flowchart TD
     classDef output fill:#107C10,stroke:#0B5A0B,stroke-width:3px,color:#fff
     
     class Start,End startEnd
-    class Fetch dataFetch
-    class Load load
-    class UpdateHP,UpdateDisk,UpdateIO,UpdateClass update
-    class HPProphet,DiskProphet,IOCrisis prophet
-    class HPARIMA arima
-    class HPLSTM,IOEnsemble lstm
+    class Fetch,FetchDisk,FetchIO dataFetch
+    class Alias,ClusterID,GroupNodes,GoldenAnomaly dataProcess
+    class LoadHP,LoadDisk,LoadIO load
+    class UpdateHP,UpdateDisk,UpdateIOCrisis,UpdateIOEnsemble,UpdateClass update
+    class HPProphet,DiskProphet,IOCrisis,IOEProphet prophet
+    class HPARIMA,IOEARIMA arima
+    class HPLSTM,IOELSTM lstm
     class HPForecast,DiskForecast,IOForecast forecast
     class IOAnomaly,ClassPredict anomaly
     class Aggregate aggregate
@@ -696,7 +729,7 @@ graph TD
 
 ## Model Execution Order
 
-### Normal Execution Flow
+### Normal Execution Flow (Training Mode)
 
 ```mermaid
 sequenceDiagram
@@ -706,30 +739,52 @@ sequenceDiagram
     participant Models
     participant Storage
     
-    User->>+System: Run metrics.py
-    System->>+Prometheus: Fetch Data (START_HOURS_AGO, STEP)
+    User->>+System: Run metrics.py --training
+    System->>+Prometheus: Fetch Host/Pod Data (START_HOURS_AGO, STEP)
     Prometheus-->>-System: Return Data
     
+    System->>System: Alias Resolution & Canonicalization
     System->>System: Identify Clusters (LOOKBACK_HOURS)
+    System->>System: Group Nodes by Cluster
     
-    System->>+Models: Train/Load Host/Pod Models
-    Models->>Storage: Save/Load Models
+    System->>+Models: Train K8s Cluster Models (per cluster)
+    Models->>Storage: Save Models
     Models-->>-System: Models Ready
     
-    System->>+Models: Train/Load Disk Models
-    Models->>Storage: Save/Load to Manifest
+    System->>+Models: Train K8s Host Model (for divergence)
+    Models->>Storage: Save Models
+    Models-->>-System: Model Ready
+    
+    System->>+Models: Train Unknown Cluster Model (if needed)
+    Models->>Storage: Save Models
+    Models-->>-System: Model Ready
+    
+    System->>+Models: Train Standalone Model (if needed)
+    Models->>Storage: Save Models
+    Models-->>-System: Model Ready
+    
+    System->>System: Calculate Divergence
+    
+    System->>+Models: Train Classification Model
+    Models->>Storage: Save Models
+    Models-->>-System: Model Ready
+    
+    System->>+Prometheus: Fetch Disk Data (Last 30 days)
+    Prometheus-->>-System: Return Data
+    System->>+Models: Train Disk Models (per disk)
+    Models->>Storage: Save to Manifest
     Models-->>-System: Models Ready
     
-    System->>+Models: Train/Load I/O Crisis Models
-    Models->>Storage: Save/Load to Manifest
+    System->>System: Golden Anomaly Detection
+    
+    System->>+Prometheus: Fetch I/O & Network Data (Last 30-35 days)
+    Prometheus-->>-System: Return Data
+    System->>+Models: Train I/O Crisis Models
+    Models->>Storage: Save to Manifest
     Models-->>-System: Models Ready
     
-    System->>+Models: Train/Load I/O Ensemble Models
-    Models->>Storage: Save/Load to Manifest
-    Models-->>-System: Models Ready
-    
-    System->>+Models: Train/Load Classification Models
-    Models->>Storage: Save/Load Models
+    System->>+Models: Train I/O Ensemble Models
+    Models->>Storage: Save to Manifest
     Models-->>-System: Models Ready
     
     System->>System: Generate Forecasts
