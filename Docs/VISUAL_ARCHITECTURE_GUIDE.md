@@ -2,6 +2,22 @@
 
 This document provides visual representations of the Metrics AI system architecture, model flows, and comparisons.
 
+## Color Coding Legend
+
+All diagrams use a consistent color scheme for easy identification:
+
+| Color | Usage | Hex Code |
+|-------|-------|----------|
+| 🔵 **Blue** | Data Sources, Prophet Models, Start/End nodes | `#4A90E2` |
+| 🟢 **Green** | Data Fetching, Data Processing, OK status | `#7ED321` |
+| 🟡 **Orange/Yellow** | Model Training, Updates, Warnings, Aggregation | `#F5A623` |
+| 🟣 **Purple** | Storage, Ensemble Models, Forecasts, Output | `#9013FE` |
+| 🔴 **Red** | Critical alerts, Anomalies, Save operations | `#D0021B` |
+| 🟦 **Cyan/Teal** | ARIMA Models, Data Processing, Load operations | `#50E3C2` |
+| 🟪 **Magenta** | LSTM Models, External Systems, Save operations | `#BD10E0` |
+
+**Note**: Mermaid diagrams support color coding and styling. Some viewers (like GitHub, GitLab, VS Code with Mermaid extensions) will render these colors automatically. For enhanced interactivity and animations, consider using tools like [Mermaid Live Editor](https://mermaid.live/) or embedding in web pages with custom CSS animations.
+
 ---
 
 ## Table of Contents
@@ -84,6 +100,20 @@ graph TB
     AN --> AL
     AL --> WH
     AL --> PG
+    
+    classDef dataSource fill:#4A90E2,stroke:#2E5C8A,stroke-width:3px,color:#fff
+    classDef dataLayer fill:#7ED321,stroke:#5A9F1A,stroke-width:2px,color:#000
+    classDef modelLayer fill:#F5A623,stroke:#D68910,stroke-width:2px,color:#000
+    classDef storageLayer fill:#9013FE,stroke:#6A0DAD,stroke-width:2px,color:#fff
+    classDef outputLayer fill:#50E3C2,stroke:#3AB89F,stroke-width:2px,color:#000
+    classDef externalSystem fill:#BD10E0,stroke:#8B0DA8,stroke-width:2px,color:#fff
+    
+    class P dataSource
+    class DF,CI dataLayer
+    class HPE,DFM,IOC,IOE,CLS modelLayer
+    class MF,MN,PL storageLayer
+    class FC,AN,CR,AL outputLayer
+    class WH,PG externalSystem
 ```
 
 ### Model Types Architecture
@@ -122,6 +152,22 @@ graph LR
     IOC --> |Threshold| CR[Crisis Detection]
     
     CLS --> |IsolationForest| IF[Anomaly Labels]
+    
+    classDef ensemble fill:#F5A623,stroke:#D68910,stroke-width:3px,color:#000
+    classDef singleAlgo fill:#7ED321,stroke:#5A9F1A,stroke-width:3px,color:#000
+    classDef anomaly fill:#D0021B,stroke:#A00115,stroke-width:3px,color:#fff
+    classDef prophet fill:#4A90E2,stroke:#2E5C8A,stroke-width:2px,color:#fff
+    classDef arima fill:#50E3C2,stroke:#3AB89F,stroke-width:2px,color:#000
+    classDef lstm fill:#BD10E0,stroke:#8B0DA8,stroke-width:2px,color:#fff
+    classDef output fill:#9013FE,stroke:#6A0DAD,stroke-width:2px,color:#fff
+    
+    class HPE,IOE ensemble
+    class DFM,IOC singleAlgo
+    class CLS anomaly
+    class P1,P2,P3,P4 prophet
+    class A1,A2 arima
+    class L1,L2 lstm
+    class E1,E2,E3,CR,LT,IF output
 ```
 
 ---
@@ -232,6 +278,28 @@ flowchart TD
     
     AllDone --> GeneratePlots[Generate Plots]
     GeneratePlots --> End([End: Models Saved])
+    
+    classDef startEnd fill:#4A90E2,stroke:#2E5C8A,stroke-width:4px,color:#fff
+    classDef dataFetch fill:#7ED321,stroke:#5A9F1A,stroke-width:3px,color:#000
+    classDef dataProcess fill:#50E3C2,stroke:#3AB89F,stroke-width:2px,color:#000
+    classDef modelTrain fill:#F5A623,stroke:#D68910,stroke-width:3px,color:#000
+    classDef prophet fill:#4A90E2,stroke:#2E5C8A,stroke-width:2px,color:#fff
+    classDef arima fill:#50E3C2,stroke:#3AB89F,stroke-width:2px,color:#000
+    classDef lstm fill:#BD10E0,stroke:#8B0DA8,stroke-width:2px,color:#fff
+    classDef ensemble fill:#9013FE,stroke:#6A0DAD,stroke-width:3px,color:#fff
+    classDef save fill:#D0021B,stroke:#A00115,stroke-width:3px,color:#fff
+    classDef output fill:#F5A623,stroke:#D68910,stroke-width:3px,color:#000
+    
+    class Start,End startEnd
+    class Fetch,HostData,PodData,DiskData,IOData,NetData dataFetch
+    class ClusterID,GroupNodes dataProcess
+    class HostPodTrain,DiskTrain,IOTrain,ClassTrain,HPSplit,DiskSplit,IOSplit modelTrain
+    class HPProphet,DiskProphet,IOCrisis prophet
+    class HPARIMA arima
+    class HPLSTM,IOEnsemble lstm
+    class HPEnsemble,DiskETA,AllDone ensemble
+    class HPSave,DiskSave,IOSave,ClassSave save
+    class HPBacktest,GeneratePlots output
 ```
 
 ### Host/Pod Ensemble Training Detail
@@ -264,6 +332,29 @@ flowchart TD
     Metrics --> Save
     
     Save --> End([End])
+    
+    classDef startEnd fill:#4A90E2,stroke:#2E5C8A,stroke-width:4px,color:#fff
+    classDef dataPrep fill:#7ED321,stroke:#5A9F1A,stroke-width:2px,color:#000
+    classDef split fill:#50E3C2,stroke:#3AB89F,stroke-width:2px,color:#000
+    classDef trainSet fill:#F5A623,stroke:#D68910,stroke-width:2px,color:#000
+    classDef testSet fill:#9013FE,stroke:#6A0DAD,stroke-width:2px,color:#fff
+    classDef prophet fill:#4A90E2,stroke:#2E5C8A,stroke-width:2px,color:#fff
+    classDef arima fill:#50E3C2,stroke:#3AB89F,stroke-width:2px,color:#000
+    classDef lstm fill:#BD10E0,stroke:#8B0DA8,stroke-width:2px,color:#fff
+    classDef ensemble fill:#9013FE,stroke:#6A0DAD,stroke-width:3px,color:#fff
+    classDef save fill:#D0021B,stroke:#A00115,stroke-width:3px,color:#fff
+    classDef backtest fill:#F5A623,stroke:#D68910,stroke-width:2px,color:#000
+    
+    class Start,End startEnd
+    class DataPrep dataPrep
+    class Split split
+    class TrainSet trainSet
+    class TestSet,Backtest,Metrics testSet
+    class Prophet,PForecast prophet
+    class ARIMA,AForecast arima
+    class LSTM,LForecast lstm
+    class Ensemble ensemble
+    class Save save
 ```
 
 ### Disk Model Training Detail
@@ -304,6 +395,30 @@ flowchart TD
     
     Next -->|Yes| ForEach
     Next -->|No| End([End])
+    
+    classDef startEnd fill:#4A90E2,stroke:#2E5C8A,stroke-width:4px,color:#fff
+    classDef process fill:#7ED321,stroke:#5A9F1A,stroke-width:2px,color:#000
+    classDef decision fill:#F5A623,stroke:#D68910,stroke-width:3px,color:#000
+    classDef prophet fill:#4A90E2,stroke:#2E5C8A,stroke-width:2px,color:#fff
+    classDef linear fill:#50E3C2,stroke:#3AB89F,stroke-width:2px,color:#000
+    classDef ensemble fill:#9013FE,stroke:#6A0DAD,stroke-width:3px,color:#fff
+    classDef critical fill:#D0021B,stroke:#A00115,stroke-width:3px,color:#fff
+    classDef warning fill:#F5A623,stroke:#D68910,stroke-width:2px,color:#000
+    classDef soon fill:#7ED321,stroke:#5A9F1A,stroke-width:2px,color:#000
+    classDef ok fill:#50E3C2,stroke:#3AB89F,stroke-width:2px,color:#000
+    classDef save fill:#BD10E0,stroke:#8B0DA8,stroke-width:3px,color:#fff
+    
+    class Start,End startEnd
+    class Group,Data,Split process
+    class ForEach,Check,Severity,Next decision
+    class Prophet,ProphetETA prophet
+    class Linear,LinearETA linear
+    class EnsembleETA ensemble
+    class Critical critical
+    class Warning warning
+    class Soon soon
+    class OK ok
+    class Save save
 ```
 
 ---
@@ -355,6 +470,30 @@ flowchart TD
     Alerts --> Save[Save Updated Models]
     Save --> Plots[Generate Plots if --plot]
     Plots --> End([End])
+    
+    classDef startEnd fill:#4A90E2,stroke:#2E5C8A,stroke-width:4px,color:#fff
+    classDef dataFetch fill:#7ED321,stroke:#5A9F1A,stroke-width:3px,color:#000
+    classDef load fill:#50E3C2,stroke:#3AB89F,stroke-width:3px,color:#000
+    classDef update fill:#F5A623,stroke:#D68910,stroke-width:2px,color:#000
+    classDef prophet fill:#4A90E2,stroke:#2E5C8A,stroke-width:2px,color:#fff
+    classDef arima fill:#50E3C2,stroke:#3AB89F,stroke-width:2px,color:#000
+    classDef lstm fill:#BD10E0,stroke:#8B0DA8,stroke-width:2px,color:#fff
+    classDef forecast fill:#9013FE,stroke:#6A0DAD,stroke-width:3px,color:#fff
+    classDef anomaly fill:#D0021B,stroke:#A00115,stroke-width:2px,color:#fff
+    classDef aggregate fill:#F5A623,stroke:#D68910,stroke-width:3px,color:#000
+    classDef output fill:#7ED321,stroke:#5A9F1A,stroke-width:3px,color:#000
+    
+    class Start,End startEnd
+    class Fetch dataFetch
+    class Load load
+    class UpdateHP,UpdateDisk,UpdateIO,UpdateClass update
+    class HPProphet,DiskProphet,IOCrisis prophet
+    class HPARIMA arima
+    class HPLSTM,IOEnsemble lstm
+    class HPForecast,DiskForecast,IOForecast forecast
+    class IOAnomaly,ClassPredict anomaly
+    class Aggregate aggregate
+    class Alerts,Save,Plots output
 ```
 
 ### Minimal Update Flow (Forecast Mode)
@@ -382,6 +521,24 @@ flowchart LR
     L3 --> Ensemble
     
     Ensemble --> Save[Save Updated Models]
+    
+    classDef load fill:#50E3C2,stroke:#3AB89F,stroke-width:2px,color:#000
+    classDef process fill:#F5A623,stroke:#D68910,stroke-width:2px,color:#000
+    classDef prophet fill:#4A90E2,stroke:#2E5C8A,stroke-width:2px,color:#fff
+    classDef arima fill:#50E3C2,stroke:#3AB89F,stroke-width:2px,color:#000
+    classDef lstm fill:#BD10E0,stroke:#8B0DA8,stroke-width:2px,color:#fff
+    classDef forecast fill:#9013FE,stroke:#6A0DAD,stroke-width:2px,color:#fff
+    classDef ensemble fill:#9013FE,stroke:#6A0DAD,stroke-width:3px,color:#fff
+    classDef save fill:#D0021B,stroke:#A00115,stroke-width:3px,color:#fff
+    
+    class P1,A1,L1 load
+    class P2,P3,A2,L2 process
+    class P1,P2,P3,P4 prophet
+    class A1,A2,A3 arima
+    class L1,L2,L3 lstm
+    class P4,A3,L3 forecast
+    class Ensemble ensemble
+    class Save save
 ```
 
 ---
@@ -409,6 +566,21 @@ graph LR
     
     T5 -->|Models Saved| P2
     P6 -->|Updated Models| P2
+    
+    classDef trainingData fill:#7ED321,stroke:#5A9F1A,stroke-width:2px,color:#000
+    classDef trainingProcess fill:#F5A623,stroke:#D68910,stroke-width:2px,color:#000
+    classDef trainingSave fill:#D0021B,stroke:#A00115,stroke-width:3px,color:#fff
+    classDef predictionData fill:#4A90E2,stroke:#2E5C8A,stroke-width:2px,color:#fff
+    classDef predictionProcess fill:#50E3C2,stroke:#3AB89F,stroke-width:2px,color:#000
+    classDef predictionOutput fill:#9013FE,stroke:#6A0DAD,stroke-width:2px,color:#fff
+    classDef predictionSave fill:#BD10E0,stroke:#8B0DA8,stroke-width:3px,color:#fff
+    
+    class T1,P1 trainingData
+    class T2,T3,T4 trainingProcess
+    class T5 trainingSave
+    class P2,P3 predictionProcess
+    class P4,P5 predictionOutput
+    class P6 predictionSave
 ```
 
 ### Configuration Variables Flow
@@ -439,6 +611,18 @@ graph TD
     
     Forecast --> Output[Output: Forecasts, Crises, Anomalies]
     AnomalyDet --> Output
+    
+    classDef dataVar fill:#7ED321,stroke:#5A9F1A,stroke-width:2px,color:#000
+    classDef trainVar fill:#F5A623,stroke:#D68910,stroke-width:2px,color:#000
+    classDef anomalyVar fill:#D0021B,stroke:#A00115,stroke-width:2px,color:#fff
+    classDef process fill:#50E3C2,stroke:#3AB89F,stroke-width:3px,color:#000
+    classDef output fill:#9013FE,stroke:#6A0DAD,stroke-width:3px,color:#fff
+    
+    class START,STEP,Fetch dataVar
+    class TRAIN,HORIZON,LSTM_SEQ,LSTM_EPOCH,Split,Models trainVar
+    class LOOKBACK,CONTAM,Anomaly anomalyVar
+    class Forecast,AnomalyDet process
+    class Output output
 ```
 
 ---
@@ -497,6 +681,14 @@ graph TD
         C3[START_HOURS_AGO<br/>High]
         C4[STEP<br/>Medium]
     end
+    
+    classDef critical fill:#D0021B,stroke:#A00115,stroke-width:3px,color:#fff
+    classDef high fill:#F5A623,stroke:#D68910,stroke-width:2px,color:#000
+    classDef medium fill:#7ED321,stroke:#5A9F1A,stroke-width:2px,color:#000
+    
+    class HP1,IO1,C1,C2 critical
+    class HP2,HP3,HP4,D1,D2,IO2,IO3,IO4,C3 high
+    class HP5,HP6,D3,IO5,C4 medium
 ```
 
 ---
@@ -513,26 +705,31 @@ sequenceDiagram
     participant Models
     participant Storage
     
-    User->>System: Run metrics.py
-    System->>Prometheus: Fetch Data (START_HOURS_AGO, STEP)
-    Prometheus-->>System: Return Data
+    User->>+System: Run metrics.py
+    System->>+Prometheus: Fetch Data (START_HOURS_AGO, STEP)
+    Prometheus-->>-System: Return Data
     
     System->>System: Identify Clusters (LOOKBACK_HOURS)
     
-    System->>Models: Train/Load Host/Pod Models
+    System->>+Models: Train/Load Host/Pod Models
     Models->>Storage: Save/Load Models
+    Models-->>-System: Models Ready
     
-    System->>Models: Train/Load Disk Models
+    System->>+Models: Train/Load Disk Models
     Models->>Storage: Save/Load to Manifest
+    Models-->>-System: Models Ready
     
-    System->>Models: Train/Load I/O Crisis Models
+    System->>+Models: Train/Load I/O Crisis Models
     Models->>Storage: Save/Load to Manifest
+    Models-->>-System: Models Ready
     
-    System->>Models: Train/Load I/O Ensemble Models
+    System->>+Models: Train/Load I/O Ensemble Models
     Models->>Storage: Save/Load to Manifest
+    Models-->>-System: Models Ready
     
-    System->>Models: Train/Load Classification Models
+    System->>+Models: Train/Load Classification Models
     Models->>Storage: Save/Load Models
+    Models-->>-System: Models Ready
     
     System->>System: Generate Forecasts
     System->>System: Detect Anomalies
@@ -540,6 +737,7 @@ sequenceDiagram
     
     System->>User: Display Results
     System->>Storage: Save Plots (if enabled)
+    System-->>-User: Complete
 ```
 
 ---
