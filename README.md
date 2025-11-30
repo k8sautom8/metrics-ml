@@ -694,6 +694,20 @@ python3 metrics.py --training --parallel 16
 python3 metrics.py --parallel 2  # Uses 2 workers even with <10 items
 ```
 
+## Documentation
+
+### Core Documentation
+- **[README.md](README.md)** - This file: Quick start and overview
+- **[Docs.md](Docs.md)** - Comprehensive system documentation
+- **[CONFIGURATION_VARIABLES.md](CONFIGURATION_VARIABLES.md)** - Detailed explanation of all configuration variables
+- **[MODEL_TRAINING_AND_PREDICTION_GUIDE.md](MODEL_TRAINING_AND_PREDICTION_GUIDE.md)** - Step-by-step guide for all models
+- **[VISUAL_ARCHITECTURE_GUIDE.md](VISUAL_ARCHITECTURE_GUIDE.md)** - Architecture diagrams, flowcharts, and comparison tables
+
+### Specialized Documentation
+- **[ANOMALY_DETECTION.md](ANOMALY_DETECTION.md)** - Anomaly detection details
+- **[SLI_SLO_GUIDE.md](SLI_SLO_GUIDE.md)** - SLI/SLO configuration guide
+- **[ERROR_BUDGET_EXPLAINED.md](ERROR_BUDGET_EXPLAINED.md)** - Error budget calculations
+
 ## License
 
 See [LICENSE](LICENSE) for details.
