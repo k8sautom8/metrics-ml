@@ -698,15 +698,16 @@ python3 metrics.py --parallel 2  # Uses 2 workers even with <10 items
 
 ### Core Documentation
 - **[README.md](README.md)** - This file: Quick start and overview
-- **[Docs.md](Docs.md)** - Comprehensive system documentation
-- **[CONFIGURATION_VARIABLES.md](CONFIGURATION_VARIABLES.md)** - Detailed explanation of all configuration variables
-- **[MODEL_TRAINING_AND_PREDICTION_GUIDE.md](MODEL_TRAINING_AND_PREDICTION_GUIDE.md)** - Step-by-step guide for all models
-- **[VISUAL_ARCHITECTURE_GUIDE.md](VISUAL_ARCHITECTURE_GUIDE.md)** - Architecture diagrams, flowcharts, and comparison tables
+- **[Docs/SYSTEM_DOCUMENTATION.md](Docs/SYSTEM_DOCUMENTATION.md)** - Comprehensive system documentation
+- **[Docs/CONFIGURATION_VARIABLES.md](Docs/CONFIGURATION_VARIABLES.md)** - Detailed explanation of all configuration variables
+- **[Docs/MODEL_TRAINING_AND_PREDICTION_GUIDE.md](Docs/MODEL_TRAINING_AND_PREDICTION_GUIDE.md)** - Step-by-step guide for all models
+- **[Docs/VISUAL_ARCHITECTURE_GUIDE.md](Docs/VISUAL_ARCHITECTURE_GUIDE.md)** - Architecture diagrams, flowcharts, and comparison tables
 
 ### Specialized Documentation
-- **[ANOMALY_DETECTION.md](ANOMALY_DETECTION.md)** - Anomaly detection details
-- **[SLI_SLO_GUIDE.md](SLI_SLO_GUIDE.md)** - SLI/SLO configuration guide
-- **[ERROR_BUDGET_EXPLAINED.md](ERROR_BUDGET_EXPLAINED.md)** - Error budget calculations
+- **[Docs/ANOMALY_DETECTION.md](Docs/ANOMALY_DETECTION.md)** - Anomaly detection details
+- **[Docs/SLI_SLO_GUIDE.md](Docs/SLI_SLO_GUIDE.md)** - SLI/SLO configuration guide
+- **[Docs/ERROR_BUDGET_EXPLAINED.md](Docs/ERROR_BUDGET_EXPLAINED.md)** - Error budget calculations
+- **[Docs/ERROR_BUDGET_CALCULATION_EXAMPLE.md](Docs/ERROR_BUDGET_CALCULATION_EXAMPLE.md)** - Error budget calculation examples
 
 ## License
 

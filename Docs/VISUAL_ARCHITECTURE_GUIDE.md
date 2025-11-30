@@ -572,6 +572,6 @@ sequenceDiagram
 
 - `MODEL_TRAINING_AND_PREDICTION_GUIDE.md` - Detailed step-by-step guide
 - `CONFIGURATION_VARIABLES.md` - Variable explanations
-- `README.md` - General documentation
-- `Docs.md` - System architecture
+- `../README.md` - General documentation
+- `SYSTEM_DOCUMENTATION.md` - System architecture
 

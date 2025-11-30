@@ -1075,7 +1075,7 @@ Detects anomalous nodes using IsolationForest, comparing nodes within the same K
 ## See Also
 
 - `CONFIGURATION_VARIABLES.md` - Detailed variable explanations
-- `README.md` - General documentation
-- `Docs.md` - System architecture
+- `../README.md` - General documentation
+- `SYSTEM_DOCUMENTATION.md` - System architecture
 - `ANOMALY_DETECTION.md` - Anomaly detection specifics
 

@@ -310,7 +310,7 @@ export STEP="300s"             # 5-minute resolution (less data)
 
 ## See Also
 
-- `README.md` - General configuration documentation
-- `Docs.md` - Detailed system documentation
+- `../README.md` - General configuration documentation
+- `SYSTEM_DOCUMENTATION.md` - Detailed system documentation
 - `ANOMALY_DETECTION.md` - Anomaly detection specifics
 
