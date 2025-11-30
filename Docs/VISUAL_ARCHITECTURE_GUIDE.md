@@ -8,14 +8,14 @@ All diagrams use a consistent color scheme for easy identification:
 
 | Color | Usage | Hex Code |
 |-------|-------|----------|
-| 🔵 **Navy Blue** | Data Sources, Prophet Models, Start/End nodes | `#2C3E50` |
-| 🟢 **Forest Green** | Data Fetching, Data Processing, OK status | `#27AE60` |
-| 🟡 **Amber** | Model Training, Updates, Warnings, Aggregation | `#E67E22` |
-| 🟣 **Slate Purple** | Storage, Ensemble Models, Forecasts, Output | `#6C5CE7` |
-| 🔴 **Burgundy** | Critical alerts, Anomalies, Save operations | `#C0392B` |
-| 🟦 **Teal** | ARIMA Models, Data Processing, Load operations | `#16A085` |
-| 🟪 **Indigo** | LSTM Models, External Systems, Save operations | `#5B4B8A` |
-| ⚫ **Charcoal** | Decision points, Process steps | `#34495E` |
+| 🔵 **Light Blue** | Data Sources, Prophet Models, Start/End nodes | `#0078D4` |
+| 🟢 **Light Green** | Data Fetching, Data Processing, OK status | `#107C10` |
+| 🟡 **Light Orange** | Model Training, Updates, Warnings, Aggregation | `#FF8C00` |
+| 🟣 **Light Purple** | Storage, Ensemble Models, Forecasts, Output | `#8764B8` |
+| 🔴 **Light Red** | Critical alerts, Anomalies, Save operations | `#E81123` |
+| 🟦 **Light Teal** | ARIMA Models, Data Processing, Load operations | `#00B7C3` |
+| 🟪 **Light Indigo** | LSTM Models, External Systems, Save operations | `#5C2D91` |
+| ⚫ **Light Gray** | Decision points, Process steps | `#6B6B6B` |
 
 **Note**: Mermaid diagrams support color coding and styling. Some viewers (like GitHub, GitLab, VS Code with Mermaid extensions) will render these colors automatically. For enhanced interactivity and animations, consider using tools like [Mermaid Live Editor](https://mermaid.live/) or embedding in web pages with custom CSS animations.
 
@@ -102,12 +102,12 @@ graph TB
     AL --> WH
     AL --> PG
     
-    classDef dataSource fill:#2C3E50,stroke:#1A252F,stroke-width:3px,color:#fff
-    classDef dataLayer fill:#27AE60,stroke:#1E8449,stroke-width:2px,color:#fff
-    classDef modelLayer fill:#E67E22,stroke:#D35400,stroke-width:2px,color:#fff
-    classDef storageLayer fill:#6C5CE7,stroke:#5A4FCF,stroke-width:2px,color:#fff
-    classDef outputLayer fill:#16A085,stroke:#138D75,stroke-width:2px,color:#fff
-    classDef externalSystem fill:#5B4B8A,stroke:#4A3D73,stroke-width:2px,color:#fff
+    classDef dataSource fill:#0078D4,stroke:#005A9E,stroke-width:3px,color:#fff
+    classDef dataLayer fill:#107C10,stroke:#0B5A0B,stroke-width:2px,color:#fff
+    classDef modelLayer fill:#FF8C00,stroke:#CC7000,stroke-width:2px,color:#fff
+    classDef storageLayer fill:#8764B8,stroke:#6B4F93,stroke-width:2px,color:#fff
+    classDef outputLayer fill:#00B7C3,stroke:#00929A,stroke-width:2px,color:#fff
+    classDef externalSystem fill:#5C2D91,stroke:#4A2473,stroke-width:2px,color:#fff
     
     class P dataSource
     class DF,CI dataLayer
@@ -154,13 +154,13 @@ graph LR
     
     CLS --> |IsolationForest| IF[Anomaly Labels]
     
-    classDef ensemble fill:#E67E22,stroke:#D35400,stroke-width:3px,color:#fff
-    classDef singleAlgo fill:#27AE60,stroke:#1E8449,stroke-width:3px,color:#fff
-    classDef anomaly fill:#C0392B,stroke:#A93226,stroke-width:3px,color:#fff
-    classDef prophet fill:#2C3E50,stroke:#1A252F,stroke-width:2px,color:#fff
-    classDef arima fill:#16A085,stroke:#138D75,stroke-width:2px,color:#fff
-    classDef lstm fill:#5B4B8A,stroke:#4A3D73,stroke-width:2px,color:#fff
-    classDef output fill:#6C5CE7,stroke:#5A4FCF,stroke-width:2px,color:#fff
+    classDef ensemble fill:#FF8C00,stroke:#CC7000,stroke-width:3px,color:#fff
+    classDef singleAlgo fill:#107C10,stroke:#0B5A0B,stroke-width:3px,color:#fff
+    classDef anomaly fill:#E81123,stroke:#BA0E1C,stroke-width:3px,color:#fff
+    classDef prophet fill:#0078D4,stroke:#005A9E,stroke-width:2px,color:#fff
+    classDef arima fill:#00B7C3,stroke:#00929A,stroke-width:2px,color:#fff
+    classDef lstm fill:#5C2D91,stroke:#4A2473,stroke-width:2px,color:#fff
+    classDef output fill:#8764B8,stroke:#6B4F93,stroke-width:2px,color:#fff
     
     class HPE,IOE ensemble
     class DFM,IOC singleAlgo
@@ -280,16 +280,16 @@ flowchart TD
     AllDone --> GeneratePlots[Generate Plots]
     GeneratePlots --> End([End: Models Saved])
     
-    classDef startEnd fill:#2C3E50,stroke:#1A252F,stroke-width:4px,color:#fff
-    classDef dataFetch fill:#27AE60,stroke:#1E8449,stroke-width:3px,color:#fff
-    classDef dataProcess fill:#16A085,stroke:#138D75,stroke-width:2px,color:#fff
-    classDef modelTrain fill:#E67E22,stroke:#D35400,stroke-width:3px,color:#fff
-    classDef prophet fill:#2C3E50,stroke:#1A252F,stroke-width:2px,color:#fff
-    classDef arima fill:#16A085,stroke:#138D75,stroke-width:2px,color:#fff
-    classDef lstm fill:#5B4B8A,stroke:#4A3D73,stroke-width:2px,color:#fff
-    classDef ensemble fill:#6C5CE7,stroke:#5A4FCF,stroke-width:3px,color:#fff
-    classDef save fill:#C0392B,stroke:#A93226,stroke-width:3px,color:#fff
-    classDef output fill:#E67E22,stroke:#D35400,stroke-width:3px,color:#fff
+    classDef startEnd fill:#0078D4,stroke:#005A9E,stroke-width:4px,color:#fff
+    classDef dataFetch fill:#107C10,stroke:#0B5A0B,stroke-width:3px,color:#fff
+    classDef dataProcess fill:#00B7C3,stroke:#00929A,stroke-width:2px,color:#fff
+    classDef modelTrain fill:#FF8C00,stroke:#CC7000,stroke-width:3px,color:#fff
+    classDef prophet fill:#0078D4,stroke:#005A9E,stroke-width:2px,color:#fff
+    classDef arima fill:#00B7C3,stroke:#00929A,stroke-width:2px,color:#fff
+    classDef lstm fill:#5C2D91,stroke:#4A2473,stroke-width:2px,color:#fff
+    classDef ensemble fill:#8764B8,stroke:#6B4F93,stroke-width:3px,color:#fff
+    classDef save fill:#E81123,stroke:#BA0E1C,stroke-width:3px,color:#fff
+    classDef output fill:#FF8C00,stroke:#CC7000,stroke-width:3px,color:#fff
     
     class Start,End startEnd
     class Fetch,HostData,PodData,DiskData,IOData,NetData dataFetch
@@ -334,17 +334,17 @@ flowchart TD
     
     Save --> End([End])
     
-    classDef startEnd fill:#2C3E50,stroke:#1A252F,stroke-width:4px,color:#fff
-    classDef dataPrep fill:#27AE60,stroke:#1E8449,stroke-width:2px,color:#fff
-    classDef split fill:#16A085,stroke:#138D75,stroke-width:2px,color:#fff
-    classDef trainSet fill:#E67E22,stroke:#D35400,stroke-width:2px,color:#fff
-    classDef testSet fill:#6C5CE7,stroke:#5A4FCF,stroke-width:2px,color:#fff
-    classDef prophet fill:#2C3E50,stroke:#1A252F,stroke-width:2px,color:#fff
-    classDef arima fill:#16A085,stroke:#138D75,stroke-width:2px,color:#fff
-    classDef lstm fill:#5B4B8A,stroke:#4A3D73,stroke-width:2px,color:#fff
-    classDef ensemble fill:#6C5CE7,stroke:#5A4FCF,stroke-width:3px,color:#fff
-    classDef save fill:#C0392B,stroke:#A93226,stroke-width:3px,color:#fff
-    classDef backtest fill:#E67E22,stroke:#D35400,stroke-width:2px,color:#fff
+    classDef startEnd fill:#0078D4,stroke:#005A9E,stroke-width:4px,color:#fff
+    classDef dataPrep fill:#107C10,stroke:#0B5A0B,stroke-width:2px,color:#fff
+    classDef split fill:#00B7C3,stroke:#00929A,stroke-width:2px,color:#fff
+    classDef trainSet fill:#FF8C00,stroke:#CC7000,stroke-width:2px,color:#fff
+    classDef testSet fill:#8764B8,stroke:#6B4F93,stroke-width:2px,color:#fff
+    classDef prophet fill:#0078D4,stroke:#005A9E,stroke-width:2px,color:#fff
+    classDef arima fill:#00B7C3,stroke:#00929A,stroke-width:2px,color:#fff
+    classDef lstm fill:#5C2D91,stroke:#4A2473,stroke-width:2px,color:#fff
+    classDef ensemble fill:#8764B8,stroke:#6B4F93,stroke-width:3px,color:#fff
+    classDef save fill:#E81123,stroke:#BA0E1C,stroke-width:3px,color:#fff
+    classDef backtest fill:#FF8C00,stroke:#CC7000,stroke-width:2px,color:#fff
     
     class Start,End startEnd
     class DataPrep dataPrep
@@ -397,17 +397,17 @@ flowchart TD
     Next -->|Yes| ForEach
     Next -->|No| End([End])
     
-    classDef startEnd fill:#2C3E50,stroke:#1A252F,stroke-width:4px,color:#fff
-    classDef process fill:#27AE60,stroke:#1E8449,stroke-width:2px,color:#fff
-    classDef decision fill:#34495E,stroke:#2C3E50,stroke-width:3px,color:#fff
-    classDef prophet fill:#2C3E50,stroke:#1A252F,stroke-width:2px,color:#fff
-    classDef linear fill:#16A085,stroke:#138D75,stroke-width:2px,color:#fff
-    classDef ensemble fill:#6C5CE7,stroke:#5A4FCF,stroke-width:3px,color:#fff
-    classDef critical fill:#C0392B,stroke:#A93226,stroke-width:3px,color:#fff
-    classDef warning fill:#E67E22,stroke:#D35400,stroke-width:2px,color:#fff
-    classDef soon fill:#27AE60,stroke:#1E8449,stroke-width:2px,color:#fff
-    classDef ok fill:#16A085,stroke:#138D75,stroke-width:2px,color:#fff
-    classDef save fill:#5B4B8A,stroke:#4A3D73,stroke-width:3px,color:#fff
+    classDef startEnd fill:#0078D4,stroke:#005A9E,stroke-width:4px,color:#fff
+    classDef process fill:#107C10,stroke:#0B5A0B,stroke-width:2px,color:#fff
+    classDef decision fill:#6B6B6B,stroke:#555555,stroke-width:3px,color:#fff
+    classDef prophet fill:#0078D4,stroke:#005A9E,stroke-width:2px,color:#fff
+    classDef linear fill:#00B7C3,stroke:#00929A,stroke-width:2px,color:#fff
+    classDef ensemble fill:#8764B8,stroke:#6B4F93,stroke-width:3px,color:#fff
+    classDef critical fill:#E81123,stroke:#BA0E1C,stroke-width:3px,color:#fff
+    classDef warning fill:#FF8C00,stroke:#CC7000,stroke-width:2px,color:#fff
+    classDef soon fill:#107C10,stroke:#0B5A0B,stroke-width:2px,color:#fff
+    classDef ok fill:#00B7C3,stroke:#00929A,stroke-width:2px,color:#fff
+    classDef save fill:#5C2D91,stroke:#4A2473,stroke-width:3px,color:#fff
     
     class Start,End startEnd
     class Group,Data,Split process
@@ -472,17 +472,17 @@ flowchart TD
     Save --> Plots[Generate Plots if --plot]
     Plots --> End([End])
     
-    classDef startEnd fill:#2C3E50,stroke:#1A252F,stroke-width:4px,color:#fff
-    classDef dataFetch fill:#27AE60,stroke:#1E8449,stroke-width:3px,color:#fff
-    classDef load fill:#16A085,stroke:#138D75,stroke-width:3px,color:#fff
-    classDef update fill:#E67E22,stroke:#D35400,stroke-width:2px,color:#fff
-    classDef prophet fill:#2C3E50,stroke:#1A252F,stroke-width:2px,color:#fff
-    classDef arima fill:#16A085,stroke:#138D75,stroke-width:2px,color:#fff
-    classDef lstm fill:#5B4B8A,stroke:#4A3D73,stroke-width:2px,color:#fff
-    classDef forecast fill:#6C5CE7,stroke:#5A4FCF,stroke-width:3px,color:#fff
-    classDef anomaly fill:#C0392B,stroke:#A93226,stroke-width:2px,color:#fff
-    classDef aggregate fill:#E67E22,stroke:#D35400,stroke-width:3px,color:#fff
-    classDef output fill:#27AE60,stroke:#1E8449,stroke-width:3px,color:#fff
+    classDef startEnd fill:#0078D4,stroke:#005A9E,stroke-width:4px,color:#fff
+    classDef dataFetch fill:#107C10,stroke:#0B5A0B,stroke-width:3px,color:#fff
+    classDef load fill:#00B7C3,stroke:#00929A,stroke-width:3px,color:#fff
+    classDef update fill:#FF8C00,stroke:#CC7000,stroke-width:2px,color:#fff
+    classDef prophet fill:#0078D4,stroke:#005A9E,stroke-width:2px,color:#fff
+    classDef arima fill:#00B7C3,stroke:#00929A,stroke-width:2px,color:#fff
+    classDef lstm fill:#5C2D91,stroke:#4A2473,stroke-width:2px,color:#fff
+    classDef forecast fill:#8764B8,stroke:#6B4F93,stroke-width:3px,color:#fff
+    classDef anomaly fill:#E81123,stroke:#BA0E1C,stroke-width:2px,color:#fff
+    classDef aggregate fill:#FF8C00,stroke:#CC7000,stroke-width:3px,color:#fff
+    classDef output fill:#107C10,stroke:#0B5A0B,stroke-width:3px,color:#fff
     
     class Start,End startEnd
     class Fetch dataFetch
@@ -523,14 +523,14 @@ flowchart LR
     
     Ensemble --> Save[Save Updated Models]
     
-    classDef load fill:#16A085,stroke:#138D75,stroke-width:2px,color:#fff
-    classDef process fill:#E67E22,stroke:#D35400,stroke-width:2px,color:#fff
-    classDef prophet fill:#2C3E50,stroke:#1A252F,stroke-width:2px,color:#fff
-    classDef arima fill:#16A085,stroke:#138D75,stroke-width:2px,color:#fff
-    classDef lstm fill:#5B4B8A,stroke:#4A3D73,stroke-width:2px,color:#fff
-    classDef forecast fill:#6C5CE7,stroke:#5A4FCF,stroke-width:2px,color:#fff
-    classDef ensemble fill:#6C5CE7,stroke:#5A4FCF,stroke-width:3px,color:#fff
-    classDef save fill:#C0392B,stroke:#A93226,stroke-width:3px,color:#fff
+    classDef load fill:#00B7C3,stroke:#00929A,stroke-width:2px,color:#fff
+    classDef process fill:#FF8C00,stroke:#CC7000,stroke-width:2px,color:#fff
+    classDef prophet fill:#0078D4,stroke:#005A9E,stroke-width:2px,color:#fff
+    classDef arima fill:#00B7C3,stroke:#00929A,stroke-width:2px,color:#fff
+    classDef lstm fill:#5C2D91,stroke:#4A2473,stroke-width:2px,color:#fff
+    classDef forecast fill:#8764B8,stroke:#6B4F93,stroke-width:2px,color:#fff
+    classDef ensemble fill:#8764B8,stroke:#6B4F93,stroke-width:3px,color:#fff
+    classDef save fill:#E81123,stroke:#BA0E1C,stroke-width:3px,color:#fff
     
     class P1,A1,L1 load
     class P2,P3,A2,L2 process
@@ -568,13 +568,13 @@ graph LR
     T5 -->|Models Saved| P2
     P6 -->|Updated Models| P2
     
-    classDef trainingData fill:#27AE60,stroke:#1E8449,stroke-width:2px,color:#fff
-    classDef trainingProcess fill:#E67E22,stroke:#D35400,stroke-width:2px,color:#fff
-    classDef trainingSave fill:#C0392B,stroke:#A93226,stroke-width:3px,color:#fff
-    classDef predictionData fill:#2C3E50,stroke:#1A252F,stroke-width:2px,color:#fff
-    classDef predictionProcess fill:#16A085,stroke:#138D75,stroke-width:2px,color:#fff
-    classDef predictionOutput fill:#6C5CE7,stroke:#5A4FCF,stroke-width:2px,color:#fff
-    classDef predictionSave fill:#5B4B8A,stroke:#4A3D73,stroke-width:3px,color:#fff
+    classDef trainingData fill:#107C10,stroke:#0B5A0B,stroke-width:2px,color:#fff
+    classDef trainingProcess fill:#FF8C00,stroke:#CC7000,stroke-width:2px,color:#fff
+    classDef trainingSave fill:#E81123,stroke:#BA0E1C,stroke-width:3px,color:#fff
+    classDef predictionData fill:#0078D4,stroke:#005A9E,stroke-width:2px,color:#fff
+    classDef predictionProcess fill:#00B7C3,stroke:#00929A,stroke-width:2px,color:#fff
+    classDef predictionOutput fill:#8764B8,stroke:#6B4F93,stroke-width:2px,color:#fff
+    classDef predictionSave fill:#5C2D91,stroke:#4A2473,stroke-width:3px,color:#fff
     
     class T1,P1 trainingData
     class T2,T3,T4 trainingProcess
@@ -613,11 +613,11 @@ graph TD
     Forecast --> Output[Output: Forecasts, Crises, Anomalies]
     AnomalyDet --> Output
     
-    classDef dataVar fill:#27AE60,stroke:#1E8449,stroke-width:2px,color:#fff
-    classDef trainVar fill:#E67E22,stroke:#D35400,stroke-width:2px,color:#fff
-    classDef anomalyVar fill:#C0392B,stroke:#A93226,stroke-width:2px,color:#fff
-    classDef process fill:#16A085,stroke:#138D75,stroke-width:3px,color:#fff
-    classDef output fill:#6C5CE7,stroke:#5A4FCF,stroke-width:3px,color:#fff
+    classDef dataVar fill:#107C10,stroke:#0B5A0B,stroke-width:2px,color:#fff
+    classDef trainVar fill:#FF8C00,stroke:#CC7000,stroke-width:2px,color:#fff
+    classDef anomalyVar fill:#E81123,stroke:#BA0E1C,stroke-width:2px,color:#fff
+    classDef process fill:#00B7C3,stroke:#00929A,stroke-width:3px,color:#fff
+    classDef output fill:#8764B8,stroke:#6B4F93,stroke-width:3px,color:#fff
     
     class START,STEP,Fetch dataVar
     class TRAIN,HORIZON,LSTM_SEQ,LSTM_EPOCH,Split,Models trainVar
@@ -683,9 +683,9 @@ graph TD
         C4[STEP<br/>Medium]
     end
     
-    classDef critical fill:#C0392B,stroke:#A93226,stroke-width:3px,color:#fff
-    classDef high fill:#E67E22,stroke:#D35400,stroke-width:2px,color:#fff
-    classDef medium fill:#27AE60,stroke:#1E8449,stroke-width:2px,color:#fff
+    classDef critical fill:#E81123,stroke:#BA0E1C,stroke-width:3px,color:#fff
+    classDef high fill:#FF8C00,stroke:#CC7000,stroke-width:2px,color:#fff
+    classDef medium fill:#107C10,stroke:#0B5A0B,stroke-width:2px,color:#fff
     
     class HP1,IO1,C1,C2 critical
     class HP2,HP3,HP4,D1,D2,IO2,IO3,IO4,C3 high
