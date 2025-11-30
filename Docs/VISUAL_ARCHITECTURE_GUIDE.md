@@ -180,10 +180,10 @@ graph LR
 | Model Type | Purpose | Algorithms | Scope | Storage | Forecast Horizon |
 |------------|---------|------------|-------|---------|------------------|
 | **Host/Pod Ensemble** | CPU/Memory forecasting | Prophet + ARIMA + LSTM | Per-cluster or standalone | `k8s_cluster_{id}_forecast.pkl` | `HORIZON_MIN` (default: 15 min) |
-| **Disk Full** | Disk usage prediction | Linear trend + Prophet | Per node/mountpoint | Manifest: `disk_full_models.pkl` | `horizon_days` (default: 7 days) |
-| **I/O Network Crisis** | Crisis detection | Prophet | Per node/signal | Manifest: `io_net_models.pkl` | `horizon_days` (default: 7 days) |
-| **I/O Network Ensemble** | Full I/O/Net forecasting | Prophet + ARIMA + LSTM | Per node/signal | Manifest: `io_net_models.pkl` | `HORIZON_MIN` (default: 15 min) |
-| **Classification** | Anomaly detection | IsolationForest | Per-cluster | `isolation_forest_anomaly.pkl` | N/A (real-time) |
+| **Disk Full** | Disk usage prediction | Linear trend + Prophet (daily + weekly seasonality) | Per node/mountpoint | Manifest: `disk_full_models.pkl` | `horizon_days` (default: 7 days) |
+| **I/O Network Crisis** | Crisis detection | Prophet (daily + weekly seasonality) | Per node/signal | Manifest: `io_net_models.pkl` | `horizon_days` (default: 7 days) |
+| **I/O Network Ensemble** | Full I/O/Net forecasting | Prophet + ARIMA + LSTM (temporal-aware anomaly detection) | Per node/signal | Manifest: `io_net_models.pkl` | `HORIZON_MIN` (default: 15 min) |
+| **Classification** | Anomaly detection | IsolationForest (temporal-aware if 3+ months data) | Per-cluster | `isolation_forest_anomaly.pkl` | N/A (real-time) |
 
 ### Training vs Prediction Comparison
 
@@ -203,11 +203,11 @@ graph LR
 
 | Algorithm | Strengths | Weaknesses | Used In | Configuration Variables |
 |-----------|-----------|------------|---------|------------------------|
-| **Prophet** | Handles seasonality, trends, holidays | Slower training | All models | `HORIZON_MIN`, `horizon_days` |
+| **Prophet** | Handles seasonality (daily + weekly), trends, holidays | Slower training | All models | `HORIZON_MIN`, `horizon_days` |
 | **ARIMA** | Fast, good for stationary data | Limited to linear patterns | Host/Pod, I/O Ensemble | `HORIZON_MIN` |
 | **LSTM** | Captures complex patterns, non-linear | Requires more data, slower | Host/Pod, I/O Ensemble | `LSTM_SEQ_LEN`, `LSTM_EPOCHS`, `HORIZON_MIN` |
 | **Linear Trend** | Very fast, simple | Only captures linear trends | Disk models | None (fixed) |
-| **IsolationForest** | Unsupervised, no labels needed | Sensitive to contamination rate | Classification | `LOOKBACK_HOURS`, `CONTAMINATION` |
+| **IsolationForest** | Unsupervised, no labels needed, temporal-aware | Sensitive to contamination rate | Classification | `LOOKBACK_HOURS`, `CONTAMINATION` (temporal features if 3+ months data) |
 
 ### Storage Comparison
 
@@ -282,8 +282,8 @@ flowchart TD
     IOEEnsemble --> IOEBacktest[Backtest on Test Set]
     IOEBacktest --> IOESave[Save to Manifest]
     
-    ClassTrain --> ClassFeat[Extract Features<br/>LOOKBACK_HOURS]
-    ClassFeat --> ClassISO[Train IsolationForest<br/>CONTAMINATION]
+    ClassTrain --> ClassFeat[Extract Features<br/>LOOKBACK_HOURS<br/>Temporal-Aware if 3+ months data]
+    ClassFeat --> ClassISO[Train IsolationForest<br/>CONTAMINATION<br/>Uses temporal features if available]
     ClassISO --> ClassSave[Save Models]
     
     K8sSave --> AllDone[All Models Trained]
@@ -464,8 +464,8 @@ flowchart TD
     HPLSTM --> HPForecast
     
     HPForecast --> UpdateClass[Update Classification Model]
-    UpdateClass --> ClassFeat[Extract Features<br/>LOOKBACK_HOURS]
-    ClassFeat --> ClassPredict[Predict Anomalies<br/>CONTAMINATION]
+    UpdateClass --> ClassFeat[Extract Features<br/>LOOKBACK_HOURS<br/>Temporal-Aware if 3+ months]
+    ClassFeat --> ClassPredict[Predict Anomalies<br/>CONTAMINATION<br/>Uses temporal features]
     
     ClassPredict --> FetchDisk[Fetch Disk Data<br/>Last 30 days]
     FetchDisk --> LoadDisk[Load Disk Manifest]
@@ -489,7 +489,7 @@ flowchart TD
     IOEProphet --> IOForecast[Generate Forecast<br/>HORIZON_MIN]
     IOEARIMA --> IOForecast
     IOELSTM --> IOForecast
-    IOForecast --> IOAnomaly[Detect Anomalies]
+    IOForecast --> IOAnomaly[Detect Anomalies<br/>Temporal-Aware Baseline<br/>Same-time patterns]
     
     HPForecast --> Aggregate[Aggregate Results]
     DiskForecast --> Aggregate
@@ -634,8 +634,13 @@ graph TD
     end
     
     subgraph "Anomaly Detection Variables"
-        LOOKBACK[LOOKBACK_HOURS<br/>24 hours] --> Anomaly[Feature Extraction]
+        LOOKBACK[LOOKBACK_HOURS<br/>24 hours] --> Anomaly[Feature Extraction<br/>Temporal-Aware if 3+ months]
         CONTAM[CONTAMINATION<br/>0.12] --> Anomaly
+    end
+    
+    subgraph "CLI Overrides"
+        CLI_HORIZON[--forecast-horizon<br/>realtime|neartime|future] --> Models
+        CLI_PARALLEL[--parallel N] --> Models
     end
     
     Fetch --> Split
@@ -670,11 +675,13 @@ graph TD
 | **START_HOURS_AGO** | 360 | ✅ High | ✅ High | ✅ High | ✅ High | ✅ High | More data = better training, but slower |
 | **STEP** | "60s" | ✅ Medium | ✅ Medium | ✅ Medium | ✅ Medium | ✅ Medium | Smaller = more data points, better accuracy |
 | **TRAIN_FRACTION** | 0.8 | ✅ High | ✅ High | ✅ High | ✅ High | ❌ N/A | Controls train/test split ratio |
-| **HORIZON_MIN** | 15 | ✅ Critical | ❌ N/A | ❌ N/A | ✅ Critical | ❌ N/A | Forecast length in minutes |
+| **HORIZON_MIN** | 15 | ✅ Critical | ❌ N/A | ❌ N/A | ✅ Critical | ❌ N/A | Forecast length in minutes (can be overridden with `--forecast-horizon`) |
 | **LSTM_SEQ_LEN** | 60 | ✅ High | ❌ N/A | ❌ N/A | ✅ High | ❌ N/A | Input sequence length for LSTM |
 | **LSTM_EPOCHS** | 10 | ✅ Medium | ❌ N/A | ❌ N/A | ✅ Medium | ❌ N/A | Training iterations for LSTM |
-| **LOOKBACK_HOURS** | 24 | ❌ N/A | ❌ N/A | ❌ N/A | ❌ N/A | ✅ Critical | Feature extraction window |
+| **LOOKBACK_HOURS** | 24 | ❌ N/A | ❌ N/A | ❌ N/A | ❌ N/A | ✅ Critical | Feature extraction window (temporal-aware if 3+ months data) |
 | **CONTAMINATION** | 0.12 | ❌ N/A | ❌ N/A | ❌ N/A | ❌ N/A | ✅ Critical | Expected anomaly rate |
+| **--forecast-horizon** | N/A | ✅ Override | ❌ N/A | ❌ N/A | ✅ Override | ❌ N/A | CLI flag: realtime=15min, neartime=3h, future=7d |
+| **--parallel** | N/A | ✅ Override | ✅ Override | ✅ Override | ✅ Override | ❌ N/A | CLI flag: Override CPU detection, bypasses thresholds |
 
 ### Impact Legend
 - ✅ **Critical**: Directly affects model behavior/accuracy

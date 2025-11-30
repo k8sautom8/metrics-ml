@@ -21,6 +21,14 @@ This document explains how each configuration variable is used in training and p
 - Ensemble combines the first `HORIZON_MIN` values from each model
 - Used to determine how many future data points to generate
 
+### Override Options:
+- **CLI Flag**: `--forecast-horizon <realtime|neartime|future>`
+  - `realtime`: 15 minutes (short-term decisions)
+  - `neartime`: 3 hours (180 minutes, near-term planning)
+  - `future`: 7 days (10,080 minutes, long-term capacity planning)
+- **Priority**: CLI flag > Environment variable > Default (15 minutes)
+- **Display**: Horizon is printed in all outputs and included in plot titles for transparency
+
 **Example**: `HORIZON_MIN=15` means models predict the next 15 minutes of resource usage.
 
 **Code References**:
@@ -29,6 +37,7 @@ This document explains how each configuration variable is used in training and p
 - LSTM training: `y.append(scaled[i:i+horizon_min])`
 - ARIMA: `arima.forecast(steps=horizon_min)`
 - Prophet: `future = prophet_model.make_future_dataframe(periods=HORIZON_MIN, freq='min')`
+- CLI: `--forecast-horizon` flag overrides `HORIZON_MIN` in forecast mode
 
 ---
 
@@ -39,7 +48,12 @@ This document explains how each configuration variable is used in training and p
 ### Usage in Training:
 - **Anomaly Detection (Classification Model)**:
   - Extracts average CPU/memory usage over last `LOOKBACK_HOURS`
-  - Features: `host_cpu`, `host_mem`, `pod_cpu`, `pod_mem` averaged over this window
+  - **Temporal-Aware Features** (when 3+ months of data available):
+    - Compares current values to same-time historical patterns (hour, day-of-week)
+    - Features: `host_cpu_current_context`, `host_mem_current_context`, `pod_cpu_current_context`, `pod_mem_current_context`
+    - Accounts for seasonality (e.g., Monday morning spikes, weekend batch jobs)
+  - **Basic Features** (fallback):
+    - Simple averages: `host_cpu`, `host_mem`, `pod_cpu`, `pod_mem` averaged over this window
   - Used to train IsolationForest models per cluster
 
 ### Usage in Prediction:
@@ -47,18 +61,30 @@ This document explains how each configuration variable is used in training and p
   - Looks back `LOOKBACK_HOURS` to identify which nodes share pod workloads
   - Groups nodes into clusters based on pod instance patterns in this window
 - **Anomaly Detection**:
-  - Calculates average resource usage over last `LOOKBACK_HOURS` for each node
-  - Compares current patterns against historical baseline from this window
+  - **Temporal-Aware** (auto-enabled with 3+ months data):
+    - Compares current values to same-time historical patterns
+    - Same hour + same day-of-week (best match)
+    - Same hour of day (daily pattern)
+    - Same day of week (weekly pattern)
+    - Weekend vs weekday (fallback)
+  - **Basic Mode** (fallback):
+    - Calculates average resource usage over last `LOOKBACK_HOURS` for each node
+    - Compares current patterns against historical baseline from this window
 
 **Example**: `LOOKBACK_HOURS=24` means the system analyzes the last 24 hours of data to:
 - Identify cluster membership
-- Extract features for anomaly detection
+- Extract features for anomaly detection (with temporal awareness if sufficient data)
 - Establish baseline patterns
+
+**Temporal Awareness**:
+- **Auto-enabled** when 3+ months (90 days) of historical data available
+- **Benefits**: Reduces false positives from normal weekly/daily patterns
+- **Example**: Monday 9 AM high CPU compared to historical Monday 9 AM averages, not weekend averages
 
 **Code References**:
 - `identify_clusters()`: `lookback_hours=LOOKBACK_HOURS` - determines cluster membership
-- `classification_model()`: `lookback_hours=LOOKBACK_HOURS` - feature extraction window
-- `extract_instance_features()`: Uses lookback window to calculate averages
+- `classification_model()`: `lookback_hours=LOOKBACK_HOURS` - feature extraction window with temporal awareness
+- `extract_instance_features()`: Uses lookback window to calculate averages (temporal-aware when enabled)
 
 ---
 

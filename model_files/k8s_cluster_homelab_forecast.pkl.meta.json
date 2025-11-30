@@ -1,9 +1,0 @@
-{
-  "train_fraction": 0.8,
-  "train_points": 17281,
-  "test_points": 4320,
-  "train_start": "2025-11-14 17:28:00",
-  "train_end": "2025-11-26 17:28:00",
-  "test_start": "2025-11-26 17:29:00",
-  "test_end": "2025-11-29 17:28:00"
-}

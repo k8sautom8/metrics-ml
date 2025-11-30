@@ -14,10 +14,16 @@ Metrics AI detects anomalies at **multiple levels** across the entire Kubernetes
 
 ### 1. **Node-Level Anomalies** (Per-Instance)
 
-#### A. Classification Anomalies (IsolationForest)
+#### A. Classification Anomalies (IsolationForest) - Temporal-Aware
 - **Level**: Individual node/host
-- **Method**: Unsupervised ML using IsolationForest with per-cluster training
-- **Features Analyzed**:
+- **Method**: Unsupervised ML using IsolationForest with per-cluster training and temporal awareness
+- **Features Analyzed** (Temporal-Aware Mode - auto-enabled with 3+ months data):
+  - `host_cpu_current_context` - Average host CPU for same-time patterns (hour, day-of-week)
+  - `host_mem_current_context` - Average host memory for same-time patterns
+  - `pod_cpu_current_context` - Average pod CPU for same-time patterns
+  - `pod_mem_current_context` - Average pod memory for same-time patterns
+  - Plus overall averages: `host_cpu`, `host_mem`, `pod_cpu`, `pod_mem`
+- **Features Analyzed** (Basic Mode - fallback):
   - `host_cpu` - Average host CPU usage (last 24h by default)
   - `host_mem` - Average host memory usage (last 24h)
   - `pod_cpu` - Average pod/container CPU usage (last 24h)
@@ -25,12 +31,17 @@ Metrics AI detects anomalies at **multiple levels** across the entire Kubernetes
 
 - **How It Works**:
   1. Identifies Kubernetes clusters and groups nodes by cluster membership
-  2. Extracts average resource usage for each node over the lookback window (default: 24 hours)
-  3. Normalizes features using StandardScaler per cluster
-  4. Trains separate IsolationForest models for each Kubernetes cluster with contamination rate (default: 12%)
-  5. Compares nodes only against their own cluster baseline (not global baseline)
-  6. Flags nodes where host and pod usage patterns are misaligned within their cluster context
-  7. Standalone nodes (no Kubernetes workloads) are excluded from anomaly detection
+  2. **Temporal-Aware Feature Extraction** (when 3+ months data available):
+     - Compares current values to same-time historical patterns (hour, day-of-week)
+     - Priority: Same hour + same day-of-week > Same hour > Same day-of-week > Weekend/weekday
+     - Reduces false positives from normal weekly/daily patterns
+  3. **Basic Feature Extraction** (fallback):
+     - Extracts average resource usage for each node over the lookback window (default: 24 hours)
+  4. Normalizes features using StandardScaler per cluster
+  5. Trains separate IsolationForest models for each Kubernetes cluster with contamination rate (default: 12%)
+  6. Compares nodes only against their own cluster baseline (not global baseline)
+  7. Flags nodes where host and pod usage patterns are misaligned within their cluster context
+  8. Standalone nodes (no Kubernetes workloads) are excluded from anomaly detection
 
 - **What It Detects**:
   - Nodes with high host CPU/memory but low pod usage → **Non-Kubernetes workloads** (backups, cron jobs, daemons)
@@ -123,20 +134,25 @@ Metrics AI detects anomalies at **multiple levels** across the entire Kubernetes
 
 #### C. I/O + Network Anomaly Detection
 - **Level**: Per-node, per-signal
-- **Method**: Statistical deviation from ensemble forecast with dual-threshold detection
-- **Status**: **Fully Implemented**
+- **Method**: Statistical deviation from ensemble forecast with **temporal-aware** dual-threshold detection
+- **Status**: **Fully Implemented** with temporal awareness
 
 - **How It Works**:
-  1. Compares recent actual values (last 24 hours) against ensemble forecast predictions
-  2. Calculates both absolute and percentage deviations from forecast baseline
-  3. Applies dual-threshold logic to reduce false positives:
+  1. **Temporal-Aware Baseline** (when 3+ months of data available):
+     - Compares current values to same-time historical patterns (hour, day-of-week)
+     - Priority: Same hour + same day-of-week > Same hour > Same day-of-week > Weekend/weekday
+     - Accounts for seasonality (e.g., weekend batch jobs, Monday morning spikes)
+     - Falls back to forecast baseline if insufficient historical data
+  2. Compares recent actual values (last 24 hours) against temporal-aware baseline
+  3. Calculates both absolute and percentage deviations from baseline
+  4. Applies dual-threshold logic to reduce false positives:
      - **Absolute thresholds**: Minimum meaningful differences (1% for I/O wait, 5 MB/s for network)
      - **Percentage thresholds**: Relative deviations (50% for current, 30% for mean)
-  4. Considers model confidence (MAE) - high confidence models trigger fewer false positives
-  5. Only flags anomalies when:
+  5. Considers model confidence (MAE) - high confidence models trigger fewer false positives
+  6. Only flags anomalies when:
      - Significant absolute difference AND significant percentage deviation
      - AND (value is actually concerning OR model confidence is low)
-  6. For very small baselines (< 1% I/O, < 5 MB/s network), uses absolute thresholds only (percentage is misleading)
+  7. For very small baselines (< 1% I/O, < 5 MB/s network), uses absolute thresholds only (percentage is misleading)
 
 - **Anomaly Conditions**:
   - Current deviation > 50% from forecast baseline
@@ -165,12 +181,15 @@ Metrics AI detects anomalies at **multiple levels** across the entire Kubernetes
 
 #### Disk Capacity Crisis Detection
 - **Level**: Per-node, per-mountpoint
-- **Method**: Hybrid linear + Prophet forecast with 90% threshold
+- **Method**: Hybrid linear + Prophet forecast with 90% threshold (temporal-aware)
 - **How It Works**:
   1. Trains linear trend model and Prophet model for each node/mountpoint
-  2. Forecasts 7 days ahead
-  3. Predicts when disk usage will reach 90%
-  4. Flags based on ETA
+  2. **Prophet Configuration**: `daily_seasonality=True, weekly_seasonality=True`
+     - Learns daily patterns (e.g., daily ETL jobs, hourly backups)
+     - Learns weekly patterns (e.g., weekend batch jobs, weekly reports)
+  3. Forecasts 7 days ahead (accounts for seasonal patterns)
+  4. Predicts when disk usage will reach 90% (considering daily/weekly patterns)
+  5. Flags based on ETA (reduces false positives from normal batch job patterns)
 
 - **Output**:
   - Alert type: `disk` (with sub-categories)
@@ -200,10 +219,16 @@ Metrics AI detects anomalies at **multiple levels** across the entire Kubernetes
 
 ## How Anomalies Are Found Across the Entire System
 
-### 1. **Per-Cluster Scanning**
+### 1. **Per-Cluster Scanning** (Temporal-Aware)
 - **Classification Model**: Scans nodes within each Kubernetes cluster separately
   - Identifies cluster membership via Prometheus labels or pod instance patterns
   - Fetches host CPU/memory and pod CPU/memory for every node
+  - **Temporal-Aware Feature Extraction** (auto-enabled with 3+ months data):
+    - Compares current values to same-time historical patterns (hour, day-of-week)
+    - Features: `*_current_context` (same-time patterns) + overall averages
+    - Reduces false positives from normal weekly/daily patterns
+  - **Basic Feature Extraction** (fallback):
+    - Simple averages over `LOOKBACK_HOURS` window
   - Groups nodes by cluster and trains separate IsolationForest models per cluster
   - Builds feature matrices per cluster: `[cluster1_nodes], [cluster2_nodes], ...`
   - Compares nodes only against their own cluster baseline (not global)
@@ -245,9 +270,16 @@ The system provides a **unified view** of all anomalies across:
 ## Configuration
 
 Key environment variables for anomaly detection:
-- `LOOKBACK_HOURS` (default: 24) - Window for classification model
+- `LOOKBACK_HOURS` (default: 24) - Window for classification model (temporal-aware if 3+ months data)
 - `CONTAMINATION` (default: 0.12) - IsolationForest contamination rate (12% of nodes expected to be anomalous)
-- `HORIZON_MIN` (default: 15) - Forecast horizon in minutes
+- `HORIZON_MIN` (default: 15) - Forecast horizon in minutes (can be overridden with `--forecast-horizon` flag)
+
+**Temporal Awareness**:
+- **Auto-enabled** when 3+ months (90 days) of historical data available
+- **Classification Model**: Uses same-time historical patterns (hour, day-of-week) for feature extraction
+- **I/O Network Anomaly**: Compares current values to same-time historical patterns instead of simple forecast baseline
+- **Disk Models**: Prophet uses daily + weekly seasonality to learn batch job patterns
+- **Benefits**: Reduces false positives from normal weekly/daily patterns (e.g., weekend backups, Monday morning spikes)
 
 ---
 

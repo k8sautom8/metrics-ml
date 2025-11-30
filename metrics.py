@@ -26,12 +26,66 @@ from statsmodels.tsa.arima.model import ARIMA
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.metrics import classification_report, mean_absolute_error, mean_squared_error
-import matplotlib.pyplot as plt; plt.ion()
-import matplotlib.dates as mdates
+
+# --- Matplotlib (optional) ---
+try:
+    import matplotlib
+    # Use non-interactive backend for headless/server environments (prevents display errors)
+    import os
+    if 'DISPLAY' not in os.environ and os.name != 'nt':
+        # No display available (headless/server) - use Agg backend
+        matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    # Only use interactive mode if display is available
+    try:
+        plt.ion()
+    except:
+        # Interactive mode failed (headless), but plotting will still work with Agg backend
+        pass
+    import matplotlib.dates as mdates
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    print("Matplotlib not found. Plotting disabled. Install with: pip install matplotlib")
+    MATPLOTLIB_AVAILABLE = False
+    # Create dummy plt object to avoid NameError
+    class DummyPlot:
+        def __getattr__(self, name):
+            def dummy(*args, **kwargs):
+                pass
+            return dummy
+    plt = DummyPlot()
+    mdates = None
+except Exception as e:
+    print(f"Warning: Matplotlib import failed: {e}. Plotting disabled.")
+    MATPLOTLIB_AVAILABLE = False
+    # Create dummy plt object to avoid NameError
+    class DummyPlot:
+        def __getattr__(self, name):
+            def dummy(*args, **kwargs):
+                pass
+            return dummy
+    plt = DummyPlot()
+    mdates = None
+
 from datetime import datetime, timedelta
 import joblib
 from joblib import Parallel, delayed
 import warnings
+
+# Suppress expected warnings from third-party libraries
+# These warnings are expected and don't indicate actual problems
+# Set default action to ignore all warnings, then we can be selective if needed
+warnings.simplefilter("ignore")
+# But allow important warnings through (we can add specific ones later if needed)
+# The above will suppress: FutureWarning, UserWarning, ConvergenceWarning, ValueWarning, etc.
+
+# Suppress cmdstanpy INFO messages (very verbose in parallel mode)
+try:
+    import logging
+    logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+    logging.getLogger("prophet").setLevel(logging.WARNING)
+except:
+    pass
 
 # --- YAML support (optional) ---
 try:
@@ -51,6 +105,7 @@ except ImportError:
     print("TensorFlow not found. LSTM disabled. Install with: pip install tensorflow-cpu")
     LSTM_AVAILABLE = False
 
+# Additional general warning suppression (catch-all for any remaining warnings)
 warnings.filterwarnings("ignore")
 
 # ----------------------------------------------------------------------
@@ -333,6 +388,11 @@ def log_verbose(msg, level=1):
     if should_verbose(level):
         print(msg)
 
+def log_debug(msg, level=1):
+    """Log DEBUG messages - only shows when -v flag is used, not in training mode"""
+    if VERBOSE_LEVEL >= level:
+        print(msg)
+
 def load_disk_manifest(path):
     if not os.path.exists(path):
         return {}
@@ -475,10 +535,13 @@ def print_config_summary():
         return " (default)" if default_used else ""
     train_pct = round(TRAIN_FRACTION * 100)
     test_pct = max(0, 100 - train_pct)
+    horizon_hours = HORIZON_MIN // 60
+    horizon_mins = HORIZON_MIN % 60
+    horizon_display = f"{horizon_hours}h {horizon_mins}m" if horizon_hours > 0 else f"{horizon_mins}m"
     print(f"  • VM_URL        : {VM_BASE_URL}{flag(VM_URL_DEFAULT)}")
     print(f"  • STEP          : {STEP}{flag(STEP_DEFAULT)}")
     print(f"  • START_HOURS   : {START_HOURS_AGO}{flag(START_DEFAULT)}")
-    print(f"  • HORIZON_MIN   : {HORIZON_MIN}{flag(HORIZON_DEFAULT)}")
+    print(f"  • HORIZON_MIN   : {HORIZON_MIN} minutes ({horizon_display}){flag(HORIZON_DEFAULT)}")
     print(f"  • LOOKBACK_HRS  : {LOOKBACK_HOURS}{flag(LOOKBACK_DEFAULT)}")
     print(f"  • CONTAMINATION : {CONTAMINATION}{flag(CONTAM_DEFAULT)}")
     print(f"  • LSTM_SEQ_LEN  : {LSTM_SEQ_LEN}{flag(LSTM_SEQ_DEFAULT)}")
@@ -881,8 +944,9 @@ def parse_cli_args():
     )
     parser.add_argument(
         "--plot",
-        action="store_true",
-        help="Generate and save plot files (PNG images). If not specified, plots are skipped to save time."
+        type=str,
+        default=None,
+        help="Generate and save plot files (PNG images). Accepts 'forecast', 'backtest', or 'both' (or comma-separated 'forecast,backtest'). If not specified, plots are skipped to save time."
     )
     parser.add_argument(
         "--parallel",
@@ -891,7 +955,44 @@ def parse_cli_args():
         metavar="N",
         help="Override automatic CPU detection and use N parallel workers (overrides 80%% rule and MAX_WORKER_THREADS env var). Example: --parallel 4"
     )
+    parser.add_argument(
+        "--forecast-horizon",
+        type=str,
+        choices=["realtime", "neartime", "future"],
+        default=None,
+        help="Override HORIZON_MIN for forecast length: realtime=15min, neartime=3h, future=7d (default: uses HORIZON_MIN env var or 15min)"
+    )
     return parser.parse_args()
+
+def parse_plot_argument(plot_arg):
+    """
+    Parse the --plot argument value.
+    Accepts: 'forecast', 'backtest', 'both', or comma-separated 'forecast,backtest'
+    Returns: tuple (enable_forecast_plots, enable_backtest_plots)
+    """
+    if plot_arg is None:
+        return False, False
+    
+    # Normalize the input
+    plot_arg = str(plot_arg).lower().strip()
+    
+    # Handle comma-separated values
+    if ',' in plot_arg:
+        parts = [p.strip() for p in plot_arg.split(',')]
+        enable_forecast = 'forecast' in parts
+        enable_backtest = 'backtest' in parts
+        return enable_forecast, enable_backtest
+    
+    # Handle single values
+    if plot_arg == 'forecast':
+        return True, False
+    elif plot_arg == 'backtest':
+        return False, True
+    elif plot_arg == 'both':
+        return True, True
+    else:
+        # Default to both if unrecognized value
+        return True, True
 
 def persist_model_metadata(model_path, metadata):
     if not metadata or not model_path:
@@ -1070,6 +1171,10 @@ def generate_forecast_plots_from_cache(df_cpu, df_mem, cached_result, horizon_mi
     
     # Plot forecast: show last 24 hours of historical data and next 3 hours of forecast
     plot_forecast_horizon = 180  # 3 hours in minutes
+    if not MATPLOTLIB_AVAILABLE:
+        log_verbose("Matplotlib not available, skipping plot generation")
+        return (prophet_model, out, metrics)
+    
     plt.figure(figsize=(16, 6))
     # Plot historical data - last 24 hours
     if not ts_data.empty:
@@ -1110,13 +1215,21 @@ def generate_forecast_plots_from_cache(df_cpu, df_mem, cached_result, horizon_mi
         model_type = model_path.split('_')[0].upper() if '_' in model_path else os.path.basename(model_path).split('_')[0].upper()
     else:
         model_type = "MODEL"
-    plt.title(f"{model_type} Layer – 24h Historical + 3h Forecast")
+    horizon_hours = horizon_min // 60
+    horizon_mins = horizon_min % 60
+    horizon_display = f"{horizon_hours}h {horizon_mins}m" if horizon_hours > 0 else f"{horizon_mins}m"
+    plt.title(f"{model_type} Layer – 24h Historical + {horizon_display} Forecast (horizon: {horizon_min} min)")
     if enable_plots:
         plot_filename = f"{model_type.lower()}_layer_forecast.png"
         plot_path = os.path.join(FORECAST_PLOTS_DIR, plot_filename)
         plt.savefig(plot_path, dpi=180, bbox_inches='tight')
-        log_verbose(f"Generated forecast plot from cache: {plot_path}")
-    plt.close()
+        if os.path.exists(plot_path):
+            file_size = os.path.getsize(plot_path)
+            print(f"✓ Saved forecast plot: {plot_path} ({file_size} bytes)")
+        else:
+            print(f"✗ Warning: Plot file not found after save: {plot_path}")
+    if MATPLOTLIB_AVAILABLE:
+        plt.close()
 
 def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_min, model_path, dump_csv_dir=None, context=None, enable_plots=True):
     """Generate fresh forecasts from cached model using latest data."""
@@ -1408,6 +1521,10 @@ def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_m
     
     # For plotting: show last 24 hours of historical data and next 3 hours of forecast
     plot_forecast_horizon = 180  # 3 hours in minutes
+    if not MATPLOTLIB_AVAILABLE:
+        log_verbose("Matplotlib not available, skipping plot generation")
+        return (prophet_model, out, metrics)
+    
     plt.figure(figsize=(16, 6))
     
     # Plot historical data - last 24 hours
@@ -1462,7 +1579,10 @@ def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_m
     else:
         # Fallback: try to extract from path
         model_type = os.path.basename(os.path.dirname(model_path)).upper() if os.path.dirname(model_path) else "MODEL"
-    plt.title(f"{model_type} Layer – 24h Historical + 3h Forecast")
+    horizon_hours = horizon_min // 60
+    horizon_mins = horizon_min % 60
+    horizon_display = f"{horizon_hours}h {horizon_mins}m" if horizon_hours > 0 else f"{horizon_mins}m"
+    plt.title(f"{model_type} Layer – 24h Historical + {horizon_display} Forecast (horizon: {horizon_min} min)")
     # Ensure directory exists and use absolute path
     forecast_dir = os.path.abspath(FORECAST_PLOTS_DIR)
     os.makedirs(forecast_dir, exist_ok=True)
@@ -1489,30 +1609,77 @@ def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_m
 
 def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrain=False,
                            generate_fresh_forecast=False, show_backtest=False,
-                           dump_csv_dir=None, context=None, enable_plots=True):
+                           dump_csv_dir=None, context=None, enable_plots=True,
+                           enable_forecast_plots=None, enable_backtest_plots=None):
+    """
+    Train or load an ensemble forecasting model with intelligent caching and minimal updates.
+    
+    This function provides a high-level interface for ensemble model management, handling:
+    - Model caching and lazy loading
+    - Minimal updates in forecast mode (last 7 days only)
+    - Full retraining when models are missing or force_retrain=True
+    - Backtest plot generation for cached models
+    - Plot generation control via enable_forecast_plots and enable_backtest_plots flags
+    
+    Args:
+        df_cpu: DataFrame with CPU metrics (columns: timestamp, value, instance/entity)
+        df_mem: Optional DataFrame with Memory metrics (same structure as df_cpu)
+        horizon_min: Forecast horizon in minutes
+        model_path: Path to save/load model artifacts
+        force_retrain: Boolean to force full model retraining (default: False)
+        generate_fresh_forecast: Boolean to generate fresh forecast from cached model (forecast mode)
+        show_backtest: Boolean to display backtest metrics
+        dump_csv_dir: Optional directory to export training datasets
+        context: Optional dict with metadata (node, signal, cluster_id) for plot titles
+        enable_plots: Master flag to enable/disable plot generation
+        enable_forecast_plots: Optional boolean to override forecast plot generation
+        enable_backtest_plots: Optional boolean to override backtest plot generation
+    
+    Returns:
+        tuple: (prophet_model, forecast_dataframe, metrics_dict, was_saved)
+            - prophet_model: Trained Prophet model object
+            - forecast_dataframe: DataFrame with forecast predictions
+            - metrics_dict: Dictionary containing MAE, MAPE, confidence levels, split_info
+            - was_saved: Boolean indicating if model was saved to disk
+    
+    Notes:
+        - In forecast mode, performs minimal updates (last 7 days) to incorporate recent trends
+        - Supports backtest plot generation for cached models when enable_backtest_plots=True
+        - Thread-safe for parallel execution (uses manifest snapshots)
+    """
     was_saved = False
     if not force_retrain:
         cached = load_cached_ensemble(model_path)
         if cached is not None:
             log_verbose(f"Loaded pre-trained ensemble artifacts: {model_path}")
             # Generate fresh forecasts from latest data if requested (forecast mode)
+            # Check if we need backtest plots - if so, we'll generate them after forecast
+            should_generate_backtest = show_backtest or (enable_backtest_plots if enable_backtest_plots is not None else False)
+            fresh_forecast_result = None
+            fresh_forecast_was_saved = False
             if generate_fresh_forecast:
                 try:
-                    result = generate_forecast_from_cached_model(df_cpu, df_mem, cached, horizon_min, model_path, dump_csv_dir=dump_csv_dir, context=context, enable_plots=enable_plots)
+                    # Use enable_forecast_plots if provided, otherwise fall back to enable_plots
+                    forecast_plots_enabled = enable_forecast_plots if enable_forecast_plots is not None else enable_plots
+                    result = generate_forecast_from_cached_model(df_cpu, df_mem, cached, horizon_min, model_path, dump_csv_dir=dump_csv_dir, context=context, enable_plots=forecast_plots_enabled)
                     if result is not None:
                         # Save updated model after minimal update
                         try:
                             joblib.dump(result, model_path)
                             log_verbose(f"Saved updated model after minimal update: {model_path}")
-                            was_saved = True
+                            fresh_forecast_was_saved = True
                         except Exception as e:
                             log_verbose(f"Warning: Failed to save updated model: {e}")
+                        # Store the result for later use
+                        fresh_forecast_result = result
                         # Plot was already saved in generate_forecast_from_cached_model
-                        # Return result with was_saved flag
-                        if isinstance(result, tuple) and len(result) == 3:
-                            return (*result, was_saved)
-                        else:
-                            return (result, None, {}, was_saved)
+                        # If we need backtest plots, generate them now (don't return early)
+                        if not should_generate_backtest:
+                            # Return early only if we don't need backtest plots
+                            if isinstance(result, tuple) and len(result) == 3:
+                                return (*result, fresh_forecast_was_saved)
+                            else:
+                                return (result, None, {}, fresh_forecast_was_saved)
                     else:
                         print(f"⚠ Warning: generate_forecast_from_cached_model returned None for {model_path}")
                         print(f"   Falling back to cached forecast plot generation...")
@@ -1531,27 +1698,51 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
                         generate_forecast_plots_from_cache(df_cpu, df_mem, cached, horizon_min, model_path, enable_plots=enable_plots)
                     except Exception as e2:
                         print(f"✗ Fallback also failed: {e2}")
-            # Generate backtest plots when show_backtest is True (even with cached models)
-            if show_backtest:
-                # Retrain to generate backtest plots (but don't save forecast plots, only backtest plots)
-                # Don't save model files in show_backtest mode - only generate plots
-                log_verbose(f"Regenerating backtest plots for {model_path} (--show-backtest flag)")
+            # Generate backtest plots when show_backtest is True OR enable_backtest_plots is True (even with cached models)
+            # In training mode, also generate forecast plots
+            # Note: should_generate_backtest is already set above if generate_fresh_forecast was True
+            if should_generate_backtest:
+                # Determine if we should generate forecast plots too (in training mode)
+                # Set defaults if not provided
+                if enable_forecast_plots is None:
+                    enable_forecast_plots = enable_plots and force_retrain  # In training mode, generate forecast plots too
+                if enable_backtest_plots is None:
+                    enable_backtest_plots = enable_plots and show_backtest
+                
+                # Retrain to generate plots
+                # In training mode: generate both forecast and backtest plots (when enable_forecast_plots is True)
+                # In show_backtest mode (not training): only generate backtest plots
+                should_save_forecast = enable_forecast_plots if enable_forecast_plots is not None else False
+                should_save_backtest = enable_backtest_plots if enable_backtest_plots is not None else enable_plots
+                plot_type = "forecast + backtest" if should_save_forecast else "backtest"
+                log_verbose(f"Regenerating {plot_type} plots for {model_path} (show_backtest={show_backtest}, force_retrain={force_retrain}, enable_forecast_plots={should_save_forecast})")
                 result = build_ensemble_forecast_model(
                     df_cpu=df_cpu,
                     df_mem=df_mem,
                     horizon_min=horizon_min,
                     model_path=model_path,
                     context=context,
-                    save_forecast_plot=False,  # Only generate backtest plots, not forecast plots
+                    save_forecast_plot=should_save_forecast,  # Generate forecast plots if flag is set
+                    save_backtest_plot=should_save_backtest,  # Generate backtest plots
+                    print_backtest_metrics=True,
                     save_model=False,  # Don't save model files - only generate plots
-                    dump_csv_dir=dump_csv_dir
+                    dump_csv_dir=dump_csv_dir,
+                    enable_plots=enable_plots
                 )
                 if result is not None:
-                    # Return cached model (not the newly trained one) to avoid updating model files
-                    if isinstance(cached, tuple) and len(cached) == 3:
-                        return (*cached, False)
+                    # Return fresh forecast result if available, otherwise return cached model
+                    # (not the newly trained one from build_ensemble_forecast_model to avoid updating model files)
+                    if fresh_forecast_result is not None:
+                        if isinstance(fresh_forecast_result, tuple) and len(fresh_forecast_result) == 3:
+                            return (*fresh_forecast_result, fresh_forecast_was_saved)
+                        else:
+                            return (fresh_forecast_result, None, {}, fresh_forecast_was_saved)
                     else:
-                        return (cached, None, {}, False)
+                        # Return cached model (not the newly trained one) to avoid updating model files
+                        if isinstance(cached, tuple) and len(cached) == 3:
+                            return (*cached, False)
+                        else:
+                            return (cached, None, {}, False)
             # In normal mode, don't generate plots (only in forecast mode or when show_backtest)
             if isinstance(cached, tuple) and len(cached) == 3:
                 return (*cached, False)
@@ -1559,12 +1750,22 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
                 return (cached, None, {}, False)
 
     log_verbose(f"Training ensemble model → {model_path}")
+    # Determine plot flags based on mode:
+    # - Training mode: generate both forecast and backtest plots
+    # - show_backtest only (not training): only backtest plots
+    # - Otherwise: generate forecast plots if enable_plots is True
+    save_forecast = enable_plots and not (show_backtest and not force_retrain)
+    save_backtest = enable_plots and show_backtest
+    
     result = build_ensemble_forecast_model(
         df_cpu=df_cpu,
         df_mem=df_mem,
         horizon_min=horizon_min,
         model_path=model_path,
         context=context,
+        save_forecast_plot=save_forecast,
+        save_backtest_plot=save_backtest,
+        print_backtest_metrics=show_backtest,
         dump_csv_dir=dump_csv_dir,
         enable_plots=enable_plots
     )
@@ -2110,12 +2311,54 @@ def fetch_and_preprocess_data(query, start_hours_ago=START_HOURS_AGO, step=STEP)
 # ----------------------------------------------------------------------
 def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, threshold_pct,
                          manifest_snapshot, retrain_targets, FORCE_TRAINING_RUN, forecast_mode,
-                         dump_csv_dir, enable_plots, show_backtest):
+                         dump_csv_dir, enable_plots, show_backtest, enable_forecast_plots=None, enable_backtest_plots=None):
     """
-    Worker function to process a single disk (node/mountpoint) for disk full prediction.
-    This function is designed to be called in parallel.
-    Returns: dict with result, metrics, and model info, or None if skipped
+    Process a single disk (node/mountpoint) for disk capacity forecasting.
+    
+    This worker function is designed for parallel execution and handles:
+    - Disk usage time series data processing
+    - Linear trend analysis for capacity planning
+    - Prophet-based forecasting for disk full prediction
+    - Model caching and selective retraining
+    - Forecast and backtest plot generation
+    
+    Args:
+        entity: Canonical node identifier
+        mountpoint: Filesystem mountpoint (e.g., '/', '/home')
+        group: DataFrame with disk usage time series data
+        mount_col: Column name for mountpoint in group DataFrame
+        horizon_days: Forecast horizon in days (default: 7)
+        threshold_pct: Alert threshold percentage (default: 90%)
+        manifest_snapshot: Dictionary of cached models (for parallel workers)
+        retrain_targets: Set of node/mountpoint keys to retrain
+        FORCE_TRAINING_RUN: Boolean flag to force full retraining
+        forecast_mode: Boolean indicating forecast mode (minimal updates)
+        dump_csv_dir: Optional directory to export training datasets
+        enable_plots: Master flag to enable/disable plot generation
+        show_backtest: Boolean to display backtest metrics
+        enable_forecast_plots: Optional boolean to override forecast plot generation
+        enable_backtest_plots: Optional boolean to override backtest plot generation
+    
+    Returns:
+        dict: Contains 'result' (alert info), 'metrics' (MAE, MAPE), 'model' (Prophet model),
+              'key' (manifest key), 'needs_retrain' (boolean), or None if skipped
+    
+    Notes:
+        - Uses manifest-based storage for efficient model caching
+        - Supports minimal updates in forecast mode (last 7 days only)
+        - Generates both forecast and backtest plots when enabled
+        - Thread-safe for parallel execution
     """
+    # Suppress warnings in parallel workers (must be done before any imports that generate warnings)
+    import warnings
+    import logging
+    # Suppress ALL warnings by default in worker processes
+    warnings.simplefilter("ignore")
+    try:
+        logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+        logging.getLogger("prophet").setLevel(logging.WARNING)
+    except:
+        pass
     try:
         raw_label = None
         if 'raw_instance' in group.columns and not group['raw_instance'].dropna().empty:
@@ -2172,16 +2415,20 @@ def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, thr
             cached_record['prophet_eta'] = max(0.0, cached_record.get('prophet_eta', 9999.0))
             
             # Minimal update in forecast mode
+            prophet_forecast_df = None
             if forecast_mode:
                 try:
                     pdf = train_ts.reset_index()
                     pdf.columns = ['ds', 'y']
                     pdf['y'] = pdf['y'].clip(upper=0.99)
                     recent_pdf = pdf.tail(min(len(pdf), 7*24*6))
-                    m = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=False)
+                    # Enable daily seasonality to catch daily batch job patterns (e.g., weekend backups, daily ETL jobs)
+                    # Weekly seasonality already enabled for weekly patterns
+                    m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
                     m.fit(recent_pdf)
                     future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
                     forecast = m.predict(future)
+                    prophet_forecast_df = forecast
                     now_ts = pd.Timestamp.now()
                     future_forecast = forecast[forecast['ds'] > now_ts]
                     over = future_forecast[future_forecast['yhat'] >= threshold_pct/100]
@@ -2202,6 +2449,116 @@ def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, thr
                     cached_record['alert'] = "CRITICAL" if updated_hybrid_days <= 0 else "CRITICAL" if updated_hybrid_days < 3 else "WARNING" if updated_hybrid_days < 7 else "SOON" if updated_hybrid_days < 30 else "OK"
                 except:
                     pass
+            
+            # Generate plots for cached models when plot flags are enabled (especially in training mode)
+            should_plot_cached = enable_forecast_plots or enable_backtest_plots
+            if should_plot_cached and MATPLOTLIB_AVAILABLE:
+                try:
+                    # Compute linear trend for plotting
+                    linear_pred = None
+                    if len(test_ts) > 1 and len(train_ts) > 0:
+                        daily_increase = train_ts.diff().resample('1D').mean().mean()
+                        base_value = train_ts.iloc[-1]
+                        time_diffs = (test_ts.index - train_ts.index[-1]).total_seconds() / 86400
+                        linear_pred = base_value + time_diffs * daily_increase
+                    
+                    # If prophet_forecast_df wasn't created (not in forecast mode), create it for plotting
+                    if prophet_forecast_df is None:
+                        try:
+                            pdf = train_ts.reset_index()
+                            pdf.columns = ['ds', 'y']
+                            pdf['y'] = pdf['y'].clip(upper=0.99)
+                            # Use all data for plotting in training mode
+                            m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
+                            m.fit(pdf)
+                            future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
+                            prophet_forecast_df = m.predict(future)
+                        except:
+                            pass
+                    
+                    plt.figure(figsize=(14, 7))
+                    # Plot historical data
+                    if len(train_ts) > 0:
+                        plt.plot(train_ts.index, train_ts.values * 100, label='Train Data', color='#1f77b4', alpha=0.7)
+                    if len(test_ts) > 0:
+                        plt.plot(test_ts.index, test_ts.values * 100, label='Test Data', color='#2ca02c', alpha=0.7)
+                    # Plot forecast if Prophet model was created successfully
+                    if prophet_forecast_df is not None:
+                        forecast_future = prophet_forecast_df[prophet_forecast_df['ds'] > ts.index[-1]]
+                        if not forecast_future.empty:
+                            plt.plot(forecast_future['ds'], forecast_future['yhat'] * 100, label='Prophet Forecast', color='#ff7f0e', linewidth=2)
+                            plt.fill_between(forecast_future['ds'], 
+                                            forecast_future['yhat_lower'] * 100, 
+                                            forecast_future['yhat_upper'] * 100, 
+                                            alpha=0.2, color='#ff7f0e')
+                    # Plot threshold line
+                    plt.axhline(threshold_pct, color='red', linestyle='--', linewidth=2, label=f'{threshold_pct}% Threshold')
+                    # Plot train/test split if available
+                    if len(test_ts) > 0 and len(train_ts) > 0:
+                        split_time = test_ts.index[0]
+                        plt.axvline(split_time, color='gray', linestyle=':', alpha=0.7, label='Train/Test Split')
+                    # Plot linear trend if available
+                    if linear_pred is not None and len(test_ts) > 0:
+                        plt.plot(test_ts.index, linear_pred.values * 100, label='Linear Trend', color='green', linestyle='--', alpha=0.7)
+                    plt.xlabel('Date')
+                    plt.ylabel('Disk Usage (%)')
+                    safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
+                    safe_mount = mountpoint.replace('/', '_')
+                    current_pct = ts.iloc[-1] * 100
+                    hybrid_days = cached_record.get('days_to_90pct', 9999.0)
+                    severity = cached_record.get('alert', 'OK')
+                    plt.title(f"{node} | {mountpoint}\nCurrent: {current_pct:.2f}% | ETA to {threshold_pct}%: {hybrid_days:.1f} days → {severity}\nForecast horizon: {horizon_days} days")
+                    plt.legend()
+                    plt.grid(alpha=0.3)
+                    plt.tight_layout()
+                    # Save forecast plot if forecast plots are enabled
+                    if enable_forecast_plots:
+                        plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_forecast.png")
+                        plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                        log_verbose(f"  → Disk forecast plot saved (cached): {plot_file}")
+                    
+                    # Save backtest plot if backtest plots are enabled (separate plot focusing on train/test)
+                    if enable_backtest_plots and len(test_ts) > 0:
+                        plt.figure(figsize=(14, 7))
+                        # Plot train data
+                        if len(train_ts) > 0:
+                            plt.plot(train_ts.index, train_ts.values * 100, label='Train Data', color='#1f77b4', alpha=0.7, linewidth=1.5)
+                        # Plot test data (actual)
+                        plt.plot(test_ts.index, test_ts.values * 100, label='Test Data (Actual)', color='#2ca02c', alpha=0.7, linewidth=1.5)
+                        # Plot backtest predictions if available
+                        if linear_pred is not None and len(test_ts) > 0:
+                            plt.plot(test_ts.index, linear_pred.values * 100, label='Linear Backtest', color='green', linestyle='--', linewidth=1.5)
+                        # Plot Prophet backtest if we can compute it
+                        if prophet_forecast_df is not None:
+                            # Get historical predictions for test period
+                            test_forecast = prophet_forecast_df[prophet_forecast_df['ds'].isin(test_ts.index)]
+                            if not test_forecast.empty:
+                                plt.plot(test_forecast['ds'], test_forecast['yhat'] * 100, label='Prophet Backtest', color='orange', linestyle='--', linewidth=1.5)
+                        # Plot threshold line
+                        plt.axhline(threshold_pct, color='red', linestyle='--', linewidth=2, label=f'{threshold_pct}% Threshold')
+                        # Mark train/test split
+                        if len(test_ts) > 0 and len(train_ts) > 0:
+                            split_time = test_ts.index[0]
+                            plt.axvline(split_time, color='gray', linestyle=':', alpha=0.7, linewidth=2, label='Train/Test Split')
+                        plt.xlabel('Date')
+                        plt.ylabel('Disk Usage (%)')
+                        plt.title(f"{node} | {mountpoint} — Backtest Performance\nCurrent: {current_pct:.2f}% | ETA to {threshold_pct}%: {hybrid_days:.1f} days → {severity}")
+                        plt.legend()
+                        plt.grid(alpha=0.3)
+                        plt.tight_layout()
+                        backtest_plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_backtest.png")
+                        plt.savefig(backtest_plot_file, dpi=180, bbox_inches='tight')
+                        file_size = os.path.getsize(backtest_plot_file) if os.path.exists(backtest_plot_file) else 0
+                        print(f"✓ Saved backtest plot: {backtest_plot_file} ({file_size} bytes)")
+                        plt.close()
+                    else:
+                        plt.close()
+                except Exception as e:
+                    log_verbose(f"  → Failed to save disk plot for cached model: {e}")
+                    try:
+                        plt.close()
+                    except:
+                        pass
             
             return {
                 'result': cached_record,
@@ -2314,6 +2671,98 @@ def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, thr
             'ensemble_mae': ensemble_mae
         } if needs_retrain else None
         
+        # Generate plots for retrained disks when plot flags are enabled
+        should_generate_plot = (needs_retrain or show_backtest or 
+                               enable_forecast_plots or enable_backtest_plots)
+        if should_generate_plot and MATPLOTLIB_AVAILABLE:
+            try:
+                plt.figure(figsize=(14, 7))
+                # Plot historical data
+                if len(train_ts) > 0:
+                    plt.plot(train_ts.index, train_ts.values * 100, label='Train Data', color='#1f77b4', alpha=0.7)
+                if len(test_ts) > 0:
+                    plt.plot(test_ts.index, test_ts.values * 100, label='Test Data', color='#2ca02c', alpha=0.7)
+                # Plot forecast if Prophet model was created successfully
+                if prophet_forecast_df is not None:
+                    forecast_future = prophet_forecast_df[prophet_forecast_df['ds'] > ts.index[-1]]
+                    if not forecast_future.empty:
+                        plt.plot(forecast_future['ds'], forecast_future['yhat'] * 100, label='Prophet Forecast', color='#ff7f0e', linewidth=2)
+                        plt.fill_between(forecast_future['ds'], 
+                                        forecast_future['yhat_lower'] * 100, 
+                                        forecast_future['yhat_upper'] * 100, 
+                                        alpha=0.2, color='#ff7f0e')
+                # Plot threshold line
+                plt.axhline(threshold_pct, color='red', linestyle='--', linewidth=2, label=f'{threshold_pct}% Threshold')
+                # Plot train/test split if available
+                if len(test_ts) > 0 and len(train_ts) > 0:
+                    split_time = test_ts.index[0]
+                    plt.axvline(split_time, color='gray', linestyle=':', alpha=0.7, label='Train/Test Split')
+                # Plot linear trend if available
+                if linear_pred is not None and len(test_ts) > 0:
+                    plt.plot(test_ts.index, linear_pred.values * 100, label='Linear Trend', color='green', linestyle='--', alpha=0.7)
+                plt.xlabel('Date')
+                plt.ylabel('Disk Usage (%)')
+                safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
+                safe_mount = mountpoint.replace('/', '_')
+                plt.title(f"{node} | {mountpoint}\nCurrent: {current_pct:.2f}% | ETA to {threshold_pct}%: {hybrid_days:.1f} days → {severity}\nForecast horizon: {horizon_days} days")
+                plt.legend()
+                plt.grid(alpha=0.3)
+                plt.tight_layout()
+                # Save forecast plot if forecast plots are enabled
+                if enable_forecast_plots:
+                    plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_forecast.png")
+                    plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                    log_verbose(f"  → Disk forecast plot saved (retrained): {plot_file}")
+                
+                # Save backtest plot if backtest plots are enabled (separate plot focusing on train/test)
+                if enable_backtest_plots and len(test_ts) > 0:
+                    plt.figure(figsize=(14, 7))
+                    # Plot train data
+                    if len(train_ts) > 0:
+                        plt.plot(train_ts.index, train_ts.values * 100, label='Train Data', color='#1f77b4', alpha=0.7, linewidth=1.5)
+                    # Plot test data (actual)
+                    plt.plot(test_ts.index, test_ts.values * 100, label='Test Data (Actual)', color='#2ca02c', alpha=0.7, linewidth=1.5)
+                    # Plot backtest predictions
+                    if linear_pred is not None and len(test_ts) > 0:
+                        plt.plot(test_ts.index, linear_pred.values * 100, label='Linear Backtest', color='green', linestyle='--', linewidth=1.5)
+                    # Plot Prophet backtest if available
+                    if prophet_forecast_df is not None:
+                        # Get historical predictions for test period
+                        test_forecast = prophet_forecast_df[prophet_forecast_df['ds'].isin(test_ts.index)]
+                        if not test_forecast.empty:
+                            plt.plot(test_forecast['ds'], test_forecast['yhat'] * 100, label='Prophet Backtest', color='orange', linestyle='--', linewidth=1.5)
+                    # Plot threshold line
+                    plt.axhline(threshold_pct, color='red', linestyle='--', linewidth=2, label=f'{threshold_pct}% Threshold')
+                    # Mark train/test split
+                    if len(test_ts) > 0 and len(train_ts) > 0:
+                        split_time = test_ts.index[0]
+                        plt.axvline(split_time, color='gray', linestyle=':', alpha=0.7, linewidth=2, label='Train/Test Split')
+                    plt.xlabel('Date')
+                    plt.ylabel('Disk Usage (%)')
+                    # Calculate MAE for title if available
+                    mae_text = ""
+                    if linear_mae is not None:
+                        mae_text = f" | Linear MAE: {linear_mae:.6f}"
+                    if prophet_mae is not None:
+                        mae_text += f" | Prophet MAE: {prophet_mae:.6f}"
+                    plt.title(f"{node} | {mountpoint} — Backtest Performance{mae_text}\nCurrent: {current_pct:.2f}% | ETA to {threshold_pct}%: {hybrid_days:.1f} days → {severity}")
+                    plt.legend()
+                    plt.grid(alpha=0.3)
+                    plt.tight_layout()
+                    backtest_plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_backtest.png")
+                    plt.savefig(backtest_plot_file, dpi=180, bbox_inches='tight')
+                    file_size = os.path.getsize(backtest_plot_file) if os.path.exists(backtest_plot_file) else 0
+                    print(f"✓ Saved backtest plot: {backtest_plot_file} ({file_size} bytes)")
+                    plt.close()
+                else:
+                    plt.close()
+            except Exception as e:
+                log_verbose(f"  → Failed to save disk plot: {e}")
+                try:
+                    plt.close()
+                except:
+                    pass
+        
         return {
             'result': record,
             'key': key,
@@ -2332,12 +2781,53 @@ def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, thr
 
 def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                            manifest=None, retrain_targets=None, show_backtest=False,
-                           forecast_mode=False, dump_csv_dir=None, enable_plots=True):
+                           forecast_mode=False, dump_csv_dir=None, enable_plots=True,
+                           enable_forecast_plots=None, enable_backtest_plots=None):
     """
-    Returns a DataFrame with full ETA for every node/mountpoint
-    Uses hybrid linear trend + Prophet for maximum accuracy
-    Also returns aggregated metrics for all disk models
+    Predict disk full dates for all nodes and mountpoints using hybrid forecasting.
+    
+    This function processes disk usage metrics across all nodes and mountpoints,
+    using a combination of linear trend analysis and Prophet forecasting to predict
+    when each disk will reach the specified threshold (default: 90%).
+    
+    The hybrid approach combines:
+    - Linear trend: Fast, simple extrapolation based on recent growth rate
+    - Prophet: Handles seasonality and non-linear patterns
+    
+    Args:
+        df_disk: DataFrame with disk usage metrics (columns: timestamp, value, instance, filesystem)
+        horizon_days: Forecast horizon in days (default: 7)
+        threshold_pct: Alert threshold percentage (default: 90.0)
+        manifest: Dictionary of cached disk models (loaded from disk_full_models.pkl)
+        retrain_targets: Set of node/mountpoint keys to retrain (e.g., {'host02:/', 'worker01:/home'})
+        show_backtest: Boolean to display backtest metrics for all models
+        forecast_mode: Boolean indicating forecast mode (minimal updates vs full training)
+        dump_csv_dir: Optional directory to export training datasets for analysis
+        enable_plots: Master flag to enable/disable plot generation
+        enable_forecast_plots: Optional boolean to override forecast plot generation
+        enable_backtest_plots: Optional boolean to override backtest plot generation
+    
+    Returns:
+        tuple: (alerts_df, manifest, manifest_changed, disk_metrics, retrained_nodes)
+            - alerts_df: DataFrame with columns: instance, mountpoint, current_%, days_to_90pct, 
+                        ensemble_eta, linear_eta, prophet_eta, alert
+            - manifest: Updated model manifest dictionary
+            - manifest_changed: Boolean indicating if manifest was modified
+            - disk_metrics: Aggregated backtest metrics across all disk models
+            - retrained_nodes: Set of node/mountpoint keys that were retrained
+    
+    Notes:
+        - Supports parallel processing for large deployments (>10 disks)
+        - Uses manifest-based storage for efficient model management
+        - Generates forecast and backtest plots when enabled
+        - Alert levels: CRITICAL (<3 days), WARNING (3-7 days), SOON (7-30 days), OK (>30 days)
     """
+    # Set defaults for plot flags if not provided
+    if enable_forecast_plots is None:
+        enable_forecast_plots = enable_plots and not forecast_mode
+    if enable_backtest_plots is None:
+        enable_backtest_plots = enable_plots and (show_backtest or not forecast_mode)
+    
     alerts = []
     manifest = manifest or {}
     retrain_targets = retrain_targets or set()
@@ -2391,7 +2881,7 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
             delayed(_process_single_disk)(
                 entity, mountpoint, group, mount_col, horizon_days, threshold_pct,
                 manifest_snapshot, retrain_targets, FORCE_TRAINING_RUN, forecast_mode,
-                dump_csv_dir, enable_plots, show_backtest
+                dump_csv_dir, enable_plots, show_backtest, enable_forecast_plots, enable_backtest_plots
             )
             for (entity, mountpoint), group in disk_groups
         )
@@ -2577,7 +3067,9 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                         pdf = train_ts.reset_index()
                         pdf.columns = ['ds', 'y']
                         pdf['y'] = pdf['y'].clip(upper=0.99)
-                        m = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=False)
+                        # Enable daily seasonality to catch daily batch job patterns (e.g., weekend backups, daily ETL jobs)
+                        # Weekly seasonality already enabled for weekly patterns
+                        m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
                         m.fit(pdf)
                         if len(test_ts) > 0:
                             test_df = test_ts.reset_index()
@@ -2599,23 +3091,23 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                     elif linear_pred is not None and len(test_ts) > 0:
                         all_mae_ensemble.append(linear_mae)
                 
-                # Save plot for cached models too (forecast mode only)
-                # Also update forecast with minimal update (use recent data only) - only in forecast mode
+                # MINIMAL UPDATE: Use recent data only (last 7 days) for faster fitting - only in forecast mode
+                # This incorporates latest trends while preserving learned patterns
+                prophet_forecast_df = None
                 if forecast_mode:
                     try:
-                        # MINIMAL UPDATE: Use recent data only (last 7 days) for faster fitting
-                        # This incorporates latest trends while preserving learned patterns
                         pdf = train_ts.reset_index()
                         pdf.columns = ['ds', 'y']
                         pdf['y'] = pdf['y'].clip(upper=0.99)
                         # Use recent data for minimal update (last 7 days or all if less)
                         recent_pdf = pdf.tail(min(len(pdf), 7*24*6))  # Last 7 days (6 data points per day for 10m intervals)
                     
-                        prophet_forecast_df = None
                         updated_prophet_days = cached_record.get('days_to_90pct', 9999.0)
                         try:
                             # Minimal update: fit on recent data only
-                            m = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=False)
+                            # Enable daily seasonality to catch daily batch job patterns (e.g., weekend backups, daily ETL jobs)
+                            # Weekly seasonality already enabled for weekly patterns
+                            m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
                             m.fit(recent_pdf)
                             future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
                             forecast = m.predict(future)
@@ -2674,8 +3166,16 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                         except Exception as e:
                             log_verbose(f"  → Minimal update failed, using cached forecast: {e}")
                             pass
-                        
-                        # Compute linear trend for plotting (even if not computing backtest metrics)
+                    except Exception as e:
+                        log_verbose(f"  → Failed to prepare minimal update: {e}")
+                        pass
+                
+                # Generate plots for cached models when plot flags are enabled
+                # In training mode, generate plots for ALL disks (including cached ones)
+                should_plot_cached = enable_forecast_plots or enable_backtest_plots
+                if should_plot_cached:
+                    try:
+                        # Compute linear trend for plotting
                         linear_pred = None
                         if len(test_ts) > 1 and len(train_ts) > 0:
                             daily_increase = train_ts.diff().resample('1D').mean().mean()
@@ -2683,47 +3183,109 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                             time_diffs = (test_ts.index - train_ts.index[-1]).total_seconds() / 86400
                             linear_pred = base_value + time_diffs * daily_increase
                         
-                        plt.figure(figsize=(14, 7))
-                        # Plot historical data
-                        if len(train_ts) > 0:
-                            plt.plot(train_ts.index, train_ts.values * 100, label='Train Data', color='#1f77b4', alpha=0.7)
-                        if len(test_ts) > 0:
-                            plt.plot(test_ts.index, test_ts.values * 100, label='Test Data', color='#2ca02c', alpha=0.7)
-                        # Plot forecast if Prophet model was created successfully
-                        if prophet_forecast_df is not None:
-                            forecast_future = prophet_forecast_df[prophet_forecast_df['ds'] > ts.index[-1]]
-                            if not forecast_future.empty:
-                                plt.plot(forecast_future['ds'], forecast_future['yhat'] * 100, label='Prophet Forecast', color='#ff7f0e', linewidth=2)
-                                plt.fill_between(forecast_future['ds'], 
-                                                forecast_future['yhat_lower'] * 100, 
-                                                forecast_future['yhat_upper'] * 100, 
-                                                alpha=0.2, color='#ff7f0e')
-                        # Plot threshold line
-                        plt.axhline(threshold_pct, color='red', linestyle='--', linewidth=2, label=f'{threshold_pct}% Threshold')
-                        # Plot train/test split if available
-                        if len(test_ts) > 0 and len(train_ts) > 0:
-                            split_time = test_ts.index[0]
-                            plt.axvline(split_time, color='gray', linestyle=':', alpha=0.7, label='Train/Test Split')
-                        # Plot linear trend if available
-                        if linear_pred is not None and len(test_ts) > 0:
-                            plt.plot(test_ts.index, linear_pred.values * 100, label='Linear Trend', color='green', linestyle='--', alpha=0.7)
-                        plt.xlabel('Date')
-                        plt.ylabel('Disk Usage (%)')
-                        safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
-                        safe_mount = mountpoint.replace('/', '_')
-                        current_pct = ts.iloc[-1] * 100
-                        # Use updated forecast if available, otherwise use cached
-                        hybrid_days = cached_record.get('days_to_90pct', 9999.0)
-                        severity = cached_record.get('alert', 'OK')
-                        plt.title(f"{node} | {mountpoint}\nCurrent: {current_pct:.2f}% | ETA to {threshold_pct}%: {hybrid_days:.1f} days → {severity}")
-                        plt.legend()
-                        plt.grid(alpha=0.3)
-                        plt.tight_layout()
-                        if enable_plots:
-                            plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_forecast.png")
-                            plt.savefig(plot_file, dpi=180, bbox_inches='tight')
-                            print(f"  → Disk plot saved: {plot_file}")
-                        plt.close()
+                        # If prophet_forecast_df wasn't created or we need backtest predictions, create it for plotting
+                        # For backtest plots, we need predictions on the test period, so train on full train data
+                        if prophet_forecast_df is None or (enable_backtest_plots and len(test_ts) > 0):
+                            try:
+                                pdf = train_ts.reset_index()
+                                pdf.columns = ['ds', 'y']
+                                pdf['y'] = pdf['y'].clip(upper=0.99)
+                                # For backtest plots, use full train data to get accurate test period predictions
+                                # For forecast plots only, use recent data for speed
+                                if enable_backtest_plots and len(test_ts) > 0:
+                                    fit_pdf = pdf  # Use all train data for accurate backtest
+                                else:
+                                    fit_pdf = pdf.tail(min(len(pdf), 7*24*6))  # Use recent data for speed
+                                m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
+                                m.fit(fit_pdf)
+                                # Extend to cover test period + forecast horizon
+                                future_periods = max(horizon_days*24*10, int((test_ts.index[-1] - train_ts.index[-1]).total_seconds() / (6*3600)) + 10) if len(test_ts) > 0 else horizon_days*24*10
+                                future = m.make_future_dataframe(periods=future_periods, freq='6H')
+                                prophet_forecast_df = m.predict(future)
+                            except:
+                                pass
+                        
+                        if not MATPLOTLIB_AVAILABLE:
+                            pass
+                        else:
+                            plt.figure(figsize=(14, 7))
+                            # Plot historical data
+                            if len(train_ts) > 0:
+                                plt.plot(train_ts.index, train_ts.values * 100, label='Train Data', color='#1f77b4', alpha=0.7)
+                            if len(test_ts) > 0:
+                                plt.plot(test_ts.index, test_ts.values * 100, label='Test Data', color='#2ca02c', alpha=0.7)
+                            # Plot forecast if Prophet model was created successfully
+                            if prophet_forecast_df is not None:
+                                forecast_future = prophet_forecast_df[prophet_forecast_df['ds'] > ts.index[-1]]
+                                if not forecast_future.empty:
+                                    plt.plot(forecast_future['ds'], forecast_future['yhat'] * 100, label='Prophet Forecast', color='#ff7f0e', linewidth=2)
+                                    plt.fill_between(forecast_future['ds'], 
+                                                    forecast_future['yhat_lower'] * 100, 
+                                                    forecast_future['yhat_upper'] * 100, 
+                                                    alpha=0.2, color='#ff7f0e')
+                            # Plot threshold line
+                            plt.axhline(threshold_pct, color='red', linestyle='--', linewidth=2, label=f'{threshold_pct}% Threshold')
+                            # Plot train/test split if available
+                            if len(test_ts) > 0 and len(train_ts) > 0:
+                                split_time = test_ts.index[0]
+                                plt.axvline(split_time, color='gray', linestyle=':', alpha=0.7, label='Train/Test Split')
+                            # Plot linear trend if available
+                            if linear_pred is not None and len(test_ts) > 0:
+                                plt.plot(test_ts.index, linear_pred.values * 100, label='Linear Trend', color='green', linestyle='--', alpha=0.7)
+                            plt.xlabel('Date')
+                            plt.ylabel('Disk Usage (%)')
+                            safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
+                            safe_mount = mountpoint.replace('/', '_')
+                            current_pct = ts.iloc[-1] * 100
+                            # Use updated forecast if available, otherwise use cached
+                            hybrid_days = cached_record.get('days_to_90pct', 9999.0)
+                            severity = cached_record.get('alert', 'OK')
+                            plt.title(f"{node} | {mountpoint}\nCurrent: {current_pct:.2f}% | ETA to {threshold_pct}%: {hybrid_days:.1f} days → {severity}\nForecast horizon: {horizon_days} days")
+                            plt.legend()
+                            plt.grid(alpha=0.3)
+                            plt.tight_layout()
+                            # Save forecast plot if forecast plots are enabled
+                            if enable_forecast_plots:
+                                plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_forecast.png")
+                                plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                                print(f"  → Disk plot saved: {plot_file}")
+                            
+                            # Save backtest plot if backtest plots are enabled (separate plot focusing on train/test)
+                            if enable_backtest_plots and len(test_ts) > 0:
+                                plt.figure(figsize=(14, 7))
+                                # Plot train data
+                                if len(train_ts) > 0:
+                                    plt.plot(train_ts.index, train_ts.values * 100, label='Train Data', color='#1f77b4', alpha=0.7, linewidth=1.5)
+                                # Plot test data (actual)
+                                plt.plot(test_ts.index, test_ts.values * 100, label='Test Data (Actual)', color='#2ca02c', alpha=0.7, linewidth=1.5)
+                                # Plot backtest predictions if available
+                                if linear_pred is not None and len(test_ts) > 0:
+                                    plt.plot(test_ts.index, linear_pred.values * 100, label='Linear Backtest', color='green', linestyle='--', linewidth=1.5)
+                                # Plot Prophet backtest if we can compute it
+                                if prophet_forecast_df is not None:
+                                    # Get historical predictions for test period
+                                    test_forecast = prophet_forecast_df[prophet_forecast_df['ds'].isin(test_ts.index)]
+                                    if not test_forecast.empty:
+                                        plt.plot(test_forecast['ds'], test_forecast['yhat'] * 100, label='Prophet Backtest', color='orange', linestyle='--', linewidth=1.5)
+                                # Plot threshold line
+                                plt.axhline(threshold_pct, color='red', linestyle='--', linewidth=2, label=f'{threshold_pct}% Threshold')
+                                # Mark train/test split
+                                if len(test_ts) > 0 and len(train_ts) > 0:
+                                    split_time = test_ts.index[0]
+                                    plt.axvline(split_time, color='gray', linestyle=':', alpha=0.7, linewidth=2, label='Train/Test Split')
+                                plt.xlabel('Date')
+                                plt.ylabel('Disk Usage (%)')
+                                plt.title(f"{node} | {mountpoint} — Backtest Performance\nCurrent: {current_pct:.2f}% | ETA to {threshold_pct}%: {hybrid_days:.1f} days → {severity}")
+                                plt.legend()
+                                plt.grid(alpha=0.3)
+                                plt.tight_layout()
+                                backtest_plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_backtest.png")
+                                plt.savefig(backtest_plot_file, dpi=180, bbox_inches='tight')
+                                file_size = os.path.getsize(backtest_plot_file) if os.path.exists(backtest_plot_file) else 0
+                                print(f"✓ Saved backtest plot: {backtest_plot_file} ({file_size} bytes)")
+                                plt.close()
+                            else:
+                                plt.close()
                     except Exception as e:
                         print(f"  ✗ Failed to save disk plot for cached model: {e}")
                         import traceback
@@ -2808,7 +3370,9 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                         dump_dataframe_to_csv(fit_pdf_for_csv, dump_csv_dir, dump_label)
                     else:
                         dump_dataframe_to_csv(fit_pdf.copy(), dump_csv_dir, dump_label)
-                    m = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=False)
+                    # Enable daily seasonality to catch daily batch job patterns (e.g., weekend backups, daily ETL jobs)
+                    # Weekly seasonality already enabled for weekly patterns
+                    m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
                     m.fit(fit_pdf)
                     prophet_model = m  # Store for plotting
                     
@@ -2879,8 +3443,13 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
             manifest_changed = True
             alerts.append(record)
             
-            # Save plot when retraining or when show_backtest is True
-            if needs_retrain or show_backtest:
+            # Save plot when retraining, show_backtest is True, or when plot flags are enabled
+            # In training mode, generate plots for ALL disks (not just retrained ones)
+            should_generate_plot = (needs_retrain or show_backtest or 
+                                   enable_forecast_plots or enable_backtest_plots)
+            if should_generate_plot:
+                if not MATPLOTLIB_AVAILABLE:
+                    continue
                 try:
                     plt.figure(figsize=(14, 7))
                     # Plot historical data
@@ -2910,15 +3479,57 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                     plt.ylabel('Disk Usage (%)')
                     safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
                     safe_mount = mountpoint.replace('/', '_')
-                    plt.title(f"{node} | {mountpoint}\nCurrent: {current_pct:.2f}% | ETA to {threshold_pct}%: {hybrid_days:.1f} days → {severity}")
+                    plt.title(f"{node} | {mountpoint}\nCurrent: {current_pct:.2f}% | ETA to {threshold_pct}%: {hybrid_days:.1f} days → {severity}\nForecast horizon: {horizon_days} days")
                     plt.legend()
                     plt.grid(alpha=0.3)
                     plt.tight_layout()
-                    if enable_plots:
+                    # Save forecast plot if forecast plots are enabled (this plot includes both historical and forecast data)
+                    if enable_forecast_plots:
                         plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_forecast.png")
                         plt.savefig(plot_file, dpi=180, bbox_inches='tight')
-                        print(f"  → Disk plot saved: {plot_file}")
-                    plt.close()
+                        print(f"  → Disk forecast plot saved: {plot_file}")
+                    
+                    # Save backtest plot if backtest plots are enabled (separate plot focusing on train/test)
+                    if enable_backtest_plots and len(test_ts) > 0:
+                        plt.figure(figsize=(14, 7))
+                        # Plot train data
+                        if len(train_ts) > 0:
+                            plt.plot(train_ts.index, train_ts.values * 100, label='Train Data', color='#1f77b4', alpha=0.7, linewidth=1.5)
+                        # Plot test data (actual)
+                        plt.plot(test_ts.index, test_ts.values * 100, label='Test Data (Actual)', color='#2ca02c', alpha=0.7, linewidth=1.5)
+                        # Plot backtest predictions
+                        if linear_pred is not None and len(test_ts) > 0:
+                            plt.plot(test_ts.index, linear_pred.values * 100, label='Linear Backtest', color='green', linestyle='--', linewidth=1.5)
+                        # Plot Prophet backtest if available
+                        if prophet_forecast_df is not None:
+                            # Get historical predictions for test period
+                            test_forecast = prophet_forecast_df[prophet_forecast_df['ds'].isin(test_ts.index)]
+                            if not test_forecast.empty:
+                                plt.plot(test_forecast['ds'], test_forecast['yhat'] * 100, label='Prophet Backtest', color='orange', linestyle='--', linewidth=1.5)
+                        # Plot threshold line
+                        plt.axhline(threshold_pct, color='red', linestyle='--', linewidth=2, label=f'{threshold_pct}% Threshold')
+                        # Mark train/test split
+                        if len(test_ts) > 0 and len(train_ts) > 0:
+                            split_time = test_ts.index[0]
+                            plt.axvline(split_time, color='gray', linestyle=':', alpha=0.7, linewidth=2, label='Train/Test Split')
+                        plt.xlabel('Date')
+                        plt.ylabel('Disk Usage (%)')
+                        # Calculate MAE for title if available
+                        mae_text = ""
+                        if linear_mae is not None:
+                            mae_text = f" | Linear MAE: {linear_mae:.6f}"
+                        if prophet_mae is not None:
+                            mae_text += f" | Prophet MAE: {prophet_mae:.6f}"
+                        plt.title(f"{node} | {mountpoint} — Backtest Performance{mae_text}\nCurrent: {current_pct:.2f}% | ETA to {threshold_pct}%: {hybrid_days:.1f} days → {severity}")
+                        plt.legend()
+                        plt.grid(alpha=0.3)
+                        plt.tight_layout()
+                        backtest_plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_backtest.png")
+                        plt.savefig(backtest_plot_file, dpi=180, bbox_inches='tight')
+                        print(f"  → Disk backtest plot saved: {backtest_plot_file}")
+                        plt.close()
+                    else:
+                        plt.close()
                 except Exception as e:
                     log_verbose(f"  → Failed to save disk plot: {e}")
                     try:
@@ -2953,11 +3564,114 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
 # ----------------------------------------------------------------------
 # 2. ENSEMBLE FORECAST (Prophet + ARIMA + LSTM)
 # ----------------------------------------------------------------------
+def calculate_model_confidence(mae, mape):
+    """
+    Calculate confidence level (1-10, where 1 is highest confidence).
+    Based on both MAE and MAPE, with special handling for small values where MAPE is misleading.
+    
+    Args:
+        mae: Mean Absolute Error
+        mape: Mean Absolute Percentage Error (can be None or NaN)
+    
+    Returns:
+        int: Confidence level from 1 (highest) to 10 (lowest)
+    """
+    if pd.isna(mae) or np.isinf(mae):
+        return 10  # Lowest confidence if MAE is invalid
+    
+    # If MAE is very small (< 0.01), model is actually quite accurate despite potentially high MAPE
+    # This handles cases like DISK_IO_WAIT where values are tiny ratios
+    if mae < 0.001:
+        return 1  # Highest confidence - extremely small absolute error
+    elif mae < 0.005:
+        return 2  # Very high confidence
+    elif mae < 0.01:
+        return 3  # High confidence
+    
+    # For larger MAE values, use MAPE if available
+    if pd.isna(mape) or np.isinf(mape) or mape <= 0:
+        # Fallback to MAE-based confidence if MAPE unavailable
+        if mae < 0.05:
+            return 4
+        elif mae < 0.1:
+            return 5
+        elif mae < 0.5:
+            return 6
+        elif mae < 1.0:
+            return 7
+        elif mae < 5.0:
+            return 8
+        elif mae < 10.0:
+            return 9
+        else:
+            return 10
+    
+    # Use MAPE for confidence scoring
+    if mape < 5:
+        return 1  # Highest confidence - < 5% error
+    elif mape < 10:
+        return 2
+    elif mape < 15:
+        return 3
+    elif mape < 20:
+        return 4
+    elif mape < 30:
+        return 5
+    elif mape < 40:
+        return 6
+    elif mape < 50:
+        return 7
+    elif mape < 70:
+        return 8
+    elif mape < 100:
+        return 9
+    else:
+        return 10  # Lowest confidence - > 100% error
+
 def build_ensemble_forecast_model(df_cpu, df_mem=None,
                                  horizon_min=HORIZON_MIN, model_path='model.pkl', context=None,
                                  save_forecast_plot=True, save_backtest_plot=True, print_backtest_metrics=True,
                                  save_model=True, dump_csv_dir=None, enable_plots=True):
-    # Override plot saving flags if enable_plots is False
+    """
+    Build an ensemble forecasting model combining Prophet, ARIMA, and LSTM.
+    
+    This function trains or loads an ensemble model for CPU/Memory forecasting using
+    three complementary algorithms: Prophet (seasonality), ARIMA (autoregressive patterns),
+    and LSTM (nonlinear dependencies). The final prediction is a simple average of all three.
+    
+    Args:
+        df_cpu: DataFrame with CPU metrics (columns: timestamp, value, instance/entity)
+        df_mem: Optional DataFrame with Memory metrics (same structure as df_cpu)
+        horizon_min: Forecast horizon in minutes (default: HORIZON_MIN from config)
+        model_path: Path to save/load model artifacts (default: 'model.pkl')
+        context: Optional dict with metadata (node, signal, cluster_id) for plot titles
+        save_forecast_plot: Whether to generate and save forecast visualization
+        save_backtest_plot: Whether to generate and save backtest visualization
+        print_backtest_metrics: Whether to print MAE, MAPE, confidence levels to console
+        save_model: Whether to persist model artifacts to disk
+        dump_csv_dir: Optional directory to export training datasets for analysis
+        enable_plots: Master flag to enable/disable all plot generation
+    
+    Returns:
+        tuple: (prophet_model, forecast_dataframe, metrics_dict)
+            - prophet_model: Trained Prophet model object
+            - forecast_dataframe: DataFrame with columns ['ds', 'yhat', 'yhat_lower', 'yhat_upper']
+            - metrics_dict: Dictionary containing MAE, MAPE, confidence levels, split_info
+    
+    Notes:
+        - Train/test split is time-ordered (chronological, not random)
+        - Models account for daily/weekly seasonality patterns
+        - LSTM is optional (requires TensorFlow)
+        - All models use the same train/test split for fair comparison
+    """
+    # Ensure horizon_min is always an integer (required for slice operations and Prophet periods)
+    horizon_min = int(horizon_min)
+    
+    # Override plot saving flags if enable_plots is False or matplotlib is not available
+    if not MATPLOTLIB_AVAILABLE:
+        save_forecast_plot = False
+        save_backtest_plot = False
+        enable_plots = False
     if not enable_plots:
         save_forecast_plot = False
         save_backtest_plot = False
@@ -2986,7 +3700,9 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
     if freq: pdf.index.freq = freq
     pdf = pdf.reset_index()
 
-    # --- Train/Test Split (time-ordered) ---
+    # --- Train/Test Split (time-ordered, chronological) ---
+    # Time-ordered split ensures training data is always from the past and test data from the future
+    # This prevents data leakage and provides realistic backtest evaluation
     split_idx = max(1, int(len(pdf) * TRAIN_FRACTION))
     if split_idx >= len(pdf):
         split_idx = len(pdf) - 1
@@ -3227,11 +3943,27 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
                     mae_ens = mean_absolute_error(test_valid, ens_valid)
                     if pd.isna(mae_ens) or np.isinf(mae_ens):
                         mae_ens = np.nan
+                    # Calculate MAPE (Mean Absolute Percentage Error) - statistically correct formula
+                    # MAPE = mean(|actual - predicted| / |actual|) * 100
+                    # This provides a relative error measure, useful for comparing models across different scales
+                    # Handle division by zero by filtering out zero actual values
+                    # Note: For metrics with very small actual values (e.g., DISK_IO_WAIT ratios),
+                    # MAPE can be misleadingly high. The system displays a contextual note when
+                    # MAPE > 50% and MAE < 0.01, indicating the high MAPE is due to small actual values
+                    non_zero_mask = test_valid.abs() > 1e-10  # Avoid division by very small numbers
+                    if non_zero_mask.sum() > 0:
+                        mape_ens = ((test_valid[non_zero_mask] - ens_valid[non_zero_mask]).abs() / test_valid[non_zero_mask].abs()).mean() * 100
+                        if pd.isna(mape_ens) or np.isinf(mape_ens):
+                            mape_ens = np.nan
+                    else:
+                        mape_ens = np.nan
                 except (ValueError, Exception) as e:
                     log_verbose(f"Warning: Failed to calculate ensemble MAE: {e}")
                     mae_ens = np.nan
+                    mape_ens = np.nan
             else:
                 mae_ens = np.nan
+                mape_ens = np.nan
             
             if (not p_back_valid.isna().any() and not np.isinf(p_back_valid).any() and
                 len(p_back_valid) == len(test_valid) and len(p_back_valid) > 0):
@@ -3239,11 +3971,21 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
                     mae_prophet = mean_absolute_error(test_valid, p_back_valid)
                     if pd.isna(mae_prophet) or np.isinf(mae_prophet):
                         mae_prophet = np.nan
+                    # Calculate MAPE (correct formula)
+                    non_zero_mask = test_valid.abs() > 1e-10
+                    if non_zero_mask.sum() > 0:
+                        mape_prophet = ((test_valid[non_zero_mask] - p_back_valid[non_zero_mask]).abs() / test_valid[non_zero_mask].abs()).mean() * 100
+                        if pd.isna(mape_prophet) or np.isinf(mape_prophet):
+                            mape_prophet = np.nan
+                    else:
+                        mape_prophet = np.nan
                 except (ValueError, Exception) as e:
                     log_verbose(f"Warning: Failed to calculate Prophet MAE: {e}")
                     mae_prophet = np.nan
+                    mape_prophet = np.nan
             else:
                 mae_prophet = np.nan
+                mape_prophet = np.nan
                 
             if (not a_pred_valid.isna().any() and not np.isinf(a_pred_valid).any() and
                 len(a_pred_valid) == len(test_valid) and len(a_pred_valid) > 0):
@@ -3251,11 +3993,21 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
                     mae_arima = mean_absolute_error(test_valid, a_pred_valid)
                     if pd.isna(mae_arima) or np.isinf(mae_arima):
                         mae_arima = np.nan
+                    # Calculate MAPE (correct formula)
+                    non_zero_mask = test_valid.abs() > 1e-10
+                    if non_zero_mask.sum() > 0:
+                        mape_arima = ((test_valid[non_zero_mask] - a_pred_valid[non_zero_mask]).abs() / test_valid[non_zero_mask].abs()).mean() * 100
+                        if pd.isna(mape_arima) or np.isinf(mape_arima):
+                            mape_arima = np.nan
+                    else:
+                        mape_arima = np.nan
                 except (ValueError, Exception) as e:
                     log_verbose(f"Warning: Failed to calculate ARIMA MAE: {e}")
                     mae_arima = np.nan
+                    mape_arima = np.nan
             else:
                 mae_arima = np.nan
+                mape_arima = np.nan
                 
             if (not l_back_valid.isna().any() and not np.isinf(l_back_valid).any() and
                 len(l_back_valid) == len(test_valid) and len(l_back_valid) > 0):
@@ -3263,25 +4015,63 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
                     mae_lstm = mean_absolute_error(test_valid, l_back_valid)
                     if pd.isna(mae_lstm) or np.isinf(mae_lstm):
                         mae_lstm = np.nan
+                    # Calculate MAPE (correct formula)
+                    non_zero_mask = test_valid.abs() > 1e-10
+                    if non_zero_mask.sum() > 0:
+                        mape_lstm = ((test_valid[non_zero_mask] - l_back_valid[non_zero_mask]).abs() / test_valid[non_zero_mask].abs()).mean() * 100
+                        if pd.isna(mape_lstm) or np.isinf(mape_lstm):
+                            mape_lstm = np.nan
+                    else:
+                        mape_lstm = np.nan
                 except (ValueError, Exception) as e:
                     log_verbose(f"Warning: Failed to calculate LSTM MAE: {e}")
                     mae_lstm = np.nan
+                    mape_lstm = np.nan
             else:
                 mae_lstm = np.nan
+                mape_lstm = np.nan
         else:
             # No valid test data
             mae_ens = np.nan
             mae_prophet = np.nan
             mae_arima = np.nan
             mae_lstm = np.nan
+            mape_ens = np.nan
+            mape_prophet = np.nan
+            mape_arima = np.nan
+            mape_lstm = np.nan
 
+        # Initialize MAPE variables if not already set
+        if 'mape_ens' not in locals():
+            mape_ens = np.nan
+        if 'mape_prophet' not in locals():
+            mape_prophet = np.nan
+        if 'mape_arima' not in locals():
+            mape_arima = np.nan
+        if 'mape_lstm' not in locals():
+            mape_lstm = np.nan
+        
+        # Calculate confidence levels for each model
+        conf_ensemble = calculate_model_confidence(mae_ens, mape_ens)
+        conf_prophet = calculate_model_confidence(mae_prophet, mape_prophet)
+        conf_arima = calculate_model_confidence(mae_arima, mape_arima)
+        conf_lstm = calculate_model_confidence(mae_lstm, mape_lstm)
+        
         metrics = {
             'mae_ensemble': mae_ens,
             'mae_prophet': mae_prophet,
             'mae_arima': mae_arima,
-            'mae_lstm': mae_lstm
+            'mae_lstm': mae_lstm,
+            'mape_ensemble': mape_ens,
+            'mape_prophet': mape_prophet,
+            'mape_arima': mape_arima,
+            'mape_lstm': mape_lstm,
+            'confidence_ensemble': conf_ensemble,
+            'confidence_prophet': conf_prophet,
+            'confidence_arima': conf_arima,
+            'confidence_lstm': conf_lstm,
+            'split_info': split_info
         }
-        metrics['split_info'] = split_info
         
         # Format metrics nicely and print only if print_backtest_metrics is True
         if print_backtest_metrics:
@@ -3295,39 +4085,195 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
                     context_str = f" → {node}"
             
             print(f"\nBacktest Metrics{context_str}:")
-            for k, v in metrics.items():
-                if k == 'split_info' and isinstance(v, dict):
-                    print(f"  • Train/Test Split:")
-                    print(f"    - Train fraction: {v.get('train_fraction', 0)*100:.0f}%")
-                    print(f"    - Train points: {v.get('train_points', 0):,}")
-                    print(f"    - Test points: {v.get('test_points', 0):,}")
-                    if v.get('train_start'):
-                        print(f"    - Train period: {v['train_start']} → {v['train_end']}")
-                    if v.get('test_start'):
-                        print(f"    - Test period: {v['test_start']} → {v['test_end']}")
-                elif isinstance(v, (int, float)) and not np.isnan(v):
-                    print(f"  • {k}: {v:.6f}")
-                elif isinstance(v, (int, float)) and np.isnan(v):
-                    print(f"  • {k}: N/A")
+            # Print MAE metrics with MAPE inline (matching summary format)
+            # Note: MAPE can be misleading for metrics with very small values (e.g., DISK_IO_WAIT ratios)
+            # High MAPE doesn't necessarily mean poor model - check MAE for absolute error magnitude
+            # Context: For cluster-level aggregations, 20-30% MAPE is normal due to higher variability
+            if metrics.get('mae_ensemble') is not None and not pd.isna(metrics['mae_ensemble']):
+                mae_val = metrics['mae_ensemble']
+                mape_val = metrics.get('mape_ensemble')
+                if mape_val is not None and not pd.isna(mape_val):
+                    # For very small MAE values, MAPE can be misleadingly high
+                    # Add a note if MAPE > 50% but MAE is very small (< 0.01)
+                    mape_note = ""
+                    if mape_val > 50 and mae_val < 0.01:
+                        mape_note = " (MAPE inflated by small actual values)"
+                    print(f"  • mae_ensemble: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
                 else:
-                    print(f"  • {k}: {v}")
+                    print(f"  • mae_ensemble: {mae_val:.6f}")
+            if metrics.get('mae_prophet') is not None and not pd.isna(metrics['mae_prophet']):
+                mae_val = metrics['mae_prophet']
+                mape_val = metrics.get('mape_prophet')
+                if mape_val is not None and not pd.isna(mape_val):
+                    mape_note = ""
+                    if mape_val > 50 and mae_val < 0.01:
+                        mape_note = " (MAPE inflated by small actual values)"
+                    print(f"  • mae_prophet: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
+                else:
+                    print(f"  • mae_prophet: {mae_val:.6f}")
+            if metrics.get('mae_arima') is not None and not pd.isna(metrics['mae_arima']):
+                mae_val = metrics['mae_arima']
+                mape_val = metrics.get('mape_arima')
+                if mape_val is not None and not pd.isna(mape_val):
+                    mape_note = ""
+                    if mape_val > 50 and mae_val < 0.01:
+                        mape_note = " (MAPE inflated by small actual values)"
+                    print(f"  • mae_arima: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
+                else:
+                    print(f"  • mae_arima: {mae_val:.6f}")
+            if metrics.get('mae_lstm') is not None and not pd.isna(metrics['mae_lstm']):
+                mae_val = metrics['mae_lstm']
+                mape_val = metrics.get('mape_lstm')
+                if mape_val is not None and not pd.isna(mape_val):
+                    mape_note = ""
+                    if mape_val > 50 and mae_val < 0.01:
+                        mape_note = " (MAPE inflated by small actual values)"
+                    print(f"  • mae_lstm: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
+                else:
+                    print(f"  • mae_lstm: {mae_val:.6f}")
+            
+            # Print Expected Error Rate and Confidence Level
+            print(f"  • Expected Error Rate (%):")
+            if metrics.get('mape_ensemble') is not None and not pd.isna(metrics['mape_ensemble']):
+                print(f"    - Ensemble: {metrics['mape_ensemble']:.2f}%")
+            if metrics.get('mape_prophet') is not None and not pd.isna(metrics['mape_prophet']):
+                print(f"    - Prophet: {metrics['mape_prophet']:.2f}%")
+            if metrics.get('mape_arima') is not None and not pd.isna(metrics['mape_arima']):
+                print(f"    - ARIMA: {metrics['mape_arima']:.2f}%")
+            if metrics.get('mape_lstm') is not None and not pd.isna(metrics['mape_lstm']):
+                print(f"    - LSTM: {metrics['mape_lstm']:.2f}%")
+            
+            print(f"  • Confidence Level (1=highest, 10=lowest):")
+            if metrics.get('confidence_ensemble') is not None:
+                conf_ens = metrics['confidence_ensemble']
+                conf_desc = "Excellent" if conf_ens <= 2 else "Good" if conf_ens <= 4 else "Moderate" if conf_ens <= 6 else "Low" if conf_ens <= 8 else "Very Low"
+                print(f"    - Ensemble: {conf_ens}/10 ({conf_desc})")
+            if metrics.get('confidence_prophet') is not None:
+                conf_prop = metrics['confidence_prophet']
+                conf_desc = "Excellent" if conf_prop <= 2 else "Good" if conf_prop <= 4 else "Moderate" if conf_prop <= 6 else "Low" if conf_prop <= 8 else "Very Low"
+                print(f"    - Prophet: {conf_prop}/10 ({conf_desc})")
+            if metrics.get('confidence_arima') is not None:
+                conf_arima = metrics['confidence_arima']
+                conf_desc = "Excellent" if conf_arima <= 2 else "Good" if conf_arima <= 4 else "Moderate" if conf_arima <= 6 else "Low" if conf_arima <= 8 else "Very Low"
+                print(f"    - ARIMA: {conf_arima}/10 ({conf_desc})")
+            if metrics.get('confidence_lstm') is not None:
+                conf_lstm = metrics['confidence_lstm']
+                conf_desc = "Excellent" if conf_lstm <= 2 else "Good" if conf_lstm <= 4 else "Moderate" if conf_lstm <= 6 else "Low" if conf_lstm <= 8 else "Very Low"
+                print(f"    - LSTM: {conf_lstm}/10 ({conf_desc})")
+            
+            # Print split info
+            if metrics.get('split_info') and isinstance(metrics['split_info'], dict):
+                split_info = metrics['split_info']
+                print(f"  • Train/Test Split:")
+                train_pct = round(split_info.get('train_fraction', 0.8) * 100)
+                print(f"    - Train fraction: {train_pct}%")
+                print(f"    - Train points: {split_info.get('train_points', 0):,}")
+                print(f"    - Test points: {split_info.get('test_points', 0):,}")
+                if split_info.get('train_start'):
+                    print(f"    - Train period: {split_info['train_start']} → {split_info['train_end']}")
+                if split_info.get('test_start'):
+                    print(f"    - Test period: {split_info['test_start']} → {split_info['test_end']}")
     else:
-        metrics = {'mae_ensemble': np.nan, 'mae_prophet': np.nan, 'mae_arima': np.nan, 'mae_lstm': np.nan}
-        metrics['split_info'] = split_info
+        metrics = {
+            'mae_ensemble': np.nan, 'mae_prophet': np.nan, 'mae_arima': np.nan, 'mae_lstm': np.nan,
+            'mape_ensemble': np.nan, 'mape_prophet': np.nan, 'mape_arima': np.nan, 'mape_lstm': np.nan,
+            'confidence_ensemble': 10, 'confidence_prophet': 10, 'confidence_arima': 10, 'confidence_lstm': 10,
+            'split_info': split_info
+        }
         print("Not enough test data for backtest")
 
     # --- Plot 1: Forecast --- Always save plots to FORECAST_PLOTS_DIR
-    last = ts.last('1h')
-    plt.figure(figsize=(12,6))
-    plt.plot(tail['ds'], f_prophet.tail(horizon_min), label='Prophet', color='orange', ls='--')
-    plt.plot(tail['ds'], f_arima, label='ARIMA', color='green', ls='--')
-    plt.plot(tail['ds'], f_lstm, label='LSTM', color='purple', ls=':')
-    plt.plot(tail['ds'], ensemble, label='Ensemble (3)', color='red', lw=2)
-    plt.plot(last.index, last, label='Last hour', color='blue', alpha=0.7)
-    if split_info.get("test_start"):
-        plt.axvline(pd.to_datetime(split_info["test_start"]), color='black', linestyle=':', alpha=0.6, label='Train/Test split')
-    plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
-    # Determine model type from model_path or context
+    if not MATPLOTLIB_AVAILABLE:
+        log_verbose("Matplotlib not available, skipping plot generation")
+        return (prophet_model, out, metrics)
+    
+    plt.figure(figsize=(16, 6))
+    
+    # Plot historical data - last 24 hours from pdf
+    pdf_ts = pdf.set_index('ds')['y']
+    if not pdf_ts.empty:
+        historical = pdf_ts.loc[pdf_ts.index >= (pdf_ts.index[-1] - pd.Timedelta(hours=24))]
+        if len(historical) > 0:
+            plt.plot(historical.index, historical.values, label="Historical Data", color="#1f77b4", linewidth=1.5)
+            last_historical_time = pdf_ts.index[-1]
+        else:
+            last_historical_time = pdf_ts.index[-1] if not pdf_ts.empty else pd.Timestamp.now()
+    else:
+        last_historical_time = pd.Timestamp.now()
+    
+    # For visualization: generate real 7-day forecast (10080 minutes) for plots
+    # This is for plot display only - the actual model forecast uses horizon_min
+    plot_horizon_min = int(7 * 24 * 60)  # 7 days = 10080 minutes for visualization (ensure integer)
+    plot_horizon_days = 7.0  # Always show "7 days" in plot title
+    
+    # Generate real 7-day forecast for visualization if model forecast is shorter
+    plot_ensemble = ensemble  # Default to actual forecast
+    plot_forecast_end = last_historical_time
+    
+    if not tail.empty:
+        plot_forecast_end = tail['ds'].iloc[-1]
+        
+        # Generate real 7-day forecast for plots if model forecast is shorter
+        if horizon_min < plot_horizon_min:
+            # Get the Prophet model and ARIMA model that were already trained
+            # Prophet: generate 7-day future dataframe
+            future_plot = m.make_future_dataframe(periods=int(plot_horizon_min), freq='min')
+            future_plot['hour'] = future_plot['ds'].dt.hour
+            future_plot['is_weekend'] = (future_plot['ds'].dt.dayofweek >= 5).astype(int)
+            f_prophet_plot = m.predict(future_plot)['yhat']
+            
+            # ARIMA: generate 7-day forecast
+            f_arima_plot = arima.forecast(steps=int(plot_horizon_min))
+            f_arima_plot.index = pd.date_range(start=ts.index[-1] + pd.Timedelta(minutes=1), 
+                                               periods=int(plot_horizon_min), freq='min')
+            
+            # Create 7-day ensemble forecast (Prophet + ARIMA)
+            # For visualization, we use Prophet and ARIMA only (LSTM training for 7-day would be expensive)
+            tail_plot = future_plot.tail(int(plot_horizon_min))
+            prophet_tail_plot = pd.Series(f_prophet_plot.tail(int(plot_horizon_min)).values, index=tail_plot['ds'])
+            plot_ensemble = (prophet_tail_plot + f_arima_plot) / 2
+            plot_forecast_end = tail_plot['ds'].iloc[-1]
+        else:
+            # Model forecast is already 7 days or longer, use it directly
+            plot_ensemble = ensemble
+            plot_forecast_end = tail['ds'].iloc[-1]
+        
+        # Plot the forecast (7-day visualization)
+        plt.plot(plot_ensemble.index, plot_ensemble.values, label="Forecast", color="#ff7f0e", linewidth=2)
+    else:
+        plot_forecast_end = last_historical_time
+    
+    # Get threshold from context if available (for I/O and Network models)
+    threshold = None
+    if context:
+        # Thresholds for I/O and Network signals (matching resources list)
+        signal = context.get('signal', '')
+        if 'DISK_IO_WAIT' in signal:
+            threshold = 0.30  # 30% I/O wait threshold
+        elif 'NET_TX_BW' in signal:
+            threshold = 120_000_000  # 120 MB/s (96% of 1 Gbps) threshold
+    
+    # Plot threshold line if available
+    if threshold is not None:
+        threshold_label = f"Threshold ({threshold:,.0f})" if threshold >= 1000 else f"Threshold ({threshold:.2f})"
+        plt.axhline(threshold, color="red", linestyle="--", linewidth=2, label=threshold_label)
+    
+    # Mark current time
+    plt.axvline(last_historical_time, color="gray", linestyle=":", alpha=0.7, label="Now")
+    
+    # Set x-axis limits to show 24 hours historical + 7 days forecast (for visualization)
+    x_min = last_historical_time - pd.Timedelta(hours=24)
+    x_max = last_historical_time + pd.Timedelta(days=7)
+    plt.xlim(x_min, x_max)
+    
+    # Format x-axis to show time (MM-DD HH format)
+    import matplotlib.dates as mdates
+    ax = plt.gca()
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H'))
+    ax.xaxis.set_major_locator(mdates.HourLocator(interval=4))
+    plt.xticks(rotation=45, ha='right')
+    
+    # Determine model type and title from model_path or context
     if model_path:
         # Extract basename first, then get model type (e.g., "host_forecast.pkl" -> "host")
         basename = os.path.basename(model_path)
@@ -3336,26 +4282,74 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
         else:
             # Fallback: use basename without extension
             model_type = os.path.splitext(basename)[0].upper()
+        title = f"{model_type} Layer Forecast"
     elif context:
         # Use context to determine model type (for I/O and Network models)
         signal = context.get('signal', 'MODEL')
         node = context.get('node', '')
+        signal_display = signal.replace('_', ' ')
+        # Create model_type for backtest plot title
         model_type = f"{signal}_{node}" if node else signal
+        title = f"{node} — {signal_display} Forecast" if node else f"{signal_display} Forecast"
     else:
         model_type = "MODEL"
-    plt.title(f"{model_type} Layer – {horizon_min}-min Forecast")
+        title = f"{model_type} Forecast"
+    
+    # Get current value and calculate ETA if threshold is available
+    current_value = pdf_ts.iloc[-1] if not pdf_ts.empty else 0.0
+    
+    # Calculate ETA to threshold if threshold is available
+    # Use the actual model forecast (not extended visualization) for ETA calculation
+    if threshold is not None and not tail.empty and len(ensemble) > 0:
+        # Create a DataFrame with ensemble forecast values (actual model forecast)
+        ensemble_df = pd.DataFrame({'ds': tail['ds'].values, 'yhat': ensemble.values if hasattr(ensemble, 'values') else ensemble})
+        future_threshold = ensemble_df[ensemble_df['yhat'] >= threshold]
+        if not future_threshold.empty:
+            eta_days = max(0.0, (pd.to_datetime(future_threshold.iloc[0]['ds']) - pd.Timestamp.now()).total_seconds() / 86400)
+        else:
+            eta_days = 9999.0
+        severity = "CRITICAL" if eta_days < 3 else "WARNING" if eta_days < 7 else "SOON" if eta_days < 30 else "OK"
+        plt.title(f"{title}\n"
+                  f"Current: {current_value:,.6f} | Hybrid ETA: {eta_days:.1f} days → {severity}\n"
+                  f"Forecast horizon: {plot_horizon_days:.0f} days")
+    else:
+        plt.title(f"{title}\nForecast horizon: {plot_horizon_days:.0f} days")
+    
+    plt.xlabel('Time')
+    plt.ylabel('Value')
+    plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
     # Save forecast plot only if save_forecast_plot is True
     if save_forecast_plot:
         # Save plot to FORECAST_PLOTS_DIR
-        # Sanitize model_type for filename
-        safe_model_type = model_type.lower().replace(' ', '_').replace('/', '_').replace(':', '_').replace('(', '_').replace(')', '_')
-        plot_filename = f"{safe_model_type}_layer_forecast.png"
+        # Determine safe model type for filename
+        if model_path:
+            basename = os.path.basename(model_path)
+            if '_' in basename:
+                safe_model_type = basename.split('_')[0].lower()
+            else:
+                safe_model_type = os.path.splitext(basename)[0].lower()
+        elif context:
+            signal = context.get('signal', 'MODEL')
+            node = context.get('node', '')
+            safe_model_type = f"{signal.lower()}_{node.lower().replace(' ', '_').replace('(', '_').replace(')', '_').replace('.', '_')}" if node else signal.lower()
+        else:
+            safe_model_type = "model"
+        safe_model_type = safe_model_type.replace(' ', '_').replace('/', '_').replace(':', '_').replace('(', '_').replace(')', '_')
+        plot_filename = f"{safe_model_type}_ensemble_layer_forecast.png"
         plot_path = os.path.join(FORECAST_PLOTS_DIR, plot_filename)
-        plt.savefig(plot_path, dpi=180, bbox_inches='tight')
+        try:
+            plt.savefig(plot_path, dpi=180, bbox_inches='tight')
+            if os.path.exists(plot_path):
+                file_size = os.path.getsize(plot_path)
+                print(f"✓ Saved forecast plot: {plot_path} ({file_size} bytes)")
+            else:
+                print(f"✗ Warning: Plot file not found after save: {plot_path}")
+        except Exception as e:
+            print(f"✗ Error saving plot to {plot_path}: {e}")
     plt.close()
     
     # --- Plot 2: Backtest Visualization (if test data available and save_backtest_plot is True) ---
-    if save_backtest_plot and len(test_ts) >= 50 and 'mae_ensemble' in metrics:
+    if save_backtest_plot and len(test_ts) >= 50 and 'mae_ensemble' in metrics and MATPLOTLIB_AVAILABLE:
         plt.figure(figsize=(14, 7))
         # Plot train data
         train_ts_plot = train.set_index('ds')['y']
@@ -3383,9 +4377,17 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
         plt.tight_layout()
         # Sanitize model_type for filename
         safe_model_type = model_type.lower().replace(' ', '_').replace('/', '_').replace(':', '_').replace('(', '_').replace(')', '_')
-        backtest_plot_filename = f"{safe_model_type}_layer_backtest.png"
+        backtest_plot_filename = f"{safe_model_type}_ensemble_layer_backtest.png"
         backtest_plot_path = os.path.join(FORECAST_PLOTS_DIR, backtest_plot_filename)
-        plt.savefig(backtest_plot_path, dpi=180, bbox_inches='tight')
+        try:
+            plt.savefig(backtest_plot_path, dpi=180, bbox_inches='tight')
+            if os.path.exists(backtest_plot_path):
+                file_size = os.path.getsize(backtest_plot_path)
+                print(f"✓ Saved backtest plot: {backtest_plot_path} ({file_size} bytes)")
+            else:
+                print(f"✗ Warning: Backtest plot file not found after save: {backtest_plot_path}")
+        except Exception as e:
+            print(f"✗ Error saving backtest plot to {backtest_plot_path}: {e}")
         plt.close()
 
     # ---- Forecast DF ----------------------------------------------------
@@ -3462,7 +4464,7 @@ def identify_clusters(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, lookback
     # IMPORTANT: Pod metrics have an 'instance' label that directly tells us which host the pod is on
     # Use that directly instead of trying to match via IPs/DNS
     nodes_with_pods = set()
-    nodes_with_pods_raw = {}  # Track raw -> canonical mapping for debug
+    nodes_with_pods_raw = {}  # Track raw -> canonical mapping for alias resolution
     pod_instance_to_host = {}  # Map pod entity -> host instance (from instance label)
     if not df_pod_cpu.empty or not df_pod_mem.empty:
         for df in [df_pod_cpu, df_pod_mem]:
@@ -3489,7 +4491,7 @@ def identify_clusters(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, lookback
                     nodes_with_pods.add(canonical)
                     nodes_with_pods_raw[canonical] = entity
     
-    # Debug output
+    # Verbose logging: cluster identification details
     if VERBOSE_LEVEL >= 1:
         print(f"\n[DEBUG] Nodes with pods (from pod metrics instance label): {sorted(nodes_with_pods)}")
         print(f"[DEBUG] Raw pod instance -> canonical mapping: {nodes_with_pods_raw}")
@@ -4349,7 +5351,7 @@ def identify_clusters(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, lookback
         else:
             cluster_nodes.append((entity, entity_normalized, cluster_map[entity_normalized]))
     
-    # Debug output
+    # Verbose logging: cluster identification details
     if VERBOSE_LEVEL >= 1:
         print(f"\n[DEBUG] Final cluster_map: {dict(sorted(cluster_map.items()))}")
         print(f"[DEBUG] Nodes assigned to clusters: {cluster_nodes}")
@@ -4358,7 +5360,36 @@ def identify_clusters(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, lookback
     
     return cluster_map
 
-def extract_instance_features(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, lookback_hours=LOOKBACK_HOURS):
+def extract_instance_features(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, lookback_hours=LOOKBACK_HOURS, include_temporal=True):
+    """
+    Extract features for anomaly detection from host and pod metrics.
+    
+    This function aggregates time series data over a lookback window and creates
+    feature vectors for each node. Features include host CPU/memory and pod CPU/memory
+    averages, with optional temporal awareness for seasonality-aware anomaly detection.
+    
+    Args:
+        df_host_cpu: DataFrame with host CPU metrics (columns: timestamp, value, entity)
+        df_host_mem: DataFrame with host memory metrics (columns: timestamp, value, entity)
+        df_pod_cpu: DataFrame with pod CPU metrics (columns: timestamp, value, entity)
+        df_pod_mem: DataFrame with pod memory metrics (columns: timestamp, value, entity)
+        lookback_hours: Time window in hours for feature aggregation (default: LOOKBACK_HOURS)
+        include_temporal: If True, adds temporal features (hour, day_of_week, etc.) for
+                         seasonality-aware detection. Automatically enabled when 3+ months of
+                         historical data is available.
+    
+    Returns:
+        DataFrame: Feature matrix with one row per entity (node), columns include:
+                   - host_cpu, host_mem, pod_cpu, pod_mem (basic features)
+                   - host_cpu_hour_*, host_cpu_dow_*, etc. (temporal features if enabled)
+                   - current_hour, current_day_of_week (time context features)
+    
+    Notes:
+        - Temporal features compare current values to same-time historical patterns
+        - Reduces false positives from normal weekly/daily patterns (batch jobs, weekend backups)
+        - Falls back to basic features if insufficient historical data (< 3 months)
+        - Recommended when training on 3+ months of data with clear weekly/daily patterns
+    """
     now = pd.Timestamp.now()
     start = now - pd.Timedelta(hours=lookback_hours)
 
@@ -4374,7 +5405,65 @@ def extract_instance_features(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, 
         if 'entity' not in local.columns:
             local = local.rename(columns={'instance': 'entity'})
         return local.groupby('entity')['value'].mean().rename(label)
+    
+    def aggregate_temporal(df, label):
+        """Aggregate with temporal awareness - compares to same time patterns."""
+        if df.empty:
+            return {}
+        local = recent(df)
+        if 'entity' not in local.columns:
+            local = local.rename(columns={'instance': 'entity'})
+        
+        # Add temporal features
+        local['hour'] = pd.to_datetime(local['timestamp']).dt.hour
+        local['day_of_week'] = pd.to_datetime(local['timestamp']).dt.dayofweek  # 0=Monday, 6=Sunday
+        local['is_weekend'] = (local['day_of_week'] >= 5).astype(int)
+        
+        # Current time context
+        current_hour = now.hour
+        current_dow = now.dayofweek
+        current_is_weekend = 1 if current_dow >= 5 else 0
+        
+        # Calculate features per entity
+        temporal_feats = {}
+        for entity in local['entity'].unique():
+            entity_data = local[local['entity'] == entity]
+            
+            # Overall average (baseline)
+            overall_avg = entity_data['value'].mean()
+            
+            # Same hour of day average (accounts for daily patterns)
+            same_hour_data = entity_data[entity_data['hour'] == current_hour]
+            same_hour_avg = same_hour_data['value'].mean() if len(same_hour_data) > 0 else overall_avg
+            
+            # Same day of week average (accounts for weekly patterns)
+            same_dow_data = entity_data[entity_data['day_of_week'] == current_dow]
+            same_dow_avg = same_dow_data['value'].mean() if len(same_dow_data) > 0 else overall_avg
+            
+            # Same time last week equivalent (same hour + same day of week)
+            same_time_pattern = entity_data[
+                (entity_data['hour'] == current_hour) & 
+                (entity_data['day_of_week'] == current_dow)
+            ]
+            same_time_avg = same_time_pattern['value'].mean() if len(same_time_pattern) > 0 else overall_avg
+            
+            # Weekend vs weekday average
+            weekend_avg = entity_data[entity_data['is_weekend'] == 1]['value'].mean() if len(entity_data[entity_data['is_weekend'] == 1]) > 0 else overall_avg
+            weekday_avg = entity_data[entity_data['is_weekend'] == 0]['value'].mean() if len(entity_data[entity_data['is_weekend'] == 0]) > 0 else overall_avg
+            
+            temporal_feats[entity] = {
+                f'{label}_overall': overall_avg,
+                f'{label}_same_hour': same_hour_avg,
+                f'{label}_same_dow': same_dow_avg,
+                f'{label}_same_time_pattern': same_time_avg,
+                f'{label}_weekend': weekend_avg,
+                f'{label}_weekday': weekday_avg,
+                f'{label}_current_context': same_time_avg if current_is_weekend == 0 else weekend_avg  # Best contextual average
+            }
+        
+        return temporal_feats
 
+    # Basic aggregation (always included)
     hcpu = aggregate(df_host_cpu, 'host_cpu')
     hmem = aggregate(df_host_mem, 'host_mem')
     pcpu = aggregate(df_pod_cpu, 'pod_cpu')
@@ -4382,6 +5471,46 @@ def extract_instance_features(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, 
 
     feats = pd.concat([hcpu, hmem, pcpu, pmem], axis=1).fillna(0)
     feats.index.name = 'entity'
+    
+    # Add temporal features if enabled (recommended for 3+ months of data)
+    if include_temporal:
+        # Get temporal features for each metric
+        hcpu_temporal = aggregate_temporal(df_host_cpu, 'host_cpu')
+        hmem_temporal = aggregate_temporal(df_host_mem, 'host_mem')
+        pcpu_temporal = aggregate_temporal(df_pod_cpu, 'pod_cpu')
+        pmem_temporal = aggregate_temporal(df_pod_mem, 'pod_mem')
+        
+        # Add temporal features to dataframe
+        for entity in feats.index:
+            # Host CPU temporal features
+            if entity in hcpu_temporal:
+                for key, value in hcpu_temporal[entity].items():
+                    feats.loc[entity, key] = value
+            # Host Memory temporal features
+            if entity in hmem_temporal:
+                for key, value in hmem_temporal[entity].items():
+                    feats.loc[entity, key] = value
+            # Pod CPU temporal features
+            if entity in pcpu_temporal:
+                for key, value in pcpu_temporal[entity].items():
+                    feats.loc[entity, key] = value
+            # Pod Memory temporal features
+            if entity in pmem_temporal:
+                for key, value in pmem_temporal[entity].items():
+                    feats.loc[entity, key] = value
+        
+        # Add current time context features
+        feats['current_hour'] = now.hour
+        feats['current_day_of_week'] = now.dayofweek
+        feats['current_is_weekend'] = 1 if now.dayofweek >= 5 else 0
+        
+        # Fill any missing temporal features with overall averages
+        for col in feats.columns:
+            if col.endswith('_same_hour') or col.endswith('_same_dow') or col.endswith('_same_time_pattern'):
+                base_col = col.replace('_same_hour', '').replace('_same_dow', '').replace('_same_time_pattern', '')
+                overall_col = f'{base_col}_overall'
+                if overall_col in feats.columns:
+                    feats[col] = feats[col].fillna(feats[overall_col])
 
     raw_lookup = {}
     for df in (df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem):
@@ -4397,8 +5526,63 @@ def extract_instance_features(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, 
 
 def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
                         lookback_hours=LOOKBACK_HOURS, contamination=CONTAMINATION, forecast_mode=False,
-                        dump_csv_dir=None, enable_plots=True):
-    feats = extract_instance_features(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, lookback_hours)
+                        dump_csv_dir=None, enable_plots=True, enable_forecast_plots=None, use_temporal_features=None):
+    """
+    Classification model for anomaly detection using Isolation Forest.
+    
+    This function detects anomalous nodes by comparing their resource usage patterns
+    (host CPU/memory vs pod CPU/memory) to their cluster/group baseline. It uses
+    Isolation Forest for unsupervised anomaly detection with optional temporal awareness.
+    
+    Features:
+    - Cluster-aware detection: Compares nodes within the same Kubernetes cluster
+    - Temporal awareness: Accounts for daily/weekly patterns to reduce false positives
+    - Host pressure detection: Identifies nodes with high host usage but minimal pod usage
+    - Classification anomalies: Detects nodes with unusual host/pod resource patterns
+    
+    Args:
+        df_host_cpu: DataFrame with host CPU metrics (columns: timestamp, value, entity)
+        df_host_mem: DataFrame with host memory metrics (columns: timestamp, value, entity)
+        df_pod_cpu: DataFrame with pod CPU metrics (columns: timestamp, value, entity)
+        df_pod_mem: DataFrame with pod memory metrics (columns: timestamp, value, entity)
+        lookback_hours: Time window in hours for feature extraction (default: LOOKBACK_HOURS)
+        contamination: Expected fraction of anomalous nodes (default: CONTAMINATION, 0.12 = 12%)
+        forecast_mode: Boolean indicating forecast mode (affects plot generation)
+        dump_csv_dir: Optional directory to export feature datasets
+        enable_plots: Master flag to enable/disable plot generation
+        enable_forecast_plots: Optional boolean to override forecast plot generation
+        use_temporal_features: If True, uses seasonality-aware features (hour, day_of_week patterns).
+                              If None, auto-detects based on data availability (3+ months recommended).
+                              Recommended for production with 3+ months of training data.
+    
+    Returns:
+        tuple: (classification_anomalies_df, host_pressure_df)
+            - classification_anomalies_df: DataFrame of nodes with anomalous host/pod patterns
+            - host_pressure_df: DataFrame of nodes with high host usage but minimal pod usage
+    
+    Notes:
+        - Temporal features are automatically enabled when 3+ months of data is available
+        - Reduces false positives from normal weekly/daily patterns (batch jobs, weekend backups)
+        - Uses Isolation Forest for unsupervised learning (no labeled data required)
+    """
+    # Auto-detect if temporal features should be used
+    # Use temporal features if we have at least 3 months (90 days) of data
+    if use_temporal_features is None:
+        # Check if we have sufficient data for temporal patterns
+        min_timestamp = None
+        for df in [df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem]:
+            if not df.empty and 'timestamp' in df.columns:
+                df_min = pd.to_datetime(df['timestamp']).min()
+                if min_timestamp is None or df_min < min_timestamp:
+                    min_timestamp = df_min
+        if min_timestamp is not None:
+            days_of_data = (pd.Timestamp.now() - min_timestamp).days
+            use_temporal_features = days_of_data >= 90  # 3 months
+        else:
+            use_temporal_features = False
+    
+    feats = extract_instance_features(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, 
+                                     lookback_hours, include_temporal=use_temporal_features)
     
     # Identify clusters - this groups nodes by their Kubernetes cluster membership
     cluster_map = identify_clusters(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem, lookback_hours)
@@ -4458,7 +5642,26 @@ def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
         
         # Train IsolationForest for this cluster
         scaler = StandardScaler()
-        X = scaler.fit_transform(cluster_feats[['host_cpu','host_mem','pod_cpu','pod_mem']])
+        
+        # Select features based on whether temporal features are available
+        if use_temporal_features and any(col.endswith('_current_context') for col in cluster_feats.columns):
+            # Use temporal-aware features: compare to same time patterns
+            feature_cols = [
+                'host_cpu_current_context', 'host_mem_current_context',
+                'pod_cpu_current_context', 'pod_mem_current_context',
+                # Also include overall averages for baseline comparison
+                'host_cpu', 'host_mem', 'pod_cpu', 'pod_mem'
+            ]
+            # Filter to only columns that exist
+            feature_cols = [col for col in feature_cols if col in cluster_feats.columns]
+            if len(feature_cols) < 4:
+                # Fallback to basic features if temporal features incomplete
+                feature_cols = ['host_cpu','host_mem','pod_cpu','pod_mem']
+        else:
+            # Use basic features (simple averages)
+            feature_cols = ['host_cpu','host_mem','pod_cpu','pod_mem']
+        
+        X = scaler.fit_transform(cluster_feats[feature_cols])
         iso = IsolationForest(contamination=contamination, random_state=42)
         cluster_labels = iso.fit_predict(X)
         cluster_feats['anomaly'] = cluster_labels
@@ -4473,6 +5676,11 @@ def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
 
     print("\n" + "="*80)
     print("Building Classification (Anomaly) Model...")
+    if use_temporal_features:
+        print("  ✓ Temporal features enabled (seasonality-aware: hour, day-of-week patterns)")
+        print("    Comparing nodes to same-time historical patterns (recommended for 3+ months data)")
+    else:
+        print("  • Using basic features (simple averages over lookback window)")
     print("="*80)
     
     # Print cluster summary
@@ -4546,6 +5754,9 @@ def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
     else:
         print("\nNo anomalous nodes – host and pod usage aligned.")
 
+    if not MATPLOTLIB_AVAILABLE:
+        log_verbose("Matplotlib not available, skipping classification plot")
+        return
     plt.figure(figsize=(9,6))
     colors = ['red' if a==-1 else 'steelblue' for a in feats['anomaly']]
     plt.scatter(feats['host_mem'], feats['pod_mem'], c=colors, alpha=0.7)
@@ -4556,10 +5767,26 @@ def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
     plt.title('Classification: Host vs Pod – Red = non-K8s')
     plt.grid(alpha=0.3); plt.tight_layout()
     # Save plot only in forecast mode or when training, and if enable_plots is True
-    if enable_plots and (forecast_mode or FORCE_TRAINING_RUN):
+    # In forecast mode, this is a forecast plot, so respect enable_forecast_plots flag
+    if enable_forecast_plots is None:
+        # Default behavior: save in forecast mode or training mode
+        should_save = enable_plots and (forecast_mode or FORCE_TRAINING_RUN)
+    else:
+        # Respect the explicit flag
+        should_save = enable_forecast_plots
+    if should_save:
         plot_path = os.path.join(FORECAST_PLOTS_DIR, "classification_host_vs_pod.png")
-        plt.savefig(plot_path, dpi=180, bbox_inches='tight')
-    plt.close()
+        try:
+            plt.savefig(plot_path, dpi=180, bbox_inches='tight')
+            if os.path.exists(plot_path):
+                file_size = os.path.getsize(plot_path)
+                print(f"✓ Saved classification plot: {plot_path} ({file_size} bytes)")
+            else:
+                print(f"✗ Warning: Classification plot file not found after save: {plot_path}")
+        except Exception as e:
+            print(f"✗ Error saving classification plot to {plot_path}: {e}")
+    if MATPLOTLIB_AVAILABLE:
+        plt.close()
 
     host_pressure_df = report_host_only_pressure(feats, return_df=True)
     # Pass has_pod_metrics info to feats for host_pressure_df
@@ -4689,7 +5916,7 @@ def detect_golden_anomaly_signals(hours=1):
                 "detected_at": pd.Timestamp.now().strftime("%H:%M")
             })
 
-    # ←←← THIS IS THE FIX — SAFE EVEN WHEN EMPTY ←←←
+    # Handle empty anomalies list gracefully by returning empty DataFrame with proper schema
     if not anomalies:
         return pd.DataFrame(columns=["node", "signal", "severity", "detected_at"])
 
@@ -4703,17 +5930,66 @@ def detect_golden_anomaly_signals(hours=1):
 # ----------------------------------------------------------------------
 def _process_single_node_io_crisis(inst, group, name, thresholds, units, test_days, horizon_days, 
                                     force_retrain, retrain_targets_set, retrain_all, retrain_targets_canon,
-                                    manifest_snapshot, forecast_mode, dump_csv_dir, plot_dir, enable_plots, show_backtest):
+                                    manifest_snapshot, forecast_mode, dump_csv_dir, plot_dir, enable_plots, show_backtest,
+                                    enable_forecast_plots=None, enable_backtest_plots=None):
     """
-    Worker function to process a single node for I/O crisis prediction.
-    This function is designed to be called in parallel.
-    Returns: (result_dict, updated_model_dict, manifest_changed_bool) or None if skipped
+    Process a single node for I/O and Network crisis prediction.
+    
+    This worker function is designed for parallel execution and handles:
+    - I/O wait time (DISK_IO_WAIT) and Network transmit bandwidth (NET_TX_BW) forecasting
+    - Prophet-based crisis detection (predicts when metrics will exceed thresholds)
+    - Hybrid ETA calculation (combines linear trend and Prophet predictions)
+    - Model caching and selective retraining
+    - Forecast and backtest plot generation
+    
+    Args:
+        inst: Instance identifier (canonical or raw)
+        group: DataFrame with time series data for the node/signal
+        name: Signal name ('DISK_IO_WAIT' or 'NET_TX_BW')
+        thresholds: Dictionary mapping signal names to threshold values
+        units: Dictionary mapping signal names to unit types ('ratio' or 'bytes/sec')
+        test_days: Number of days to use for backtesting (default: 7)
+        horizon_days: Forecast horizon in days (default: 7)
+        force_retrain: Boolean to force full model retraining
+        retrain_targets_set: Set of node/signal keys to retrain
+        retrain_all: Boolean indicating if all models should be retrained
+        retrain_targets_canon: Dictionary mapping retrain targets to canonical identities
+        manifest_snapshot: Dictionary of cached models (for parallel workers)
+        forecast_mode: Boolean indicating forecast mode (minimal updates)
+        dump_csv_dir: Optional directory to export training datasets
+        plot_dir: Directory to save plot files
+        enable_plots: Master flag to enable/disable plot generation
+        show_backtest: Boolean to display backtest metrics
+        enable_forecast_plots: Optional boolean to override forecast plot generation
+        enable_backtest_plots: Optional boolean to override backtest plot generation
+    
+    Returns:
+        dict: Contains 'result' (crisis info), 'key' (manifest key), 'model' (Prophet model),
+              'needs_retrain' (boolean), or None if skipped
+    
+    Notes:
+        - Uses manifest-based storage with '_backtest' suffix to avoid conflicts
+        - Supports minimal updates in forecast mode (last 7 days only)
+        - Generates both forecast and backtest plots when enabled
+        - Thread-safe for parallel execution
+        - Crisis severity: CRITICAL (<3 days), WARNING (3-7 days), SOON (7-30 days), OK (>30 days)
     """
+    # Suppress warnings in parallel workers (must be done before any imports that generate warnings)
+    import warnings
+    import logging
+    # Suppress ALL warnings by default in worker processes
+    warnings.simplefilter("ignore")
+    try:
+        logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+        logging.getLogger("prophet").setLevel(logging.WARNING)
+    except:
+        pass
     try:
         node = canonical_node_label(inst, with_ip=True)
         entity = canonical_identity(inst)
         ts = group.set_index('timestamp')['value'].sort_index()
         if len(ts) < 100:
+            log_verbose(f"  Skipping {node} | {name}: insufficient data ({len(ts)} points, need 100+)")
             return None
         
         dump_label = f"io_crisis_{node}_{name}"
@@ -4724,6 +6000,7 @@ def _process_single_node_io_crisis(inst, group, name, thresholds, units, test_da
         test = ts[ts.index > test_cutoff]
         
         if len(train) < 50 or len(test) < 10:
+            log_verbose(f"  Skipping {node} | {name}: insufficient train/test data (train: {len(train)}, test: {len(test)}, need train>=50, test>=10)")
             return None
         
         current = ts.iloc[-1]
@@ -4821,6 +6098,70 @@ def _process_single_node_io_crisis(inst, group, name, thresholds, units, test_da
         
         severity = "CRITICAL" if hybrid_eta < 3 else "WARNING" if hybrid_eta < 7 else "SOON" if hybrid_eta < 30 else "OK"
         
+        # Generate plots if requested (same logic as sequential path)
+        # Save backtest plot if enable_backtest_plots is True, or if show_backtest is True, or if retraining
+        if enable_backtest_plots is not None:
+            should_save_backtest = enable_backtest_plots and enable_plots
+        else:
+            should_save_backtest = (needs_retrain or show_backtest) and enable_plots
+        
+        if should_save_backtest and MATPLOTLIB_AVAILABLE:
+            plt.figure(figsize=(14, 7))
+            plt.plot(train.index, train.values, label="Train Data", color="#1f77b4")
+            plt.plot(test.index, test.values, label="Test (Actual)", color="#2ca02c", linewidth=2.5)
+            plt.plot(forecast['ds'], forecast['yhat'], label="Forecast", color="#ff7f0e", linewidth=2)
+            plt.fill_between(forecast['ds'], forecast['yhat_lower'], forecast['yhat_upper'], alpha=0.2, color="#ff7f0e")
+            plt.axhline(threshold, color="red", linestyle="--", linewidth=2, label=f"Threshold ({threshold})")
+            test_cutoff = ts.index[-1] - pd.Timedelta(days=test_days)
+            plt.axvline(test_cutoff, color="gray", linestyle=":", alpha=0.7)
+            plt.title(f"{node} — {name.replace('_', ' ')}\n"
+                      f"MAE: {mae:.6f} | RMSE: {rmse:.6f} | Hybrid ETA: {hybrid_eta:.1f} days → {severity}")
+            plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
+            safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
+            plot_file = os.path.join(plot_dir, f"{safe_node}_{name.lower().replace(' ', '_')}_crisis_backtest.png")
+            plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+            if os.path.exists(plot_file):
+                file_size = os.path.getsize(plot_file)
+                print(f"✓ Saved backtest plot: {plot_file} ({file_size} bytes)")
+            plt.close()
+        
+        # Generate forecast plots in forecast mode OR in training mode (when enable_forecast_plots is True)
+        if enable_forecast_plots is not None:
+            # If enable_forecast_plots is explicitly set, use it (respect the explicit flag)
+            should_save_forecast = enable_forecast_plots
+        else:
+            # Fallback to default logic if not explicitly set
+            should_save_forecast = (forecast_mode and enable_plots) or (not forecast_mode and enable_plots and (needs_retrain or show_backtest))
+        
+        if should_save_forecast and MATPLOTLIB_AVAILABLE:
+            plt.figure(figsize=(14, 7))
+            # Plot last 24 hours of historical data
+            historical = ts.loc[ts.index >= (ts.index[-1] - pd.Timedelta(hours=24))]
+            if len(historical) > 0:
+                plt.plot(historical.index, historical.values, label="Historical Data", color="#1f77b4", linewidth=1.5)
+            # Plot forecast (future predictions only)
+            future_pred = forecast[forecast['ds'] > ts.index[-1]]
+            if not future_pred.empty:
+                # Limit to next 3 hours (180 minutes) for forecast plot
+                forecast_3h = future_pred.head(180)
+                plt.plot(forecast_3h['ds'], forecast_3h['yhat'], label="Forecast", color="#ff7f0e", linewidth=2)
+                plt.fill_between(forecast_3h['ds'], forecast_3h['yhat_lower'], forecast_3h['yhat_upper'], alpha=0.2, color="#ff7f0e")
+            plt.axhline(threshold, color="red", linestyle="--", linewidth=2, label=f"Threshold ({threshold})")
+            # Mark current time
+            plt.axvline(ts.index[-1], color="gray", linestyle=":", alpha=0.7, label="Now")
+            plt.title(f"{node} — {name.replace('_', ' ')} Forecast\n"
+                      f"Current: {current:,.6f} | Hybrid ETA: {hybrid_eta:.1f} days → {severity}\nForecast horizon: {horizon_days} days")
+            plt.xlabel('Time')
+            plt.ylabel('Value')
+            plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
+            safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
+            plot_file = os.path.join(plot_dir, f"{safe_node}_{name.lower().replace(' ', '_')}_crisis_forecast.png")
+            plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+            if os.path.exists(plot_file):
+                file_size = os.path.getsize(plot_file)
+                print(f"✓ Saved forecast plot: {plot_file} ({file_size} bytes)")
+            plt.close()
+        
         # Build result
         result = {
             "node": node,
@@ -4852,13 +6193,58 @@ def predict_io_and_network_crisis_with_backtest(
     show_backtest: bool = False,
     forecast_mode: bool = False,
     dump_csv_dir: str | None = None,
-    enable_plots: bool = True
+    enable_plots: bool = True,
+    enable_forecast_plots: bool = None,
+    enable_backtest_plots: bool = None
 ):
     """
-    FINAL PRODUCTION VERSION — NO MORE ERRORS
-    Disk I/O + Network crisis forecasting with proper backtesting & plots
-    Uses manifest for model storage (single file instead of per-node files)
+    Predict I/O and Network crises with comprehensive backtesting and visualization.
+    
+    This function provides crisis detection for disk I/O wait time and network transmit
+    bandwidth using Prophet-based forecasting. It predicts when metrics will exceed
+    thresholds (30% iowait, 120 MB/s network) and calculates time-to-crisis (ETA).
+    
+    Features:
+    - Manifest-based model storage: Single file storage for all node/signal combinations
+    - Lazy model loading: Models are loaded from cache if available, trained only when missing
+    - Selective retraining: Supports retraining specific nodes/signals without full retraining
+    - Hybrid ETA calculation: Combines linear trend and Prophet predictions for accuracy
+    - Comprehensive backtesting: MAE, RMSE, train/test split metrics
+    - Plot generation: Forecast and backtest visualizations
+    
+    Args:
+        horizon_days: Forecast horizon in days (default: 7)
+        test_days: Number of days to use for backtesting (default: 7)
+        plot_dir: Directory to save plot files (default: FORECAST_PLOTS_DIR)
+        force_retrain: Boolean to force full model retraining (default: FORCE_TRAINING_RUN)
+        manifest: Dictionary of cached models (loaded from io_net_models.pkl)
+        retrain_targets: Set of node/signal keys to retrain (e.g., {'host02:DISK_IO_WAIT'})
+        show_backtest: Boolean to display backtest metrics for all models
+        forecast_mode: Boolean indicating forecast mode (minimal updates vs full training)
+        dump_csv_dir: Optional directory to export training datasets for analysis
+        enable_plots: Master flag to enable/disable plot generation
+        enable_forecast_plots: Optional boolean to override forecast plot generation
+        enable_backtest_plots: Optional boolean to override backtest plot generation
+    
+    Returns:
+        tuple: (crisis_df, manifest, manifest_changed)
+            - crisis_df: DataFrame of predicted crises (ETA < 30 days to threshold)
+            - manifest: Updated model manifest dictionary
+            - manifest_changed: Boolean indicating if manifest was modified
+    
+    Notes:
+        - Supports parallel processing for large deployments (>10 nodes)
+        - Uses optimized Prophet settings for faster training (n_changepoints=10)
+        - Generates forecast and backtest plots when enabled
+        - Crisis severity: CRITICAL (<3 days), WARNING (3-7 days), SOON (7-30 days), OK (>30 days)
     """
+    # Set defaults for plot flags if not provided
+    # Only set defaults if explicitly None (not False) - False means explicitly disabled
+    if enable_forecast_plots is None:
+        enable_forecast_plots = enable_plots and (forecast_mode or (force_retrain if force_retrain is not None else FORCE_TRAINING_RUN))
+    if enable_backtest_plots is None:
+        enable_backtest_plots = enable_plots and (show_backtest or (force_retrain if force_retrain is not None else FORCE_TRAINING_RUN))
+    
     if plot_dir is None:
         plot_dir = FORECAST_PLOTS_DIR
     os.makedirs(plot_dir, exist_ok=True)
@@ -4897,6 +6283,16 @@ def predict_io_and_network_crisis_with_backtest(
 
         df = df_raw.copy()
         df['timestamp'] = pd.to_datetime(df['ts'], unit='s')
+        
+        # Apply alias resolution and canonicalization to match nodes correctly
+        # This ensures nodes with IP addresses (e.g., 192.168.10.81) are matched with DNS names (e.g., host01)
+        if 'instance' in df.columns:
+            # Add entity column with canonical identities for proper matching
+            df['entity'] = df['instance'].map(lambda x: canonical_identity(str(x)))
+            # Apply alias resolution: if entity has an alias, use the alias target
+            df['entity'] = df['entity'].map(lambda e: INSTANCE_ALIAS_MAP.get(e, e))
+            # Re-canonicalize after alias resolution
+            df['entity'] = df['entity'].map(lambda e: canonical_identity(str(e)) if isinstance(e, str) else e)
 
         processed_nodes = 0
         # Pre-compute retrain matching logic once (outside loop) for performance
@@ -4913,7 +6309,9 @@ def predict_io_and_network_crisis_with_backtest(
                     retrain_targets_canon[target] = canonical_identity(target)
         
         # Progress reporting for large node counts (reduces perceived slowness)
-        node_groups = list(df.groupby('instance'))
+        # Group by entity (canonical identity) instead of instance to handle IP vs DNS name differences
+        group_by_col = 'entity' if 'entity' in df.columns else 'instance'
+        node_groups = list(df.groupby(group_by_col))
         total_nodes = len(node_groups)
         show_progress = total_nodes > 20
         # If --parallel flag is set, bypass threshold and use parallel processing
@@ -4945,9 +6343,12 @@ def predict_io_and_network_crisis_with_backtest(
             manifest_snapshot = manifest.copy()  # Snapshot for parallel workers
             processed_results = Parallel(n_jobs=n_workers, verbose=0)(
                 delayed(_process_single_node_io_crisis)(
-                    inst, group, name, thresholds, units, test_days, horizon_days,
+                    # If grouping by entity, inst is the entity; get original instance from group if available
+                    group['instance'].iloc[0] if 'instance' in group.columns else inst,
+                    group, name, thresholds, units, test_days, horizon_days,
                     force_retrain, retrain_targets_set, retrain_all, retrain_targets_canon,
-                    manifest_snapshot, forecast_mode, dump_csv_dir, plot_dir, enable_plots, show_backtest
+                    manifest_snapshot, forecast_mode, dump_csv_dir, plot_dir, enable_plots, show_backtest,
+                    enable_forecast_plots, enable_backtest_plots
                 )
                 for inst, group in node_groups
             )
@@ -4972,286 +6373,406 @@ def predict_io_and_network_crisis_with_backtest(
             if use_parallel:
                 print()  # New line after progress indicator
                 successful_nodes = len([r for r in processed_results if r is not None])
+                skipped_nodes = total_nodes - successful_nodes
+                if skipped_nodes > 0:
+                    print(f"    ⚠ Note: {skipped_nodes} node(s) skipped due to insufficient data (use -v for details)")
                 print(f"    ✓ Parallel execution complete: {successful_nodes}/{total_nodes} nodes processed successfully")
         else:
             # Sequential processing (original code)
+            skipped_count = 0
             for idx, (inst, group) in enumerate(node_groups, 1):
                 if show_progress and idx % 10 == 0:
                     print(f"  Progress: {idx}/{total_nodes} nodes processed...", end='\r')
-                node = canonical_node_label(inst, with_ip=True)
-            entity = canonical_identity(inst)  # Canonical name for matching
-            ts = group.set_index('timestamp')['value'].sort_index()
-            if len(ts) < 100:
-                continue
-            dump_label = f"io_crisis_{node}_{name}"
-
-            # Train/test split
-            test_cutoff = ts.index[-1] - pd.Timedelta(days=test_days)
-            train = ts[ts.index <= test_cutoff]
-            test  = ts[ts.index > test_cutoff]
-
-            if len(train) < 50 or len(test) < 10:
-                continue
-
-            current = ts.iloc[-1]
-            threshold = thresholds[name]
-
-            # Linear 7d burst
-            train_last_7d = train.loc[train.index >= (train.index[-1] - pd.Timedelta(days=7))]
-            trend_7d = train_last_7d.diff().mean() * 1440
-            linear_eta = 9999.0
-            if trend_7d > 0:
-                remaining = threshold - current
-                divisor = trend_7d / 100 if units[name] == "ratio" else trend_7d
-                linear_eta_calc = remaining / divisor
-                # Ensure non-negative
-                linear_eta = max(0.0, linear_eta_calc)
-
-            # Prophet - use manifest (with _backtest suffix to avoid conflicts)
-            key = f"{build_io_net_key(entity, name)}_backtest"
-            
-            # OPTIMIZED: Fast path when no retraining needed
-            needs_retrain = force_retrain or retrain_all
-            if not needs_retrain and has_retrain_targets:
-                # Fast checks first (no DNS lookups)
-                entity_match = entity in retrain_targets_set
-                key_match = key in retrain_targets_set
-                instance_canon = canonical_identity(inst)
-                instance_match = instance_canon in retrain_targets_set
-                node_base = node.split('(')[0].strip() if '(' in node else node
-                node_base_canon = canonical_identity(node_base)
-                node_match = node_base_canon in retrain_targets_set
+                # If grouping by entity, get original instance from group if available
+                original_inst = group['instance'].iloc[0] if 'instance' in group.columns else inst
+                node = canonical_node_label(original_inst, with_ip=True)
+                entity = canonical_identity(inst)  # inst is now the entity (canonical identity)
+                ts = group.set_index('timestamp')['value'].sort_index()
+                # Verbose logging: node processing details
+                log_debug(f"  DEBUG: Processing {node} | {name}: {len(ts)} data points, force_retrain={force_retrain}")
                 
-                # Check alias map (fast, no DNS)
-                alias_match = False
-                if not (entity_match or key_match or instance_match or node_match):
-                    # Only check alias map if simple matches failed
-                    for target, target_canon in retrain_targets_canon.items():
-                        if target_canon == entity:
-                            alias_match = True
-                            break
-                        # Check alias map (cached, no DNS)
-                        if target_canon in INSTANCE_ALIAS_MAP:
-                            alias_value = INSTANCE_ALIAS_MAP[target_canon]
-                            if canonical_identity(alias_value) == entity:
-                                alias_match = True
-                                break
-                        # Check reverse alias map
-                        for k, v in INSTANCE_ALIAS_MAP.items():
-                            if canonical_identity(v) == entity and canonical_identity(k) == target_canon:
-                                alias_match = True
-                                break
-                        if alias_match:
-                            break
-                        # Check IP registry (fast, no DNS)
-                        target_ip = SOURCE_REGISTRY.get(target_canon) or CANON_SOURCE_MAP.get(target_canon)
-                        entity_ip = SOURCE_REGISTRY.get(entity) or CANON_SOURCE_MAP.get(entity)
-                        if target_ip and entity_ip and target_ip == entity_ip:
-                            alias_match = True
-                            break
+                # Check for cached model first - if it exists and we need plots, we can still generate plots
+                key = f"{build_io_net_key(entity, name)}_backtest"
+                has_cached_model = key in manifest and manifest[key].get('model') is not None
+                # In training mode, be more lenient with data requirements if we have cached models or if plots are needed
+                # Check if we're in training mode by checking force_retrain (which is set from FORCE_TRAINING_RUN at line 5484)
+                is_training_mode = force_retrain  # This is already set to FORCE_TRAINING_RUN if None at line 5484
+                # Check if plot flags are actually True (not just not None)
+                plots_enabled = (enable_forecast_plots if enable_forecast_plots is not None else False) or (enable_backtest_plots if enable_backtest_plots is not None else False)
+                can_generate_plots_from_cache = has_cached_model and plots_enabled
+                # In training mode OR when we need plots, lower the threshold for data requirements
+                should_relax_thresholds = is_training_mode or can_generate_plots_from_cache or plots_enabled
+                # In training mode, be very lenient - accept any data >= 1 point
+                min_data_points = 1 if should_relax_thresholds else 100
+                min_train_points = 1 if should_relax_thresholds else 50
+                min_test_points = 1 if should_relax_thresholds else 10
                 
-                # Only do expensive DNS lookups as last resort (and only if still no match)
-                if not alias_match and not (entity_match or key_match or instance_match or node_match):
-                    # DNS lookup only for remaining unmatched targets (expensive, do last)
-                    if '(' in node and ')' in node:
-                        node_ip = node.split('(')[1].split(')')[0].strip()
+                # Debug output
+                log_debug(f"  Node {node} | {name}: len(ts)={len(ts)}, is_training_mode={is_training_mode}, plots_enabled={plots_enabled}, should_relax={should_relax_thresholds}, min_data={min_data_points}")
+                
+                if len(ts) < min_data_points:
+                    if can_generate_plots_from_cache or is_training_mode:
+                        # Even with insufficient data, if we have a cached model or are in training mode, continue
+                        print(f"  → Processing {node} | {name} with {len(ts)} points (threshold: {min_data_points}) - {'using cached model' if can_generate_plots_from_cache else 'training mode'}")
+                        log_verbose(f"  → Insufficient data ({len(ts)} points, need {min_data_points}+), but {'using cached model' if can_generate_plots_from_cache else 'training mode'}: {key}")
+                        # Create minimal train/test for plotting purposes - accept any data >= 1 point
+                        if len(ts) >= 1:
+                            # Use all available data, split 80/20 if possible
+                            if len(ts) >= 2:
+                                split_idx = max(1, int(len(ts) * 0.8))
+                                train = ts.iloc[:split_idx]
+                                test = ts.iloc[split_idx:]
+                            else:
+                                train = ts
+                                test = ts.iloc[-1:] if len(ts) > 0 else ts
+                        else:
+                            skipped_count += 1
+                            log_verbose(f"  Skipping {node} | {name}: no data available")
+                            continue
+                    else:
+                        skipped_count += 1
+                        log_verbose(f"  Skipping {node} | {name}: insufficient data ({len(ts)} points, need {min_data_points}+)")
+                        continue
+                else:
+                    dump_label = f"io_crisis_{node}_{name}"
+
+                    # Train/test split
+                    test_cutoff = ts.index[-1] - pd.Timedelta(days=test_days)
+                    train = ts[ts.index <= test_cutoff]
+                    test  = ts[ts.index > test_cutoff]
+                    
+                    log_debug(f"  DEBUG: {node} | {name}: Train/test split - train={len(train)}, test={len(test)}, min_train={min_train_points}, min_test={min_test_points}")
+
+                    if len(train) < min_train_points or len(test) < min_test_points:
+                        if can_generate_plots_from_cache or is_training_mode:
+                            # Even with insufficient train/test, if we have a cached model or are in training mode, continue
+                            print(f"  → Processing {node} | {name} with insufficient train/test (train: {len(train)}, test: {len(test)}) - {'using cached model' if can_generate_plots_from_cache else 'training mode'}")
+                            log_verbose(f"  → Insufficient train/test data (train: {len(train)}, test: {len(test)}), but {'using cached model' if can_generate_plots_from_cache else 'training mode'}: {key}")
+                            # Use available data for plotting - adjust split if needed
+                            if len(train) < min_train_points:
+                                # Use 80% for train if possible, otherwise use what we have
+                                if len(ts) >= 2:
+                                    split_idx = max(1, int(len(ts) * 0.8))
+                                    train = ts.iloc[:split_idx]
+                                    test = ts.iloc[split_idx:]
+                                else:
+                                    train = ts
+                                    test = ts.iloc[-1:] if len(ts) > 0 else ts
+                            if len(test) < 1:
+                                test = ts.iloc[-min(1, len(ts)):] if len(ts) > 0 else ts.iloc[-1:]
+                        else:
+                            skipped_count += 1
+                            log_verbose(f"  Skipping {node} | {name}: insufficient train/test data (train: {len(train)}, test: {len(test)}, need train>={min_train_points}, test>={min_test_points})")
+                            continue
+
+                current = ts.iloc[-1]
+                threshold = thresholds[name]
+                
+                log_debug(f"  DEBUG: {node} | {name}: After train/test split, setting current and threshold")
+                log_debug(f"  DEBUG: {node} | {name}: train is defined={train is not None if 'train' in locals() else False}, len(train)={len(train) if 'train' in locals() and train is not None else 'N/A'}")
+
+                # Linear 7d burst
+                try:
+                    train_last_7d = train.loc[train.index >= (train.index[-1] - pd.Timedelta(days=7))]
+                    
+                    log_debug(f"  DEBUG: {node} | {name}: After linear 7d burst calculation, train_last_7d={len(train_last_7d)} points")
+                    trend_7d = train_last_7d.diff().mean() * 1440
+                except Exception as e:
+                    log_debug(f"  DEBUG: {node} | {name}: Exception in linear 7d burst calculation: {e}")
+                    trend_7d = 0.0
+                    train_last_7d = train.iloc[-7*24*6:] if len(train) >= 7*24*6 else train
+                
+                linear_eta = 9999.0
+                if trend_7d > 0:
+                    remaining = threshold - current
+                    divisor = trend_7d / 100 if units[name] == "ratio" else trend_7d
+                    linear_eta_calc = remaining / divisor
+                    # Ensure non-negative
+                    linear_eta = max(0.0, linear_eta_calc)
+
+                # Prophet - use manifest (with _backtest suffix to avoid conflicts)
+                key = f"{build_io_net_key(entity, name)}_backtest"
+                
+                log_debug(f"  DEBUG: {node} | {name}: Built key={key}, about to check needs_retrain")
+                
+                # OPTIMIZED: Fast path when no retraining needed
+                # In training mode, always retrain to ensure models exist for all nodes
+                needs_retrain = force_retrain or retrain_all
+                # Verbose logging: retrain status for all nodes in training mode
+                log_debug(f"  DEBUG: {node} | {name}: needs_retrain={needs_retrain}, force_retrain={force_retrain}, key={key}, key_in_manifest={key in manifest}, has_retrain_targets={has_retrain_targets}")
+                # Only check retrain targets if we're not already forcing retrain (training mode)
+                if not needs_retrain and has_retrain_targets:
+                    # Fast checks first (no DNS lookups)
+                    entity_match = entity in retrain_targets_set
+                    key_match = key in retrain_targets_set
+                    instance_canon = canonical_identity(inst)
+                    instance_match = instance_canon in retrain_targets_set
+                    node_base = node.split('(')[0].strip() if '(' in node else node
+                    node_base_canon = canonical_identity(node_base)
+                    node_match = node_base_canon in retrain_targets_set
+                    
+                    # Check alias map (fast, no DNS)
+                    alias_match = False
+                    if not (entity_match or key_match or instance_match or node_match):
+                        # Only check alias map if simple matches failed
                         for target, target_canon in retrain_targets_canon.items():
-                            if looks_like_hostname(target):
-                                target_variants = [target]
-                                for domain in DNS_DOMAIN_SUFFIXES:
-                                    if domain and not target.endswith(domain):
-                                        target_variants.append(f"{target}{domain}")
-                                for target_var in target_variants:
-                                    try:
-                                        target_resolved = socket.gethostbyname(target_var)
-                                        if target_resolved == node_ip:
-                                            alias_match = True
-                                            log_verbose(f"   DNS match: {target_var} → {target_resolved} == {node_ip}")
-                                            break
-                                    except:
-                                        pass
-                                    if alias_match:
-                                        break
+                            if target_canon == entity:
+                                alias_match = True
+                                break
+                            # Check alias map (cached, no DNS)
+                            if target_canon in INSTANCE_ALIAS_MAP:
+                                alias_value = INSTANCE_ALIAS_MAP[target_canon]
+                                if canonical_identity(alias_value) == entity:
+                                    alias_match = True
+                                    break
+                            # Check reverse alias map
+                            for k, v in INSTANCE_ALIAS_MAP.items():
+                                if canonical_identity(v) == entity and canonical_identity(k) == target_canon:
+                                    alias_match = True
+                                    break
                             if alias_match:
                                 break
+                            # Check IP registry (fast, no DNS)
+                            target_ip = SOURCE_REGISTRY.get(target_canon) or CANON_SOURCE_MAP.get(target_canon)
+                            entity_ip = SOURCE_REGISTRY.get(entity) or CANON_SOURCE_MAP.get(entity)
+                            if target_ip and entity_ip and target_ip == entity_ip:
+                                alias_match = True
+                                break
+                    
+                    # Only do expensive DNS lookups as last resort (and only if still no match)
+                    if not alias_match and not (entity_match or key_match or instance_match or node_match):
+                        # DNS lookup only for remaining unmatched targets (expensive, do last)
+                        if '(' in node and ')' in node:
+                            node_ip = node.split('(')[1].split(')')[0].strip()
+                            for target, target_canon in retrain_targets_canon.items():
+                                if looks_like_hostname(target):
+                                    target_variants = [target]
+                                    for domain in DNS_DOMAIN_SUFFIXES:
+                                        if domain and not target.endswith(domain):
+                                            target_variants.append(f"{target}{domain}")
+                                    for target_var in target_variants:
+                                        try:
+                                            target_resolved = socket.gethostbyname(target_var)
+                                            if target_resolved == node_ip:
+                                                alias_match = True
+                                                log_verbose(f"   DNS match: {target_var} → {target_resolved} == {node_ip}")
+                                                break
+                                        except:
+                                            pass
+                                        if alias_match:
+                                            break
+                                if alias_match:
+                                    break
+                    
+                    # Only set needs_retrain if we're not already forcing retrain (training mode)
+                    # In training mode (force_retrain=True), we always retrain, so don't override it
+                    if not force_retrain:
+                        needs_retrain = entity_match or key_match or instance_match or node_match or alias_match
                 
-                needs_retrain = entity_match or key_match or instance_match or node_match or alias_match
-            
-            if not needs_retrain and key in manifest:
-                m = manifest[key].get('model')
-                if m is not None:
-                    log_verbose(f"  → Loaded model from manifest: {key}")
-                    # MINIMAL UPDATE: Use recent data only (last 7 days) for forecast mode
-                    # This incorporates latest trends while preserving learned patterns
-                    # Minimal updates are required in --forecast, --disk-retrain, and --io-net-retrain modes
-                    if forecast_mode:
+                if not needs_retrain and key in manifest:
+                    log_debug(f"  DEBUG: {node} | {name}: WARNING - not needs_retrain but key in manifest (should not happen in training mode!)")
+                    m = manifest[key].get('model')
+                    if m is not None:
+                        log_verbose(f"  → Loaded model from manifest: {key}")
+                        # MINIMAL UPDATE: Use recent data only (last 7 days) for forecast mode
                         # This incorporates latest trends while preserving learned patterns
-                        # train is a Series with timestamp index, so use last('7D')
+                        # Minimal updates are required in --forecast, --disk-retrain, and --io-net-retrain modes
+                        # In training mode with enable_forecast_plots, also update to generate fresh plots
+                        should_update_for_plots = not forecast_mode and enable_forecast_plots if enable_forecast_plots is not None else False
+                        if forecast_mode or should_update_for_plots:
+                            # This incorporates latest trends while preserving learned patterns
+                            # train is a Series with timestamp index, so use last('7D')
+                            recent_train = train.loc[train.index >= (train.index[-1] - pd.Timedelta(days=7))] if len(train) > 7*24*6 else train
+                            if len(recent_train) >= 50:  # Only update if we have enough recent data
+                                pdf = recent_train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
+                                # OPTIMIZATION: Use faster Prophet settings for minimal updates
+                                # Use fewer changepoints and simpler seasonality for speed
+                                m_updated = Prophet(
+                                    changepoint_prior_scale=0.2,
+                                    daily_seasonality=True,
+                                    weekly_seasonality=True,
+                                    n_changepoints=10  # Reduce changepoints from default 25 for faster fitting
+                                )
+                                m_updated.fit(pdf)
+                                m = m_updated  # Use updated model for forecasting
+                                manifest[key] = {'model': m}  # Save updated model to manifest
+                                manifest_changed = True
+                                log_verbose(f"  → Minimal update applied (recent 7 days): {key}")
+                    else:
+                        needs_retrain = True
+                
+                if needs_retrain or key not in manifest:
+                    log_debug(f"  DEBUG: {node} | {name}: Entering training block - needs_retrain={needs_retrain}, key_in_manifest={key in manifest}")
+                    # For retraining: use minimal update if model exists, full training if first-time
+                    if needs_retrain and key in manifest:
+                        log_debug(f"  DEBUG: {node} | {name}: Retraining cached model (minimal update)")
+                        # Minimal update: use recent data (last 7 days) to incorporate latest trends
                         recent_train = train.loc[train.index >= (train.index[-1] - pd.Timedelta(days=7))] if len(train) > 7*24*6 else train
-                        if len(recent_train) >= 50:  # Only update if we have enough recent data
-                            pdf = recent_train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
-                            # OPTIMIZATION: Use faster Prophet settings for minimal updates
-                            # Use fewer changepoints and simpler seasonality for speed
-                            m_updated = Prophet(
-                                changepoint_prior_scale=0.2,
-                                daily_seasonality=True,
-                                weekly_seasonality=True,
-                                n_changepoints=10  # Reduce changepoints from default 25 for faster fitting
-                            )
-                            m_updated.fit(pdf)
-                            m = m_updated  # Use updated model for forecasting
-                            manifest[key] = {'model': m}  # Save updated model to manifest
-                            manifest_changed = True
-                            log_verbose(f"  → Minimal update applied (recent 7 days): {key}")
-                else:
-                    needs_retrain = True
-            
-            if needs_retrain or key not in manifest:
-                # For retraining: use minimal update if model exists, full training if first-time
-                if needs_retrain and key in manifest:
-                    # Minimal update: use recent data (last 7 days) to incorporate latest trends
-                    recent_train = train.loc[train.index >= (train.index[-1] - pd.Timedelta(days=7))] if len(train) > 7*24*6 else train
-                    pdf = recent_train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
-                    # OPTIMIZATION: Use faster Prophet settings for minimal updates
-                    m = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, weekly_seasonality=True, n_changepoints=10)
-                    m.fit(pdf)
-                    # Add node and signal metadata to CSV
-                    if dump_csv_dir:
-                        pdf_for_csv = pdf.copy()
-                        pdf_for_csv['node'] = node
-                        pdf_for_csv['signal'] = name
-                        dump_dataframe_to_csv(pdf_for_csv, dump_csv_dir, dump_label)
+                        pdf = recent_train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
+                        # OPTIMIZATION: Use faster Prophet settings for minimal updates
+                        m = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, weekly_seasonality=True, n_changepoints=10)
+                        m.fit(pdf)
+                        # Add node and signal metadata to CSV
+                        if dump_csv_dir:
+                            pdf_for_csv = pdf.copy()
+                            pdf_for_csv['node'] = node
+                            pdf_for_csv['signal'] = name
+                            dump_dataframe_to_csv(pdf_for_csv, dump_csv_dir, dump_label)
+                        else:
+                            dump_dataframe_to_csv(pdf.copy(), dump_csv_dir, dump_label)
+                        log_verbose(f"  → Minimal update (recent 7 days): {key}")
                     else:
-                        dump_dataframe_to_csv(pdf.copy(), dump_csv_dir, dump_label)
-                    log_verbose(f"  → Minimal update (recent 7 days): {key}")
-                else:
-                    # First-time training: use all data to learn patterns
-                    pdf = train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
-                    # OPTIMIZATION: Use faster Prophet settings for first-time training
-                    m = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, weekly_seasonality=True, n_changepoints=15)
-                    m.fit(pdf)
-                    manifest[key] = {'model': m}
-                    manifest_changed = True
-                    log_verbose(f"  → Trained & saved to manifest: {key}")
-                    # Add node and signal metadata to CSV
-                    if dump_csv_dir:
-                        pdf_for_csv = pdf.copy()
-                        pdf_for_csv['node'] = node
-                        pdf_for_csv['signal'] = name
-                        dump_dataframe_to_csv(pdf_for_csv, dump_csv_dir, dump_label)
-                    else:
-                        dump_dataframe_to_csv(pdf.copy(), dump_csv_dir, dump_label)
-            elif m is None:
-                continue
+                        # First-time training: use all data to learn patterns
+                        if force_retrain:
+                            log_debug(f"  DEBUG: {node} | {name}: First-time training (no cached model)")
+                        pdf = train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
+                        # OPTIMIZATION: Use faster Prophet settings for first-time training
+                        m = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, weekly_seasonality=True, n_changepoints=15)
+                        m.fit(pdf)
+                        manifest[key] = {'model': m}
+                        manifest_changed = True
+                        log_verbose(f"  → Trained & saved to manifest: {key}")
+                        # Add node and signal metadata to CSV
+                        if dump_csv_dir:
+                            pdf_for_csv = pdf.copy()
+                            pdf_for_csv['node'] = node
+                            pdf_for_csv['signal'] = name
+                            dump_dataframe_to_csv(pdf_for_csv, dump_csv_dir, dump_label)
+                        else:
+                            dump_dataframe_to_csv(pdf.copy(), dump_csv_dir, dump_label)
 
-            future = m.make_future_dataframe(periods=(test_days + horizon_days) * 1440, freq='min')
-            forecast = m.predict(future)
+                future = m.make_future_dataframe(periods=(test_days + horizon_days) * 1440, freq='min')
+                forecast = m.predict(future)
 
-            # Backtest
-            test_forecast = forecast.set_index('ds').reindex(test.index, method='nearest')
-            mae = mean_absolute_error(test, test_forecast['yhat'])
-            rmse = np.sqrt(mean_squared_error(test, test_forecast['yhat']))
+                # Backtest
+                test_forecast = forecast.set_index('ds').reindex(test.index, method='nearest')
+                mae = mean_absolute_error(test, test_forecast['yhat'])
+                rmse = np.sqrt(mean_squared_error(test, test_forecast['yhat']))
 
-            # Prophet ETA
-            future_pred = forecast[forecast['ds'] > ts.index[-1]]
-            crisis = future_pred[future_pred['yhat'] >= threshold]
-            prophet_eta_calc = (crisis.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400 if not crisis.empty else 9999.0
-            # Ensure non-negative
-            prophet_eta = max(0.0, prophet_eta_calc)
-
-            # Hybrid ETA - ensure non-negative
-            hybrid_eta = max(0.0, min(linear_eta, prophet_eta))
-
-            # Severity is always defined
-            if hybrid_eta < 3:
-                severity = "CRITICAL"
-            elif hybrid_eta < 7:
-                severity = "WARNING"
-            elif hybrid_eta < 30:
-                severity = "SOON"
-            else:
-                severity = "OK"
-
-            # OPTIMIZATION: Skip plot generation unless explicitly needed (plots are expensive)
-            # Save backtest plot when training/retraining or when show_backtest is True
-            if (needs_retrain or show_backtest) and enable_plots:
-                plt.figure(figsize=(14, 7))
-                plt.plot(train.index, train.values, label="Train Data", color="#1f77b4")
-                plt.plot(test.index, test.values, label="Test (Actual)", color="#2ca02c", linewidth=2.5)
-                plt.plot(forecast['ds'], forecast['yhat'], label="Forecast", color="#ff7f0e", linewidth=2)
-                plt.fill_between(forecast['ds'], forecast['yhat_lower'], forecast['yhat_upper'], alpha=0.2, color="#ff7f0e")
-                plt.axhline(threshold, color="red", linestyle="--", linewidth=2, label=f"Threshold ({threshold})")
-                plt.axvline(test_cutoff, color="gray", linestyle=":", alpha=0.7)
-                plt.title(f"{node} — {name.replace('_', ' ')}\n"
-                          f"MAE: {mae:.6f} | RMSE: {rmse:.6f} | Hybrid ETA: {hybrid_eta:.1f} days → {severity}")
-                plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
-                # Sanitize node name for filename
-                safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
-                plot_file = os.path.join(plot_dir, f"{safe_node}_{name.lower().replace(' ', '_')}_backtest.png")
-                plt.savefig(plot_file, dpi=180, bbox_inches='tight')
-                log_verbose(f"  → Plot saved: {plot_file}")
-                plt.close()
-            
-            # OPTIMIZATION: Skip forecast plots in forecast mode unless enable_plots is True
-            # Save forecast plot in forecast mode (showing future predictions, not backtest)
-            if forecast_mode and enable_plots:
-                plt.figure(figsize=(14, 7))
-                # Plot last 24 hours of historical data
-                historical = ts.loc[ts.index >= (ts.index[-1] - pd.Timedelta(hours=24))]
-                if len(historical) > 0:
-                    plt.plot(historical.index, historical.values, label="Historical Data", color="#1f77b4", linewidth=1.5)
-                # Plot forecast (future predictions only)
+                # Prophet ETA
                 future_pred = forecast[forecast['ds'] > ts.index[-1]]
-                if not future_pred.empty:
-                    # Limit to next 3 hours (180 minutes) for forecast plot
-                    forecast_3h = future_pred.head(180)
-                    plt.plot(forecast_3h['ds'], forecast_3h['yhat'], label="Forecast", color="#ff7f0e", linewidth=2)
-                    plt.fill_between(forecast_3h['ds'], forecast_3h['yhat_lower'], forecast_3h['yhat_upper'], alpha=0.2, color="#ff7f0e")
-                plt.axhline(threshold, color="red", linestyle="--", linewidth=2, label=f"Threshold ({threshold})")
-                # Mark current time
-                plt.axvline(ts.index[-1], color="gray", linestyle=":", alpha=0.7, label="Now")
-                plt.title(f"{node} — {name.replace('_', ' ')} Forecast\n"
-                          f"Current: {current:,.6f} | Hybrid ETA: {hybrid_eta:.1f} days → {severity}")
-                plt.xlabel('Time')
-                plt.ylabel('Value')
-                plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
-                # Sanitize node name for filename
-                safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
-                plot_file = os.path.join(plot_dir, f"{safe_node}_{name.lower().replace(' ', '_')}_forecast.png")
-                plt.savefig(plot_file, dpi=180, bbox_inches='tight')
-                log_verbose(f"  → Forecast plot saved: {plot_file}")
-                plt.close()
+                crisis = future_pred[future_pred['yhat'] >= threshold]
+                prophet_eta_calc = (crisis.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400 if not crisis.empty else 9999.0
+                # Ensure non-negative
+                prophet_eta = max(0.0, prophet_eta_calc)
 
-            if show_backtest or should_verbose():
-                print(f"\nBacktest complete → {node} | {name.replace('_', ' ')}")
-                print(f"  ├─ Train period     : {train.index[0].strftime('%Y-%m-%d')} → {train.index[-1].strftime('%Y-%m-%d')} ({len(train)} pts)")
-                print(f"  ├─ Test period      : {test.index[0].strftime('%Y-%m-%d')} → {test.index[-1].strftime('%Y-%m-%d')} ({len(test)} pts)")
-                print(f"  ├─ Current value    : {current:,.6f} → "
-                      f"{'{:6.2f}%'.format(current*100) if units[name]=='ratio' else f'{current/1e9:.3f} GB/s'}")
-                print(f"  ├─ Backtest MAE     : {mae:.6f}")
-                print(f"  ├─ Backtest RMSE    : {rmse:.6f}")
-                print(f"  ├─ Linear 7d ETA    : {linear_eta:6.1f} days")
-                print(f"  ├─ Prophet ETA      : {prophet_eta:6.1f} days")
-                print(f"  └─ HYBRID ETA       : {hybrid_eta:6.1f} days → {severity}")
+                # Hybrid ETA - ensure non-negative
+                hybrid_eta = max(0.0, min(linear_eta, prophet_eta))
 
-            # Only add to results if within 30 days
-            if hybrid_eta < 30:
-                results.append({
-                    "node": node,
-                    "signal": name.replace("_", " "),
-                    "current": f"{current*100:.2f}%" if units[name] == "ratio" else f"{current/1e9:.2f} GB/s",
-                    "mae": round(mae, 6),
-                    "hybrid_eta_days": round(max(0.0, hybrid_eta), 1),
-                    "severity": severity
-                })
+                # Severity is always defined
+                if hybrid_eta < 3:
+                    severity = "CRITICAL"
+                elif hybrid_eta < 7:
+                    severity = "WARNING"
+                elif hybrid_eta < 30:
+                    severity = "SOON"
+                else:
+                    severity = "OK"
 
-            processed_nodes += 1
+                # OPTIMIZATION: Skip plot generation unless explicitly needed (plots are expensive)
+                # Save backtest plot when training/retraining or when show_backtest is True or when enable_backtest_plots is True
+                # Save backtest plot if enable_backtest_plots is True, or if show_backtest is True, or if retraining
+                if enable_backtest_plots is not None:
+                    should_save_backtest = enable_backtest_plots and enable_plots
+                else:
+                    should_save_backtest = (needs_retrain or show_backtest) and enable_plots
+                if should_save_backtest and MATPLOTLIB_AVAILABLE:
+                    plt.figure(figsize=(14, 7))
+                    plt.plot(train.index, train.values, label="Train Data", color="#1f77b4")
+                    plt.plot(test.index, test.values, label="Test (Actual)", color="#2ca02c", linewidth=2.5)
+                    plt.plot(forecast['ds'], forecast['yhat'], label="Forecast", color="#ff7f0e", linewidth=2)
+                    plt.fill_between(forecast['ds'], forecast['yhat_lower'], forecast['yhat_upper'], alpha=0.2, color="#ff7f0e")
+                    plt.axhline(threshold, color="red", linestyle="--", linewidth=2, label=f"Threshold ({threshold})")
+                    plt.axvline(test_cutoff, color="gray", linestyle=":", alpha=0.7)
+                    plt.title(f"{node} — {name.replace('_', ' ')}\n"
+                              f"MAE: {mae:.6f} | RMSE: {rmse:.6f} | Hybrid ETA: {hybrid_eta:.1f} days → {severity}")
+                    plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
+                    # Sanitize node name for filename
+                    safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
+                    plot_file = os.path.join(plot_dir, f"{safe_node}_{name.lower().replace(' ', '_')}_crisis_backtest.png")
+                    plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                    if os.path.exists(plot_file):
+                        file_size = os.path.getsize(plot_file)
+                        print(f"✓ Saved backtest plot: {plot_file} ({file_size} bytes)")
+                    plt.close()
+                
+                # Generate forecast plots in forecast mode OR in training mode (when enable_forecast_plots is True)
+                # Save forecast plot in forecast mode or training mode (showing future predictions, not backtest)
+                # Use enable_forecast_plots flag if provided, otherwise use forecast_mode logic
+                if enable_forecast_plots is not None:
+                    # If enable_forecast_plots is explicitly set, use it (respect the explicit flag)
+                    should_save_forecast = enable_forecast_plots
+                else:
+                    # Fallback to default logic if not explicitly set
+                    should_save_forecast = (forecast_mode and enable_plots) or (not forecast_mode and enable_plots and (needs_retrain or show_backtest))
+                if should_save_forecast and MATPLOTLIB_AVAILABLE:
+                    plt.figure(figsize=(14, 7))
+                    # Plot last 24 hours of historical data
+                    historical = ts.loc[ts.index >= (ts.index[-1] - pd.Timedelta(hours=24))]
+                    if len(historical) > 0:
+                        plt.plot(historical.index, historical.values, label="Historical Data", color="#1f77b4", linewidth=1.5)
+                    # Plot forecast (future predictions only)
+                    future_pred = forecast[forecast['ds'] > ts.index[-1]]
+                    if not future_pred.empty:
+                        # Limit to next 3 hours (180 minutes) for forecast plot
+                        forecast_3h = future_pred.head(180)
+                        plt.plot(forecast_3h['ds'], forecast_3h['yhat'], label="Forecast", color="#ff7f0e", linewidth=2)
+                        plt.fill_between(forecast_3h['ds'], forecast_3h['yhat_lower'], forecast_3h['yhat_upper'], alpha=0.2, color="#ff7f0e")
+                    plt.axhline(threshold, color="red", linestyle="--", linewidth=2, label=f"Threshold ({threshold})")
+                    # Mark current time
+                    plt.axvline(ts.index[-1], color="gray", linestyle=":", alpha=0.7, label="Now")
+                    plt.title(f"{node} — {name.replace('_', ' ')} Forecast\n"
+                              f"Current: {current:,.6f} | Hybrid ETA: {hybrid_eta:.1f} days → {severity}\nForecast horizon: {horizon_days} days")
+                    plt.xlabel('Time')
+                    plt.ylabel('Value')
+                    plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
+                    # Sanitize node name for filename
+                    safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
+                    plot_file = os.path.join(plot_dir, f"{safe_node}_{name.lower().replace(' ', '_')}_crisis_forecast.png")
+                    plt.savefig(plot_file, dpi=180, bbox_inches='tight')
+                    if os.path.exists(plot_file):
+                        file_size = os.path.getsize(plot_file)
+                        print(f"✓ Saved forecast plot: {plot_file} ({file_size} bytes)")
+                    plt.close()
 
-        if show_progress:
-            print()  # New line after progress indicator
-        
-        summary = [r for r in results if r['signal'] == name.replace("_", " ")]
-        print(f"{name}: processed {processed_nodes} nodes, crises <30d: {len(summary)}")
+                if show_backtest or should_verbose():
+                    print(f"\nBacktest complete → {node} | {name.replace('_', ' ')}")
+                    print(f"  ├─ Train period     : {train.index[0].strftime('%Y-%m-%d')} → {train.index[-1].strftime('%Y-%m-%d')} ({len(train)} pts)")
+                    print(f"  ├─ Test period      : {test.index[0].strftime('%Y-%m-%d')} → {test.index[-1].strftime('%Y-%m-%d')} ({len(test)} pts)")
+                    print(f"  ├─ Current value    : {current:,.6f} → "
+                          f"{'{:6.2f}%'.format(current*100) if units[name]=='ratio' else f'{current/1e9:.3f} GB/s'}")
+                    print(f"  ├─ Backtest MAE     : {mae:.6f}")
+                    print(f"  ├─ Backtest RMSE    : {rmse:.6f}")
+                    print(f"  ├─ Linear 7d ETA    : {linear_eta:6.1f} days")
+                    print(f"  ├─ Prophet ETA      : {prophet_eta:6.1f} days")
+                    print(f"  └─ HYBRID ETA       : {hybrid_eta:6.1f} days → {severity}")
+
+                # Only add to results if within 30 days (for crisis detection)
+                # But in training mode, we still want to count the node as processed for plot generation
+                if hybrid_eta < 30:
+                    results.append({
+                        "node": node,
+                        "signal": name.replace("_", " "),
+                        "current": f"{current*100:.2f}%" if units[name] == "ratio" else f"{current/1e9:.2f} GB/s",
+                        "mae": round(mae, 6),
+                        "hybrid_eta_days": round(max(0.0, hybrid_eta), 1),
+                        "severity": severity
+                    })
+                
+                # Count node as processed if we generated plots or if it's in training mode
+                # This ensures all nodes are counted in training mode, not just those with crises
+                if is_training_mode or enable_forecast_plots or enable_backtest_plots or hybrid_eta < 30:
+                    processed_nodes += 1
+
+            if show_progress:
+                print()  # New line after progress indicator
+            
+            skipped_count = total_nodes - processed_nodes
+            if skipped_count > 0:
+                print(f"  ⚠ Note: {skipped_count} node(s) skipped due to insufficient data (use -v for details)")
+            
+            summary = [r for r in results if r['signal'] == name.replace("_", " ")]
+            print(f"{name}: processed {processed_nodes}/{total_nodes} nodes, crises <30d: {len(summary)}")
 
     results_df = pd.DataFrame(results) if results else pd.DataFrame(columns=["node","signal","current","mae","hybrid_eta_days","severity"])
     return results_df, manifest, manifest_changed
@@ -5325,22 +6846,73 @@ def format_anomaly_description(node, signal, current_val, current_str, mae_ensem
 
 def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_days, force_retrain, retrain_targets_set,
                                      retrain_all, retrain_targets_canon, manifest_snapshot, forecast_mode,
-                                     dump_csv_dir, plot_dir, enable_plots, show_backtest):
+                                     dump_csv_dir, plot_dir, enable_plots, show_backtest,
+                                     enable_forecast_plots=None, enable_backtest_plots=None):
     """
-    Worker function to process a single node for I/O and Network ensemble forecasting.
-    This function is designed to be called in parallel.
-    Returns: dict with crisis_result, anomaly_result, backtest_metrics, retrained_node, key, model, or None if skipped
+    Process a single node for I/O and Network ensemble forecasting and anomaly detection.
+    
+    This worker function is designed for parallel execution and handles:
+    - Full ensemble forecasting (Prophet + ARIMA + LSTM) for DISK_IO_WAIT and NET_TX_BW
+    - Crisis detection (predicts when metrics will exceed thresholds)
+    - Anomaly detection (statistical deviation analysis)
+    - Comprehensive backtesting with MAE, MAPE, and confidence levels
+    - Model caching and selective retraining
+    - Forecast and backtest plot generation
+    
+    Args:
+        instance: Instance identifier (canonical or raw)
+        group: DataFrame with time series data for the node/signal
+        res: Resource configuration dict with name, query, threshold, unit
+        test_days: Number of days to use for backtesting (default: 7)
+        horizon_days: Forecast horizon in days (default: 7)
+        force_retrain: Boolean to force full model retraining
+        retrain_targets_set: Set of node/signal keys to retrain
+        retrain_all: Boolean indicating if all models should be retrained
+        retrain_targets_canon: Dictionary mapping retrain targets to canonical identities
+        manifest_snapshot: Dictionary of cached models (for parallel workers)
+        forecast_mode: Boolean indicating forecast mode (minimal updates)
+        dump_csv_dir: Optional directory to export training datasets
+        plot_dir: Directory to save plot files
+        enable_plots: Master flag to enable/disable plot generation
+        show_backtest: Boolean to display backtest metrics
+        enable_forecast_plots: Optional boolean to override forecast plot generation
+        enable_backtest_plots: Optional boolean to override backtest plot generation
+    
+    Returns:
+        dict: Contains 'crisis_result' (crisis info), 'anomaly_result' (anomaly info),
+              'backtest_metrics' (MAE, MAPE, confidence), 'retrained_node' (node identifier),
+              'key' (manifest key), 'model' (ensemble model), 'needs_retrain' (boolean),
+              or None if skipped
+    
+    Notes:
+        - Uses manifest-based storage for efficient model caching
+        - Supports minimal updates in forecast mode (last 7 days only)
+        - Generates both forecast and backtest plots when enabled
+        - Thread-safe for parallel execution
+        - Ensemble prediction is simple average of Prophet, ARIMA, and LSTM
     """
+    # Suppress warnings in parallel workers (must be done before any imports that generate warnings)
+    import warnings
+    import logging
+    # Suppress ALL warnings by default in worker processes
+    warnings.simplefilter("ignore")
+    try:
+        logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+        logging.getLogger("prophet").setLevel(logging.WARNING)
+    except:
+        pass
     try:
         node = canonical_node_label(instance, with_ip=True)
         entity = canonical_identity(instance)
         ts = group.set_index('timestamp')['value'].sort_index()
         if len(ts) < 200:
+            log_verbose(f"  Skipping {node} | {res['name']}: insufficient data ({len(ts)} points, need 200+)")
             return None
         
         cutoff = ts.index[-1] - pd.Timedelta(days=test_days)
         train_raw = ts[ts.index <= cutoff]
         if len(train_raw) < 100:
+            log_verbose(f"  Skipping {node} | {res['name']}: insufficient training data ({len(train_raw)} points, need 100+)")
             return None
         
         current = ts.iloc[-1]
@@ -5389,17 +6961,20 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
                     recent_train_df = train_df_sorted[train_df_sorted['timestamp'] >= cutoff_time]
                     if len(recent_train_df) < 50:
                         recent_train_df = train_df_sorted.tail(min(len(train_df_sorted), 7*24*6))
+                    # Determine plot flags based on enable_forecast_plots and enable_backtest_plots
+                    should_save_forecast = enable_forecast_plots if enable_forecast_plots is not None else (enable_plots if forecast_mode else False)
+                    should_save_backtest = enable_backtest_plots if enable_backtest_plots is not None else False
                     forecast_result = build_ensemble_forecast_model(
                         df_cpu=recent_train_df,
                         df_mem=None,
-                        horizon_min=horizon_days * 24 * 60,
+                        horizon_min=int(horizon_days * 24 * 60),
                         model_path=None,
                         context={'node': node, 'signal': res['name']},
-                        save_forecast_plot=True,
-                        save_backtest_plot=False,
-                        print_backtest_metrics=False,
+                        save_forecast_plot=should_save_forecast,
+                        save_backtest_plot=should_save_backtest,
+                        print_backtest_metrics=show_backtest,  # Print backtest metrics when show_backtest
                         dump_csv_dir=dump_csv_dir,
-                        enable_plots=enable_plots
+                        enable_plots=should_save_forecast or should_save_backtest
                     )
                     if forecast_result is not None:
                         manifest_key_updated = True
@@ -5409,18 +6984,21 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
                     has_metrics = isinstance(forecast_result, tuple) and len(forecast_result) >= 3
                     if not has_metrics:
                         log_verbose(f"   Computing backtest metrics for cached model (display only, not saving)...")
+                        # Determine plot flags based on enable_forecast_plots and enable_backtest_plots
+                        should_save_forecast = enable_forecast_plots if enable_forecast_plots is not None else False
+                        should_save_backtest = enable_backtest_plots if enable_backtest_plots is not None else (enable_plots and show_backtest)
                         forecast_result = build_ensemble_forecast_model(
                             df_cpu=train_df,
                             df_mem=None,
-                            horizon_min=horizon_days * 24 * 60,
+                            horizon_min=int(horizon_days * 24 * 60),
                             model_path=None,
                             context={'node': node, 'signal': res['name']},
-                            save_forecast_plot=False,
-                            save_backtest_plot=False,
-                            print_backtest_metrics=False,
+                            save_forecast_plot=should_save_forecast,
+                            save_backtest_plot=should_save_backtest,
+                            print_backtest_metrics=show_backtest,  # Print backtest metrics when show_backtest
                             save_model=False,
                             dump_csv_dir=dump_csv_dir,
-                            enable_plots=enable_plots
+                            enable_plots=should_save_forecast or should_save_backtest
                         )
             else:
                 needs_retrain = True
@@ -5433,30 +7011,36 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
                 recent_train_df = train_df_sorted[train_df_sorted['timestamp'] >= cutoff_time]
                 if len(recent_train_df) < 50:
                     recent_train_df = train_df_sorted.tail(min(len(train_df_sorted), 7*24*6))
+                # Determine plot flags based on enable_forecast_plots and enable_backtest_plots
+                should_save_forecast = enable_forecast_plots if enable_forecast_plots is not None else enable_plots
+                should_save_backtest = enable_backtest_plots if enable_backtest_plots is not None else (enable_plots and show_backtest)
                 forecast_result = build_ensemble_forecast_model(
                     df_cpu=recent_train_df,
                     df_mem=None,
-                    horizon_min=horizon_days * 24 * 60,
+                        horizon_min=int(horizon_days * 24 * 60),
                     model_path=None,
                     context={'node': node, 'signal': res['name']},
-                    save_forecast_plot=False,
-                    save_backtest_plot=False,
-                    print_backtest_metrics=False,
+                    save_forecast_plot=should_save_forecast,
+                    save_backtest_plot=should_save_backtest,
+                    print_backtest_metrics=show_backtest,  # Print backtest metrics when show_backtest
                     dump_csv_dir=dump_csv_dir,
-                    enable_plots=enable_plots
+                    enable_plots=should_save_forecast or should_save_backtest
                 )
             else:
                 log_verbose(f"   No cached model → FULL TRAINING...")
+                # Determine plot flags based on enable_forecast_plots and enable_backtest_plots
+                should_save_forecast = enable_forecast_plots if enable_forecast_plots is not None else enable_plots
+                should_save_backtest = enable_backtest_plots if enable_backtest_plots is not None else (enable_plots and show_backtest)
                 forecast_result = build_ensemble_forecast_model(
                     df_cpu=train_df,
                     df_mem=None,
-                    horizon_min=horizon_days * 24 * 60,
+                        horizon_min=int(horizon_days * 24 * 60),
                     model_path=None,
                     context={'node': node, 'signal': res['name']},
-                    save_forecast_plot=False,
-                    save_backtest_plot=False,
-                    enable_plots=enable_plots,
-                    print_backtest_metrics=False,
+                    save_forecast_plot=should_save_forecast,
+                    save_backtest_plot=should_save_backtest,
+                    enable_plots=should_save_forecast or should_save_backtest,
+                    print_backtest_metrics=show_backtest,  # Print backtest metrics when show_backtest
                     dump_csv_dir=dump_csv_dir
                 )
             if forecast_result is not None:
@@ -5628,7 +7212,8 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
 
 def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forecast_plots", force_retrain: bool | None = None,
                                     manifest: dict | None = None, retrain_targets: set | None = None, show_backtest: bool = False,
-                                    forecast_mode: bool = False, dump_csv_dir: str | None = None, enable_plots: bool = True):
+                                    forecast_mode: bool = False, dump_csv_dir: str | None = None, enable_plots: bool = True,
+                                    enable_forecast_plots: bool = None, enable_backtest_plots: bool = None):
     """
     Disk I/O and Network ensemble forecasting using Prophet, ARIMA, and LSTM models.
     
@@ -5700,23 +7285,37 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
         df = df_raw.copy()
         df['timestamp'] = pd.to_datetime(df['ts'], unit='s')
         
-        # Collect nodes for summary
-        all_instances = df['instance'].unique()
-        for inst in all_instances:
-            node = canonical_node_label(inst, with_ip=True)
-            entity = canonical_identity(inst)
-            all_unique_nodes.add(node)
-            all_unique_entities.add(f"{entity} ({inst})")
+        # Apply alias resolution and canonicalization to match nodes correctly
+        # This ensures nodes with IP addresses (e.g., 192.168.10.81) are matched with DNS names (e.g., host01)
+        if 'instance' in df.columns:
+            # Add entity column with canonical identities for proper matching
+            df['entity'] = df['instance'].map(lambda x: canonical_identity(str(x)))
+            # Apply alias resolution: if entity has an alias, use the alias target
+            df['entity'] = df['entity'].map(lambda e: INSTANCE_ALIAS_MAP.get(e, e))
+            # Re-canonicalize after alias resolution
+            df['entity'] = df['entity'].map(lambda e: canonical_identity(str(e)) if isinstance(e, str) else e)
         
-        # Show all nodes found in this signal's data (for debugging retrain targets)
+        # Collect nodes for summary (use entity if available, otherwise instance)
+        group_col = 'entity' if 'entity' in df.columns else 'instance'
+        all_instances = df[group_col].unique()
+        for inst in all_instances:
+            # For display, try to get the original instance name if available
+            original_inst = df[df[group_col] == inst]['instance'].iloc[0] if 'instance' in df.columns and not df[df[group_col] == inst].empty else inst
+            node = canonical_node_label(original_inst, with_ip=True) if isinstance(original_inst, str) else canonical_node_label(str(inst), with_ip=True)
+            entity = canonical_identity(str(inst))
+            all_unique_nodes.add(node)
+            all_unique_entities.add(f"{entity} ({original_inst})")
+        
+        # Verbose logging: display all nodes found in signal data for retrain target matching
         if retrain_targets:
-            all_nodes = [canonical_node_label(inst, with_ip=True) for inst in all_instances]
-            all_entities = [canonical_identity(inst) for inst in all_instances]
+            all_nodes = [canonical_node_label(df[df[group_col] == inst]['instance'].iloc[0] if 'instance' in df.columns and not df[df[group_col] == inst].empty else inst, with_ip=True) for inst in all_instances]
+            all_entities = [canonical_identity(str(inst)) for inst in all_instances]
             log_verbose(f"  Found {len(all_instances)} nodes in {res['name']} data: {', '.join(all_nodes)}")
             log_verbose(f"  Entity names: {', '.join(all_entities)}")
 
         # Prepare for parallelization
-        node_groups = list(df.groupby('instance'))
+        # Group by entity (canonical identity) instead of instance to handle IP vs DNS name differences
+        node_groups = list(df.groupby(group_col))
         total_nodes = len(node_groups)
         # If --parallel flag is set, bypass threshold and use parallel processing
         # Otherwise, only parallelize if we have enough nodes to justify the overhead
@@ -5754,9 +7353,12 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
             manifest_snapshot = manifest.copy()  # Snapshot for parallel workers
             processed_results = Parallel(n_jobs=n_workers, verbose=0)(
                 delayed(_process_single_node_io_ensemble)(
-                    instance, group, res, test_days, horizon_days, force_retrain,
+                    # If grouping by entity, instance is the entity; get original instance from group if available
+                    group['instance'].iloc[0] if 'instance' in group.columns else instance,
+                    group, res, test_days, horizon_days, force_retrain,
                     retrain_targets_set, retrain_all, retrain_targets_canon, manifest_snapshot,
-                    forecast_mode, dump_csv_dir, plot_dir, enable_plots, show_backtest
+                    forecast_mode, dump_csv_dir, plot_dir, enable_plots, show_backtest,
+                    enable_forecast_plots, enable_backtest_plots
                 )
                 for instance, group in node_groups
             )
@@ -5789,417 +7391,491 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
             
             print()  # New line after progress indicator
             successful_nodes = len([r for r in processed_results if r is not None])
+            skipped_nodes = total_nodes - successful_nodes
+            if skipped_nodes > 0:
+                print(f"    ⚠ Note: {skipped_nodes} node(s) skipped due to insufficient data (use -v for details)")
             print(f"    ✓ Parallel execution complete: {successful_nodes}/{total_nodes} nodes processed successfully")
         else:
             # Sequential processing (original code)
+            skipped_count = 0
             for instance, group in node_groups:
-                node = canonical_node_label(instance, with_ip=True)
-            entity = canonical_identity(instance)  # Canonical name for matching
-            ts = group.set_index('timestamp')['value'].sort_index()
-            if len(ts) < 200:
-                log_verbose(f"   Skipping {node} | {res['name']}: insufficient data ({len(ts)} points)")
-                continue
+                # If grouping by entity, get original instance from group if available
+                original_inst = group['instance'].iloc[0] if 'instance' in group.columns else instance
+                node = canonical_node_label(original_inst, with_ip=True)
+                entity = canonical_identity(instance)  # instance is now the entity (canonical identity)
+                ts = group.set_index('timestamp')['value'].sort_index()
+                if len(ts) < 200:
+                    skipped_count += 1
+                    log_verbose(f"  Skipping {node} | {res['name']}: insufficient data ({len(ts)} points, need 200+)")
+                    continue
 
-            cutoff = ts.index[-1] - pd.Timedelta(days=test_days)
-            train_raw = ts[ts.index <= cutoff]
-            if len(train_raw) < 100:
-                continue
+                cutoff = ts.index[-1] - pd.Timedelta(days=test_days)
+                train_raw = ts[ts.index <= cutoff]
+                if len(train_raw) < 100:
+                    skipped_count += 1
+                    log_verbose(f"  Skipping {node} | {res['name']}: insufficient training data ({len(train_raw)} points, need 100+)")
+                    continue
 
-            current = ts.iloc[-1]
-            train_df = train_raw.reset_index()
-            train_df.columns = ['timestamp', 'value']
+                current = ts.iloc[-1]
+                train_df = train_raw.reset_index()
+                train_df.columns = ['timestamp', 'value']
 
-            key = f"{build_io_net_key(entity, res['name'])}_ensemble"
-            log_verbose(f"  Running ensemble forecast for {node} | {res['name']} ({len(train_df)} points)...")
+                key = f"{build_io_net_key(entity, res['name'])}_ensemble"
+                log_verbose(f"  Running ensemble forecast for {node} | {res['name']} ({len(train_df)} points)...")
 
-            # ———— MODEL CACHING ————
-            # Check if retraining is needed - match against entity, key, or any aliases
-            # Check for "all" flag first
-            needs_retrain = force_retrain or ('__RETRAIN_ALL__' in retrain_targets if retrain_targets else False)
-            if needs_retrain:
-                entity_match = key_match = instance_match = node_match = alias_match = False
-            else:
-                entity_match = entity in retrain_targets
-                key_match = key in retrain_targets
-                # Also check if instance (raw) matches after canonicalization
-                instance_canon = canonical_identity(instance)
-                instance_match = instance_canon in retrain_targets
-                # Check if node display name (without IP) matches
-                node_base = node.split('(')[0].strip() if '(' in node else node
-                node_base_canon = canonical_identity(node_base)
-                node_match = node_base_canon in retrain_targets
-                
-                # Check if any retrain target is an alias that maps to this entity
-                alias_match = False
-            for target in retrain_targets:
-                if '|' in target or '_' in target:
-                    continue  # Skip keys, only check node names
-                target_canon = canonical_identity(target)
-                # Direct match already checked above
-                if target_canon == entity:
-                    alias_match = True
-                    break
-                # Check if target maps to this entity via alias map
-                if target_canon in INSTANCE_ALIAS_MAP:
-                    alias_value = INSTANCE_ALIAS_MAP[target_canon]
-                    if canonical_identity(alias_value) == entity:
-                        alias_match = True
-                        break
-                # Check reverse: if entity is in alias map, does target match the key?
-                for k, v in INSTANCE_ALIAS_MAP.items():
-                    if canonical_identity(v) == entity and canonical_identity(k) == target_canon:
-                        alias_match = True
-                        break
-                if alias_match:
-                    break
-                # Check if both resolve to same IP in source registry
-                target_ip = SOURCE_REGISTRY.get(target_canon) or CANON_SOURCE_MAP.get(target_canon)
-                entity_ip = SOURCE_REGISTRY.get(entity) or CANON_SOURCE_MAP.get(entity)
-                if target_ip and entity_ip and target_ip == entity_ip:
-                    alias_match = True
-                    break
-                # Extract IP from node display string and check if target resolves to it
-                # Only attempt DNS if target looks like a hostname
-                if looks_like_hostname(target) and '(' in node and ')' in node:
-                    node_ip = node.split('(')[1].split(')')[0].strip()
-                    # Try to resolve target to IP (try with and without domain suffixes)
-                    target_variants = [target] + [f"{target}{d}" for d in DNS_DOMAIN_SUFFIXES if d and not target.endswith(d)]
-                    for target_var in target_variants:
-                        try:
-                            target_resolved = socket.gethostbyname(target_var)
-                            if target_resolved == node_ip:
-                                alias_match = True
-                                log_verbose(f"   DNS match: {target_var} → {target_resolved} == {node_ip}")
-                                break
-                        except Exception as e:
-                            log_verbose(f"   DNS resolution failed for {target_var}: {e}")
-                    if alias_match:
-                        break
-                
-                needs_retrain = entity_match or key_match or instance_match or node_match or alias_match
-            
-            if needs_retrain:
-                retrained_nodes.add(f"{node} ({entity})")
-                print(f"   ✓ Retraining {node} | {res['name']} (matched via: {'entity' if entity_match else ''} {'key' if key_match else ''} {'instance' if instance_match else ''} {'node' if node_match else ''} {'alias' if alias_match else ''})")
-                log_verbose(f"   Retraining requested for {node} | {res['name']} (entity: {entity}, matches: entity={entity_match}, key={key_match}, instance={instance_match}, node={node_match}, alias={alias_match})")
-            elif retrain_targets:
-                # Show why this node didn't match any retrain targets
-                node_targets = {t for t in retrain_targets if '|' not in t and '_' not in t}
-                if node_targets:
-                    log_verbose(f"   Skipping {node} | {res['name']} (entity: {entity})")
-                    for target in node_targets:
+                # ———— MODEL CACHING ————
+                # Check if retraining is needed - match against entity, key, or any aliases
+                # Check for "all" flag first
+                needs_retrain = force_retrain or ('__RETRAIN_ALL__' in retrain_targets if retrain_targets else False)
+                if needs_retrain:
+                    entity_match = key_match = instance_match = node_match = alias_match = False
+                else:
+                    entity_match = entity in retrain_targets
+                    key_match = key in retrain_targets
+                    # Also check if instance (raw) matches after canonicalization
+                    instance_canon = canonical_identity(instance)
+                    instance_match = instance_canon in retrain_targets
+                    # Check if node display name (without IP) matches
+                    node_base = node.split('(')[0].strip() if '(' in node else node
+                    node_base_canon = canonical_identity(node_base)
+                    node_match = node_base_canon in retrain_targets
+                    
+                    # Check if any retrain target is an alias that maps to this entity
+                    alias_match = False
+                    for target in retrain_targets:
+                        if '|' in target or '_' in target:
+                            continue  # Skip keys, only check node names
                         target_canon = canonical_identity(target)
-                        log_verbose(f"      Checking target '{target}' (canon: {target_canon}) vs entity '{entity}': match={target_canon == entity}")
-                        # Try DNS resolution for debugging
-                        if '(' in node and ')' in node:
+                        # Direct match already checked above
+                        if target_canon == entity:
+                            alias_match = True
+                            break
+                        # Check if target maps to this entity via alias map
+                        if target_canon in INSTANCE_ALIAS_MAP:
+                            alias_value = INSTANCE_ALIAS_MAP[target_canon]
+                            if canonical_identity(alias_value) == entity:
+                                alias_match = True
+                                break
+                        # Check reverse: if entity is in alias map, does target match the key?
+                        for k, v in INSTANCE_ALIAS_MAP.items():
+                            if canonical_identity(v) == entity and canonical_identity(k) == target_canon:
+                                alias_match = True
+                                break
+                        if alias_match:
+                            break
+                        # Check if both resolve to same IP in source registry
+                        target_ip = SOURCE_REGISTRY.get(target_canon) or CANON_SOURCE_MAP.get(target_canon)
+                        entity_ip = SOURCE_REGISTRY.get(entity) or CANON_SOURCE_MAP.get(entity)
+                        if target_ip and entity_ip and target_ip == entity_ip:
+                            alias_match = True
+                            break
+                        # Extract IP from node display string and check if target resolves to it
+                        # Only attempt DNS if target looks like a hostname
+                        if looks_like_hostname(target) and '(' in node and ')' in node:
                             node_ip = node.split('(')[1].split(')')[0].strip()
+                            # Try to resolve target to IP (try with and without domain suffixes)
                             target_variants = [target] + [f"{target}{d}" for d in DNS_DOMAIN_SUFFIXES if d and not target.endswith(d)]
                             for target_var in target_variants:
                                 try:
                                     target_resolved = socket.gethostbyname(target_var)
-                                    log_verbose(f"         DNS: {target_var} → {target_resolved}, node IP: {node_ip}, match={target_resolved == node_ip}")
+                                    if target_resolved == node_ip:
+                                        alias_match = True
+                                        log_verbose(f"   DNS match: {target_var} → {target_resolved} == {node_ip}")
+                                        break
                                 except Exception as e:
-                                    log_verbose(f"         DNS: {target_var} → failed: {e}")
-            
-            if not needs_retrain and key in manifest:
-                forecast_result = manifest[key].get('model')
-                if forecast_result is not None:
-                    log_verbose(f"   Loaded ENSEMBLE model from manifest: {key}")
-                    # MINIMAL UPDATE: Use recent data only (last 7 days) for forecast mode only
-                    if forecast_mode:
-                        # This incorporates latest trends while preserving learned patterns
-                        # train_df is DataFrame with 'timestamp' column, sort and get last 7 days
-                        train_df_sorted = train_df.sort_values('timestamp')
-                        cutoff_time = train_df_sorted['timestamp'].max() - pd.Timedelta(days=7)
-                        recent_train_df = train_df_sorted[train_df_sorted['timestamp'] >= cutoff_time]
-                        if len(recent_train_df) < 50:
-                            recent_train_df = train_df_sorted.tail(min(len(train_df_sorted), 7*24*6))  # Fallback: last N rows
+                                    log_verbose(f"   DNS resolution failed for {target_var}: {e}")
+                            if alias_match:
+                                break
+                    
+                    needs_retrain = entity_match or key_match or instance_match or node_match or alias_match
+                
+                if needs_retrain:
+                    retrained_nodes.add(f"{node} ({entity})")
+                    print(f"   ✓ Retraining {node} | {res['name']} (matched via: {'entity' if entity_match else ''} {'key' if key_match else ''} {'instance' if instance_match else ''} {'node' if node_match else ''} {'alias' if alias_match else ''})")
+                    log_verbose(f"   Retraining requested for {node} | {res['name']} (entity: {entity}, matches: entity={entity_match}, key={key_match}, instance={instance_match}, node={node_match}, alias={alias_match})")
+                elif retrain_targets:
+                    # Show why this node didn't match any retrain targets
+                    node_targets = {t for t in retrain_targets if '|' not in t and '_' not in t}
+                    if node_targets:
+                        log_verbose(f"   Skipping {node} | {res['name']} (entity: {entity})")
+                        for target in node_targets:
+                            target_canon = canonical_identity(target)
+                            log_verbose(f"      Checking target '{target}' (canon: {target_canon}) vs entity '{entity}': match={target_canon == entity}")
+                            # Attempt DNS resolution for alias resolution
+                            if '(' in node and ')' in node:
+                                node_ip = node.split('(')[1].split(')')[0].strip()
+                                target_variants = [target] + [f"{target}{d}" for d in DNS_DOMAIN_SUFFIXES if d and not target.endswith(d)]
+                                for target_var in target_variants:
+                                    try:
+                                        target_resolved = socket.gethostbyname(target_var)
+                                        log_verbose(f"         DNS: {target_var} → {target_resolved}, node IP: {node_ip}, match={target_resolved == node_ip}")
+                                    except Exception as e:
+                                        log_verbose(f"         DNS: {target_var} → failed: {e}")
+                
+                if not needs_retrain and key in manifest:
+                    forecast_result = manifest[key].get('model')
+                    if forecast_result is not None:
+                        log_verbose(f"   Loaded ENSEMBLE model from manifest: {key}")
+                        # MINIMAL UPDATE: Use recent data only (last 7 days) for forecast mode only
+                        if forecast_mode:
+                            # This incorporates latest trends while preserving learned patterns
+                            # train_df is DataFrame with 'timestamp' column, sort and get last 7 days
+                            train_df_sorted = train_df.sort_values('timestamp')
+                            cutoff_time = train_df_sorted['timestamp'].max() - pd.Timedelta(days=7)
+                            recent_train_df = train_df_sorted[train_df_sorted['timestamp'] >= cutoff_time]
+                            if len(recent_train_df) < 50:
+                                recent_train_df = train_df_sorted.tail(min(len(train_df_sorted), 7*24*6))  # Fallback: last N rows
+                        # Determine plot flags based on enable_forecast_plots and enable_backtest_plots
+                        should_save_forecast = enable_forecast_plots if enable_forecast_plots is not None else (enable_plots if forecast_mode else False)
+                        should_save_backtest = enable_backtest_plots if enable_backtest_plots is not None else False
                         forecast_result = build_ensemble_forecast_model(
                             df_cpu=recent_train_df,
                             df_mem=None,
-                            horizon_min=horizon_days * 24 * 60,
+                            horizon_min=int(horizon_days * 24 * 60),
                             model_path=None,
                             context={'node': node, 'signal': res['name']},
-                            save_forecast_plot=True,  # Save forecast plots in forecast mode
-                            save_backtest_plot=False,  # Don't save backtest plots in forecast mode
+                            save_forecast_plot=should_save_forecast,
+                            save_backtest_plot=should_save_backtest,
                             print_backtest_metrics=False,  # Don't print backtest metrics in forecast mode
                             dump_csv_dir=dump_csv_dir,
-                            enable_plots=enable_plots
+                            enable_plots=should_save_forecast or should_save_backtest
                         )
                         if forecast_result is not None:
                             manifest[key] = {'model': forecast_result}
                             manifest_changed = True
                             log_verbose(f"   Minimal update applied (recent 7 days): {key}")
-                    # If show_backtest is true, compute metrics even for cached models
-                    # BUT don't update manifest - only generate plots
-                    if show_backtest:
-                        # Check if cached model has metrics
-                        has_metrics = isinstance(forecast_result, tuple) and len(forecast_result) >= 3
-                        if not has_metrics:
-                            # Compute metrics for cached model (for display only, don't save to manifest)
-                            log_verbose(f"   Computing backtest metrics for cached model (display only, not saving)...")
-                            forecast_result = build_ensemble_forecast_model(
-                                df_cpu=train_df,
-                                df_mem=None,
-                                horizon_min=horizon_days * 24 * 60,
-                                model_path=None,
-                                context={'node': node, 'signal': res['name']},
-                                save_forecast_plot=False,  # Don't save forecast plots when computing metrics for cached models
-                                save_backtest_plot=False,  # Don't save backtest plots when computing metrics for cached models
-                                print_backtest_metrics=False,  # Don't print backtest metrics when computing for cached models
-                                save_model=False,  # Don't save model files in show_backtest mode
-                                dump_csv_dir=dump_csv_dir,
-                                enable_plots=enable_plots
-                            )
-                            # Don't update manifest in show_backtest mode - only use for display
-                            # manifest[key] = {'model': forecast_result}
-                            # manifest_changed = True
-                else:
-                    needs_retrain = True
-            
-            if needs_retrain or key not in manifest:
-                if key in manifest:
-                    log_verbose(f"   Retraining cached model → MINIMAL UPDATE (recent 7 days)...")
-                    # Minimal update: use recent data (last 7 days) to incorporate latest trends
-                    train_df_sorted = train_df.sort_values('timestamp')
-                    cutoff_time = train_df_sorted['timestamp'].max() - pd.Timedelta(days=7)
-                    recent_train_df = train_df_sorted[train_df_sorted['timestamp'] >= cutoff_time]
-                    if len(recent_train_df) < 50:
-                        recent_train_df = train_df_sorted.tail(min(len(train_df_sorted), 7*24*6))  # Fallback: last N rows
-                    forecast_result = build_ensemble_forecast_model(
-                        df_cpu=recent_train_df,
-                        df_mem=None,
-                        horizon_min=horizon_days * 24 * 60,
-                        model_path=None,  # Don't save to individual file
-                        context={'node': node, 'signal': res['name']},
-                        save_forecast_plot=False,  # Don't save forecast plots when retraining in forecast mode
-                        save_backtest_plot=False,  # Don't save backtest plots when retraining in forecast mode
-                        print_backtest_metrics=False,  # Don't print backtest metrics when retraining in forecast mode
-                        dump_csv_dir=dump_csv_dir,
-                        enable_plots=enable_plots
-                    )
-                else:
-                    log_verbose(f"   No cached model → FULL TRAINING...")
-                    # First-time training: use all data to learn patterns
-                    forecast_result = build_ensemble_forecast_model(
-                        df_cpu=train_df,
-                        df_mem=None,
-                        horizon_min=horizon_days * 24 * 60,
-                        model_path=None,  # Don't save to individual file
-                        context={'node': node, 'signal': res['name']},
-                        save_forecast_plot=False,  # Don't save forecast plots when first-time training in forecast mode
-                        save_backtest_plot=False,  # Don't save backtest plots when first-time training in forecast mode
-                        enable_plots=enable_plots,
-                        print_backtest_metrics=False,  # Don't print backtest metrics when first-time training in forecast mode
-                        dump_csv_dir=dump_csv_dir
-                )
-                if forecast_result is not None:
-                    manifest[key] = {'model': forecast_result}
-                    manifest_changed = True
-                    log_verbose(f"   Saved ENSEMBLE to manifest → {key}")
-
-            if forecast_result is None:
-                continue
-
-            # ———— SAFE UNPACK (handles old and new cache) ————
-            # forecast_result should be a tuple from build_ensemble_forecast_model
-            if isinstance(forecast_result, tuple):
-                if len(forecast_result) == 3:
-                    _, forecast_df, metrics = forecast_result
-                else:  # old cache with only 2 items
-                    _, forecast_df = forecast_result
-                    metrics = {"mae_ensemble": 0.0}
-            else:
-                # Unexpected type - skip this node
-                log_verbose(f"   Warning: unexpected forecast_result type for {key}, skipping")
-                continue
-
-            future_threshold = forecast_df[forecast_df['yhat'] >= res["threshold"]]
-            eta_days = 9999.0
-            if not future_threshold.empty:
-                eta_days_calc = (future_threshold.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400
-                # Ensure non-negative
-                eta_days = max(0.0, eta_days_calc)
-
-            log_verbose(f"  Done → ETA: {eta_days:.1f} days | MAE: {metrics['mae_ensemble']:.6f}")
-            
-            # Collect metrics for display when show_backtest is true or when retraining (but not in forecast mode)
-            if (show_backtest or (needs_retrain and not forecast_mode)) and metrics:
-                backtest_metrics_list.append({
-                    'node': node,
-                    'signal': res['name'],
-                    'metrics': metrics
-                })
-
-            # ———— CRISIS ALERT ————
-            if eta_days < 30:
-                severity = "CRITICAL" if eta_days < 3 else "WARNING" if eta_days < 7 else "SOON"
-                crisis_results.append({
-                    "node": node,
-                    "signal": res["name"].replace("_", " "),
-                    "current": f"{current*100:.2f}%" if res["unit"] == "ratio" else f"{current/1e6:.1f} MB/s",
-                    "mae_ensemble": round(metrics.get('mae_ensemble', 0.0), 6),
-                    "hybrid_eta_days": round(max(0.0, eta_days), 1),
-                    "severity": severity
-                })
-
-            # ———— ANOMALY DETECTION ————
-            # Compare actual values vs ensemble forecast to detect statistical deviations
-            # Method: Check deviation of recent actual values from predicted patterns
-            # 
-            # IMPROVED LOGIC (to reduce false positives):
-            # - Uses BOTH absolute and percentage thresholds (avoids flagging tiny differences)
-            # - Only flags if value is ACTUALLY concerning (e.g., I/O wait > 5%, not just different)
-            # - Accounts for model confidence (low MAE = trust model more, be conservative)
-            # - For very small baselines (< 1% I/O, < 5MB/s network), uses absolute thresholds only
-            #   (percentage deviations are misleading when baseline is near zero)
-            #
-            mae_ensemble = metrics.get('mae_ensemble', 0.0)
-            
-            # Get recent actual values (last 24 hours) for anomaly detection
-            recent_window = pd.Timedelta(hours=24)
-            now = pd.Timestamp.now()
-            recent_start = now - recent_window
-            recent_actual = ts[ts.index >= recent_start]
-            
-            if len(recent_actual) >= 6:  # Need at least 6 data points (1 hour at 10min intervals)
-                # Get forecast values for the same time period (if available in forecast_df)
-                # forecast_df contains future predictions, so we need to find the model's prediction
-                # for the current/recent time period. We'll use the most recent forecast value as baseline.
+                        # If show_backtest is true, compute metrics even for cached models
+                        # BUT don't update manifest - only generate plots
+                        if show_backtest:
+                            # Check if cached model has metrics
+                            has_metrics = isinstance(forecast_result, tuple) and len(forecast_result) >= 3
+                            if not has_metrics:
+                                # Compute metrics for cached model (for display only, don't save to manifest)
+                                log_verbose(f"   Computing backtest metrics for cached model (display only, not saving)...")
+                                forecast_result = build_ensemble_forecast_model(
+                                    df_cpu=train_df,
+                                    df_mem=None,
+                                    horizon_min=int(horizon_days * 24 * 60),
+                                    model_path=None,
+                                    context={'node': node, 'signal': res['name']},
+                                    save_forecast_plot=False,  # Don't save forecast plots when computing metrics for cached models
+                                    save_backtest_plot=False,  # Don't save backtest plots when computing metrics for cached models
+                                    print_backtest_metrics=False,  # Don't print backtest metrics when computing for cached models
+                                    save_model=False,  # Don't save model files in show_backtest mode
+                                    dump_csv_dir=dump_csv_dir,
+                                    enable_plots=enable_plots
+                                )
+                                # Don't update manifest in show_backtest mode - only use for display
+                                # manifest[key] = {'model': forecast_result}
+                                # manifest_changed = True
+                    else:
+                        needs_retrain = True
                 
-                # Find the forecast value closest to now (or most recent forecast)
-                forecast_df_sorted = forecast_df.sort_values('ds')
-                if not forecast_df_sorted.empty:
-                    # Get the forecast value at or just before now
-                    past_forecasts = forecast_df_sorted[forecast_df_sorted['ds'] <= now]
-                    if not past_forecasts.empty:
-                        # Use the most recent past forecast as baseline
-                        baseline_forecast = past_forecasts.iloc[-1]['yhat']
-                    else:
-                        # If no past forecasts, use the earliest future forecast as proxy
-                        baseline_forecast = forecast_df_sorted.iloc[0]['yhat']
-                    
-                    # Calculate statistics on recent actual values
-                    recent_mean = recent_actual.mean()
-                    recent_std = recent_actual.std()
-                    recent_max = recent_actual.max()
-                    recent_min = recent_actual.min()
-                    
-                    # Calculate deviation metrics
-                    # 1. Current value deviation from baseline forecast (both absolute and percentage)
-                    current_deviation_abs = abs(current - baseline_forecast)
-                    current_deviation_pct = abs((current - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (current_deviation_abs if current != 0 else 0)
-                    
-                    # 2. Recent mean deviation from baseline
-                    mean_deviation_abs = abs(recent_mean - baseline_forecast)
-                    mean_deviation_pct = abs((recent_mean - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (mean_deviation_abs if recent_mean != 0 else 0)
-                    
-                    # 3. Check for sudden spikes/drops (recent max/min vs baseline)
-                    spike_deviation_abs = abs(recent_max - baseline_forecast)
-                    spike_deviation = abs((recent_max - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (spike_deviation_abs if recent_max != 0 else 0)
-                    drop_deviation_abs = abs(baseline_forecast - recent_min)
-                    drop_deviation = abs((baseline_forecast - recent_min) / baseline_forecast) if baseline_forecast != 0 else (drop_deviation_abs if recent_min != 0 else 0)
-                    
-                    # 4. Define meaningful thresholds to avoid false positives
-                    # For I/O wait (ratio): values < 1% are usually fine, > 5% is concerning
-                    # For network (bytes/sec): use percentage of threshold
-                    if res["unit"] == "ratio":
-                        min_abs_threshold = 0.01  # 1% - minimum absolute difference to care about
-                        mae_threshold = 0.05  # 5% for ratio signals
-                        concerning_threshold = 0.05  # 5% I/O wait is actually concerning
-                        baseline_too_small = baseline_forecast < 0.01  # If baseline < 1%, use absolute only
-                    else:
-                        min_abs_threshold = 5_000_000  # 5 MB/s - minimum absolute difference
-                        mae_threshold = res["threshold"] * 0.10  # 10% of threshold
-                        concerning_threshold = res["threshold"] * 0.30  # 30% of threshold is concerning
-                        baseline_too_small = baseline_forecast < 5_000_000  # If baseline < 5MB/s, use absolute only
-                    
-                    # 5. Model confidence check - if MAE is very low, model is accurate, be more conservative
-                    # If MAE is high, model is struggling, be more lenient (don't trust it as much)
-                    if res["unit"] == "ratio":
-                        mae_confidence_factor = 1.0 if mae_ensemble < 0.005 else (0.7 if mae_ensemble < 0.01 else 0.3)
-                    else:
-                        mae_confidence_factor = 1.0 if mae_ensemble < mae_threshold * 0.1 else (0.7 if mae_ensemble < mae_threshold * 0.3 else 0.3)
-                    
-                    # Anomaly detection logic - be conservative to avoid false positives
-                    # Strategy: Only flag if the value is ACTUALLY concerning, not just different
-                    
-                    # Check if current value is concerning (regardless of deviation)
-                    is_concerning_value = (
-                        (res["unit"] == "ratio" and current >= concerning_threshold) or
-                        (res["unit"] != "ratio" and current >= concerning_threshold)
-                    )
-                    
-                    # Check for significant absolute deviation
-                    has_significant_abs_diff = (
-                        current_deviation_abs >= min_abs_threshold or
-                        mean_deviation_abs >= min_abs_threshold
-                    )
-                    
-                    # For small baselines, only use absolute thresholds (percentage is misleading)
-                    # For larger baselines, use both absolute and percentage
-                    if baseline_too_small:
-                        # Small baseline: only check absolute difference AND if value is concerning
-                        is_anomaly = has_significant_abs_diff and is_concerning_value
-                    else:
-                        # Larger baseline: check both absolute and percentage deviation
-                        has_significant_pct_diff = (
-                            current_deviation_pct > 0.50 or  # 50% relative deviation
-                            mean_deviation_pct > 0.30        # 30% mean deviation
+                if needs_retrain or key not in manifest:
+                    if key in manifest:
+                        log_verbose(f"   Retraining cached model → MINIMAL UPDATE (recent 7 days)...")
+                        # Minimal update: use recent data (last 7 days) to incorporate latest trends
+                        train_df_sorted = train_df.sort_values('timestamp')
+                        cutoff_time = train_df_sorted['timestamp'].max() - pd.Timedelta(days=7)
+                        recent_train_df = train_df_sorted[train_df_sorted['timestamp'] >= cutoff_time]
+                        if len(recent_train_df) < 50:
+                            recent_train_df = train_df_sorted.tail(min(len(train_df_sorted), 7*24*6))  # Fallback: last N rows
+                        # Determine plot flags based on enable_forecast_plots and enable_backtest_plots
+                        should_save_forecast = enable_forecast_plots if enable_forecast_plots is not None else enable_plots
+                        should_save_backtest = enable_backtest_plots if enable_backtest_plots is not None else (enable_plots and show_backtest)
+                        forecast_result = build_ensemble_forecast_model(
+                            df_cpu=recent_train_df,
+                            df_mem=None,
+                            horizon_min=int(horizon_days * 24 * 60),
+                            model_path=None,  # Don't save to individual file
+                            context={'node': node, 'signal': res['name']},
+                            save_forecast_plot=should_save_forecast,
+                            save_backtest_plot=should_save_backtest,
+                            print_backtest_metrics=show_backtest,  # Print backtest metrics when show_backtest
+                            dump_csv_dir=dump_csv_dir,
+                            enable_plots=should_save_forecast or should_save_backtest
                         )
-                        # Anomaly if: (significant absolute + significant percentage) AND (concerning value OR low model confidence)
-                        is_anomaly = (
-                            has_significant_abs_diff and
-                            has_significant_pct_diff and
-                            (is_concerning_value or mae_confidence_factor < 0.5 or mae_ensemble > mae_threshold)
+                    else:
+                        log_verbose(f"   No cached model → FULL TRAINING...")
+                        # First-time training: use all data to learn patterns
+                        # Determine plot flags based on enable_forecast_plots and enable_backtest_plots
+                        should_save_forecast = enable_forecast_plots if enable_forecast_plots is not None else enable_plots
+                        should_save_backtest = enable_backtest_plots if enable_backtest_plots is not None else (enable_plots and show_backtest)
+                        forecast_result = build_ensemble_forecast_model(
+                            df_cpu=train_df,
+                            df_mem=None,
+                            horizon_min=int(horizon_days * 24 * 60),
+                            model_path=None,  # Don't save to individual file
+                            context={'node': node, 'signal': res['name']},
+                            save_forecast_plot=should_save_forecast,
+                            save_backtest_plot=should_save_backtest,
+                            enable_plots=should_save_forecast or should_save_backtest,
+                            print_backtest_metrics=show_backtest,  # Print backtest metrics when show_backtest
+                            dump_csv_dir=dump_csv_dir
                         )
+                    if forecast_result is not None:
+                        manifest[key] = {'model': forecast_result}
+                        manifest_changed = True
+                        log_verbose(f"   Saved ENSEMBLE to manifest → {key}")
+
+                if forecast_result is None:
+                    continue
+
+                # ———— SAFE UNPACK (handles old and new cache) ————
+                # forecast_result should be a tuple from build_ensemble_forecast_model
+                if isinstance(forecast_result, tuple):
+                    if len(forecast_result) == 3:
+                        _, forecast_df, metrics = forecast_result
+                    else:  # old cache with only 2 items
+                        _, forecast_df = forecast_result
+                        metrics = {"mae_ensemble": 0.0}
+                else:
+                    # Unexpected type - skip this node
+                    log_verbose(f"   Warning: unexpected forecast_result type for {key}, skipping")
+                    continue
+
+                future_threshold = forecast_df[forecast_df['yhat'] >= res["threshold"]]
+                eta_days = 9999.0
+                if not future_threshold.empty:
+                    eta_days_calc = (future_threshold.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400
+                    # Ensure non-negative
+                    eta_days = max(0.0, eta_days_calc)
+
+                log_verbose(f"  Done → ETA: {eta_days:.1f} days | MAE: {metrics['mae_ensemble']:.6f}")
+                
+                # Collect metrics for display when show_backtest is true or when retraining (but not in forecast mode)
+                if (show_backtest or (needs_retrain and not forecast_mode)) and metrics:
+                    backtest_metrics_list.append({
+                        'node': node,
+                        'signal': res['name'],
+                        'metrics': metrics
+                    })
+
+                # ———— CRISIS ALERT ————
+                if eta_days < 30:
+                    severity = "CRITICAL" if eta_days < 3 else "WARNING" if eta_days < 7 else "SOON"
+                    crisis_results.append({
+                        "node": node,
+                        "signal": res["name"].replace("_", " "),
+                        "current": f"{current*100:.2f}%" if res["unit"] == "ratio" else f"{current/1e6:.1f} MB/s",
+                        "mae_ensemble": round(metrics.get('mae_ensemble', 0.0), 6),
+                        "hybrid_eta_days": round(max(0.0, eta_days), 1),
+                        "severity": severity
+                    })
+
+                # ———— ANOMALY DETECTION (TEMPORAL-AWARE) ————
+                # Compare actual values vs ensemble forecast to detect statistical deviations
+                # Method: Check deviation of recent actual values from predicted patterns
+                # 
+                # TEMPORAL-AWARE IMPROVEMENTS:
+                # - Compares current values to same-time historical patterns (hour, day-of-week)
+                # - Accounts for seasonality (e.g., weekend batch jobs, Monday morning spikes)
+                # - Uses BOTH absolute and percentage thresholds (avoids flagging tiny differences)
+                # - Only flags if value is ACTUALLY concerning (e.g., I/O wait > 5%, not just different)
+                # - Accounts for model confidence (low MAE = trust model more, be conservative)
+                # - For very small baselines (< 1% I/O, < 5MB/s network), uses absolute thresholds only
+                #   (percentage deviations are misleading when baseline is near zero)
+                #
+                mae_ensemble = metrics.get('mae_ensemble', 0.0)
+                
+                # Get recent actual values (last 24 hours) for anomaly detection
+                recent_window = pd.Timedelta(hours=24)
+                now = pd.Timestamp.now()
+                recent_start = now - recent_window
+                recent_actual = ts[ts.index >= recent_start]
+                
+                if len(recent_actual) >= 6:  # Need at least 6 data points (1 hour at 10min intervals)
+                    # TEMPORAL-AWARE BASELINE: Compare to same-time historical patterns
+                    # Instead of just using forecast baseline, compare to same hour + same day-of-week patterns
+                    current_hour = now.hour
+                    current_dow = now.dayofweek  # 0=Monday, 6=Sunday
+                    current_is_weekend = 1 if current_dow >= 5 else 0
                     
-                    if is_anomaly:
-                        # Calculate anomaly score (0-1 scale)
-                        anomaly_score = min(1.0, max(
-                            current_deviation_pct,
-                            mean_deviation_pct,
-                            spike_deviation / 2.0,
-                            drop_deviation / 2.0,
-                            min(1.0, mae_ensemble / mae_threshold) if mae_threshold > 0 else 0
-                        ))
+                    # Get historical data for temporal comparison (need at least 2 weeks for patterns)
+                    historical_window = pd.Timedelta(days=90)  # 3 months for reliable patterns
+                    historical_start = now - historical_window
+                    historical_ts = ts[ts.index >= historical_start]
+                    
+                    # Calculate temporal-aware baseline
+                    baseline_forecast = None
+                    temporal_baseline = None
+                    
+                    if len(historical_ts) >= 14 * 24:  # At least 2 weeks of data for temporal patterns
+                        # Same hour of day, same day of week (best match)
+                        same_time_mask = (
+                            (pd.to_datetime(historical_ts.index).hour == current_hour) &
+                            (pd.to_datetime(historical_ts.index).dayofweek == current_dow)
+                        )
+                        same_time_values = historical_ts[same_time_mask]
                         
-                        # Determine severity based on score
-                        if anomaly_score > 0.8:
-                            severity = "CRITICAL"
-                        elif anomaly_score > 0.5:
-                            severity = "WARNING"
+                        # Same hour of day (daily pattern)
+                        same_hour_mask = pd.to_datetime(historical_ts.index).hour == current_hour
+                        same_hour_values = historical_ts[same_hour_mask]
+                        
+                        # Same day of week (weekly pattern)
+                        same_dow_mask = pd.to_datetime(historical_ts.index).dayofweek == current_dow
+                        same_dow_values = historical_ts[same_dow_mask]
+                        
+                        # Weekend vs weekday
+                        if current_is_weekend:
+                            weekend_mask = pd.to_datetime(historical_ts.index).dayofweek >= 5
+                            weekend_values = historical_ts[weekend_mask]
+                            temporal_baseline = weekend_values.mean() if len(weekend_values) > 0 else None
                         else:
-                            severity = "INFO"
+                            weekday_mask = pd.to_datetime(historical_ts.index).dayofweek < 5
+                            weekday_values = historical_ts[weekday_mask]
+                            temporal_baseline = weekday_values.mean() if len(weekday_values) > 0 else None
                         
-                        signal_display = res["name"].replace("_", " ")
-                        current_str = f"{current*100:.2f}%" if res["unit"] == "ratio" else f"{current/1e6:.1f} MB/s"
+                        # Prefer same-time pattern, fallback to same-hour, then same-dow, then weekend/weekday
+                        if len(same_time_values) >= 3:
+                            temporal_baseline = same_time_values.mean()
+                        elif len(same_hour_values) >= 7:
+                            temporal_baseline = same_hour_values.mean()
+                        elif len(same_dow_values) >= 4:
+                            temporal_baseline = same_dow_values.mean()
+                    
+                    # Find the forecast value closest to now (or most recent forecast)
+                    forecast_df_sorted = forecast_df.sort_values('ds')
+                    if not forecast_df_sorted.empty:
+                        # Get the forecast value at or just before now
+                        past_forecasts = forecast_df_sorted[forecast_df_sorted['ds'] <= now]
+                        if not past_forecasts.empty:
+                            # Use the most recent past forecast as baseline
+                            baseline_forecast = past_forecasts.iloc[-1]['yhat']
+                        else:
+                            # If no past forecasts, use the earliest future forecast as proxy
+                            baseline_forecast = forecast_df_sorted.iloc[0]['yhat']
+                    
+                    # Use temporal baseline if available (more accurate for seasonality), otherwise use forecast baseline
+                    if temporal_baseline is not None and not pd.isna(temporal_baseline):
+                        baseline_forecast = temporal_baseline
                         
-                        # Create human-readable description
-                        description = format_anomaly_description(
-                            node, signal_display, current, current_str, mae_ensemble, 
-                            anomaly_score, severity, current_deviation_pct * 100, res["unit"]
+                        # Calculate statistics on recent actual values
+                        recent_mean = recent_actual.mean()
+                        recent_std = recent_actual.std()
+                        recent_max = recent_actual.max()
+                        recent_min = recent_actual.min()
+                        
+                        # Calculate deviation metrics
+                        # 1. Current value deviation from baseline forecast (both absolute and percentage)
+                        current_deviation_abs = abs(current - baseline_forecast)
+                        current_deviation_pct = abs((current - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (current_deviation_abs if current != 0 else 0)
+                        
+                        # 2. Recent mean deviation from baseline
+                        mean_deviation_abs = abs(recent_mean - baseline_forecast)
+                        mean_deviation_pct = abs((recent_mean - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (mean_deviation_abs if recent_mean != 0 else 0)
+                        
+                        # 3. Check for sudden spikes/drops (recent max/min vs baseline)
+                        spike_deviation_abs = abs(recent_max - baseline_forecast)
+                        spike_deviation = abs((recent_max - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (spike_deviation_abs if recent_max != 0 else 0)
+                        drop_deviation_abs = abs(baseline_forecast - recent_min)
+                        drop_deviation = abs((baseline_forecast - recent_min) / baseline_forecast) if baseline_forecast != 0 else (drop_deviation_abs if recent_min != 0 else 0)
+                        
+                        # 4. Define meaningful thresholds to avoid false positives
+                        # For I/O wait (ratio): values < 1% are usually fine, > 5% is concerning
+                        # For network (bytes/sec): use percentage of threshold
+                        if res["unit"] == "ratio":
+                            min_abs_threshold = 0.01  # 1% - minimum absolute difference to care about
+                            mae_threshold = 0.05  # 5% for ratio signals
+                            concerning_threshold = 0.05  # 5% I/O wait is actually concerning
+                            baseline_too_small = baseline_forecast < 0.01  # If baseline < 1%, use absolute only
+                        else:
+                            min_abs_threshold = 5_000_000  # 5 MB/s - minimum absolute difference
+                            mae_threshold = res["threshold"] * 0.10  # 10% of threshold
+                            concerning_threshold = res["threshold"] * 0.30  # 30% of threshold is concerning
+                            baseline_too_small = baseline_forecast < 5_000_000  # If baseline < 5MB/s, use absolute only
+                        
+                        # 5. Model confidence check - if MAE is very low, model is accurate, be more conservative
+                        # If MAE is high, model is struggling, be more lenient (don't trust it as much)
+                        if res["unit"] == "ratio":
+                            mae_confidence_factor = 1.0 if mae_ensemble < 0.005 else (0.7 if mae_ensemble < 0.01 else 0.3)
+                        else:
+                            mae_confidence_factor = 1.0 if mae_ensemble < mae_threshold * 0.1 else (0.7 if mae_ensemble < mae_threshold * 0.3 else 0.3)
+                        
+                        # Anomaly detection logic - be conservative to avoid false positives
+                        # Strategy: Only flag if the value is ACTUALLY concerning, not just different
+                        
+                        # Check if current value is concerning (regardless of deviation)
+                        is_concerning_value = (
+                            (res["unit"] == "ratio" and current >= concerning_threshold) or
+                            (res["unit"] != "ratio" and current >= concerning_threshold)
                         )
                         
-                        anomaly_results.append({
-                            "node": node,
-                            "signal": signal_display,
-                            "current": current_str,
-                            "mae_ensemble": round(mae_ensemble, 6),
-                            "score": round(anomaly_score, 3),
-                            "severity": severity,
-                            "deviation_pct": round(current_deviation_pct * 100, 1),
-                            "description": description
-                        })
+                        # Check for significant absolute deviation
+                        has_significant_abs_diff = (
+                            current_deviation_abs >= min_abs_threshold or
+                            mean_deviation_abs >= min_abs_threshold
+                        )
                         
-                        log_verbose(f"   ⚠️  Anomaly detected: {node} | {res['name']} (score: {anomaly_score:.3f}, deviation: {current_deviation_pct*100:.1f}%)")
+                        # For small baselines, only use absolute thresholds (percentage is misleading)
+                        # For larger baselines, use both absolute and percentage
+                        if baseline_too_small:
+                            # Small baseline: only check absolute difference AND if value is concerning
+                            is_anomaly = has_significant_abs_diff and is_concerning_value
+                        else:
+                            # Larger baseline: check both absolute and percentage deviation
+                            has_significant_pct_diff = (
+                                current_deviation_pct > 0.50 or  # 50% relative deviation
+                                mean_deviation_pct > 0.30        # 30% mean deviation
+                            )
+                            # Anomaly if: (significant absolute + significant percentage) AND (concerning value OR low model confidence)
+                            is_anomaly = (
+                                has_significant_abs_diff and
+                                has_significant_pct_diff and
+                                (is_concerning_value or mae_confidence_factor < 0.5 or mae_ensemble > mae_threshold)
+                            )
+                        
+                        if is_anomaly:
+                            # Calculate anomaly score (0-1 scale)
+                            anomaly_score = min(1.0, max(
+                                current_deviation_pct,
+                                mean_deviation_pct,
+                                spike_deviation / 2.0,
+                                drop_deviation / 2.0,
+                                min(1.0, mae_ensemble / mae_threshold) if mae_threshold > 0 else 0
+                            ))
+                            
+                            # Determine severity based on score
+                            if anomaly_score > 0.8:
+                                severity = "CRITICAL"
+                            elif anomaly_score > 0.5:
+                                severity = "WARNING"
+                            else:
+                                severity = "INFO"
+                            
+                            signal_display = res["name"].replace("_", " ")
+                            current_str = f"{current*100:.2f}%" if res["unit"] == "ratio" else f"{current/1e6:.1f} MB/s"
+                            
+                            # Create human-readable description
+                            description = format_anomaly_description(
+                                node, signal_display, current, current_str, mae_ensemble, 
+                                anomaly_score, severity, current_deviation_pct * 100, res["unit"]
+                            )
+                            
+                            anomaly_results.append({
+                                "node": node,
+                                "signal": signal_display,
+                                "current": current_str,
+                                "mae_ensemble": round(mae_ensemble, 6),
+                                "score": round(anomaly_score, 3),
+                                "severity": severity,
+                                "deviation_pct": round(current_deviation_pct * 100, 1),
+                                "description": description
+                            })
+                            
+                            log_verbose(f"   ⚠️  Anomaly detected: {node} | {res['name']} (score: {anomaly_score:.3f}, deviation: {current_deviation_pct*100:.1f}%)")
+            
+            # Print skipped count warning after sequential processing completes (outside the loop)
+            if skipped_count > 0:
+                print(f"    ⚠ Note: {skipped_count} node(s) skipped due to insufficient data (use -v for details)")
 
     crisis_df = pd.DataFrame(crisis_results)
     anomaly_df = pd.DataFrame(anomaly_results)
     print(f"Ensemble forecasts complete: {len(crisis_results)} crises, {len(anomaly_results)} anomalies flagged.")
     
     # Display backtest metrics when show_backtest is true or when models were retrained (but not in forecast mode)
-    if (show_backtest or (retrained_nodes and not forecast_mode)) and backtest_metrics_list:
+    # In training mode (not forecast_mode), always show backtest metrics if available
+    if (show_backtest or (retrained_nodes and not forecast_mode) or not forecast_mode) and backtest_metrics_list:
         print("\n" + "="*80)
         if retrained_nodes:
             print("DISK I/O + NETWORK — BACKTEST METRICS (retrained models only)")
@@ -6211,14 +7887,68 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
             signal = item['signal']
             metrics = item['metrics']
             print(f"\nBacktest Metrics → {node} | {signal}:")
-            if metrics.get('mae_ensemble') is not None:
-                print(f"  • mae_ensemble: {metrics['mae_ensemble']:.6f}")
-            if metrics.get('mae_prophet') is not None:
-                print(f"  • mae_prophet: {metrics['mae_prophet']:.6f}")
-            if metrics.get('mae_arima') is not None:
-                print(f"  • mae_arima: {metrics['mae_arima']:.6f}")
-            if metrics.get('mae_lstm') is not None:
-                print(f"  • mae_lstm: {metrics['mae_lstm']:.6f}")
+            if metrics.get('mae_ensemble') is not None and not pd.isna(metrics['mae_ensemble']):
+                mae_val = metrics['mae_ensemble']
+                mape_val = metrics.get('mape_ensemble')
+                if mape_val is not None and not pd.isna(mape_val):
+                    mape_note = ""
+                    if mape_val > 50 and mae_val < 0.01:
+                        mape_note = " (MAPE inflated by small actual values)"
+                    print(f"  • mae_ensemble: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
+                else:
+                    print(f"  • mae_ensemble: {mae_val:.6f}")
+            if metrics.get('mae_prophet') is not None and not pd.isna(metrics['mae_prophet']):
+                mae_val = metrics['mae_prophet']
+                mape_val = metrics.get('mape_prophet')
+                if mape_val is not None and not pd.isna(mape_val):
+                    mape_note = ""
+                    if mape_val > 50 and mae_val < 0.01:
+                        mape_note = " (MAPE inflated by small actual values)"
+                    print(f"  • mae_prophet: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
+                else:
+                    print(f"  • mae_prophet: {mae_val:.6f}")
+            if metrics.get('mae_arima') is not None and not pd.isna(metrics['mae_arima']):
+                mae_val = metrics['mae_arima']
+                mape_val = metrics.get('mape_arima')
+                if mape_val is not None and not pd.isna(mape_val):
+                    mape_note = ""
+                    if mape_val > 50 and mae_val < 0.01:
+                        mape_note = " (MAPE inflated by small actual values)"
+                    print(f"  • mae_arima: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
+                else:
+                    print(f"  • mae_arima: {mae_val:.6f}")
+            if metrics.get('mae_lstm') is not None and not pd.isna(metrics['mae_lstm']):
+                mae_val = metrics['mae_lstm']
+                mape_val = metrics.get('mape_lstm')
+                if mape_val is not None and not pd.isna(mape_val):
+                    mape_note = ""
+                    if mape_val > 50 and mae_val < 0.01:
+                        mape_note = " (MAPE inflated by small actual values)"
+                    print(f"  • mae_lstm: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
+                else:
+                    print(f"  • mae_lstm: {mae_val:.6f}")
+            
+            # Print Expected Error Rate and Confidence Level
+            print(f"  • Expected Error Rate (%):")
+            if metrics.get('mape_ensemble') is not None and not pd.isna(metrics['mape_ensemble']):
+                print(f"    - Ensemble: {metrics['mape_ensemble']:.2f}%")
+            if metrics.get('mape_prophet') is not None and not pd.isna(metrics['mape_prophet']):
+                print(f"    - Prophet: {metrics['mape_prophet']:.2f}%")
+            if metrics.get('mape_arima') is not None and not pd.isna(metrics['mape_arima']):
+                print(f"    - ARIMA: {metrics['mape_arima']:.2f}%")
+            if metrics.get('mape_lstm') is not None and not pd.isna(metrics['mape_lstm']):
+                print(f"    - LSTM: {metrics['mape_lstm']:.2f}%")
+            
+            print(f"  • Confidence Level (1=highest, 10=lowest):")
+            if metrics.get('confidence_ensemble') is not None:
+                print(f"    - Ensemble: {metrics['confidence_ensemble']}/10")
+            if metrics.get('confidence_prophet') is not None:
+                print(f"    - Prophet: {metrics['confidence_prophet']}/10")
+            if metrics.get('confidence_arima') is not None:
+                print(f"    - ARIMA: {metrics['confidence_arima']}/10")
+            if metrics.get('confidence_lstm') is not None:
+                print(f"    - LSTM: {metrics['confidence_lstm']}/10")
+            
             if metrics.get('split_info'):
                 split_info = metrics['split_info']
                 print(f"  • Train/Test Split:")
@@ -6370,7 +8100,7 @@ def summarize_alert_counts(disk_alerts, crisis_df, anomaly_df, anomalies_df, cla
         alerts_series = disk_alerts['alert'].astype(str).fillna('').str.strip()
         alerts_upper = alerts_series.str.upper()
         
-        # Debug: print unique alert values to help diagnose
+        # Verbose logging: display unique alert values for diagnostics
         if should_verbose():
             unique_alerts = alerts_series.unique()
             print(f"DEBUG: Unique alert values in disk_alerts: {unique_alerts}")
@@ -6527,8 +8257,9 @@ def dispatch_alerts(disk_alerts, crisis_df, anomaly_df, anomalies_df, classifica
     if alert_webhook is None and pushgateway_url is None:
         return
     
-    # Dump disk_alerts metadata first to simplify debugging when alerts are missing.
-    print(f"\nDEBUG: disk_alerts type: {type(disk_alerts)}")
+    # Verbose logging: display disk_alerts metadata structure for diagnostics
+    if should_verbose():
+        print(f"\n[VERBOSE] disk_alerts type: {type(disk_alerts)}")
     if disk_alerts is not None and hasattr(disk_alerts, 'empty'):
         print(f"DEBUG: disk_alerts.empty: {disk_alerts.empty}")
         print(f"DEBUG: disk_alerts.shape: {disk_alerts.shape if hasattr(disk_alerts, 'shape') else 'N/A'}")
@@ -6563,7 +8294,7 @@ def dispatch_alerts(disk_alerts, crisis_df, anomaly_df, anomalies_df, classifica
         if budget_at_risk_count > 0:
             print(f"SLI/SLO Error Budgets at Risk: {budget_at_risk_count}")
     
-    # Always print summary for debugging
+    # Display alert summary for operational visibility
     print(f"\n{'='*80}")
     if total_alerts > 0:
         print(f"ALERT SUMMARY (Total: {total_alerts})")
@@ -6590,22 +8321,27 @@ def dispatch_alerts(disk_alerts, crisis_df, anomaly_df, anomalies_df, classifica
 # ----------------------------------------------------------------------
 # 8.5. FORECAST MODE (lightweight, frequent runs)
 # ----------------------------------------------------------------------
-def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=None, sli_slo_config_path=None, enable_plots=False):
+def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=None, sli_slo_config_path=None, enable_plots=False, enable_forecast_plots=False, enable_backtest_plots=False, horizon_min=None):
     """Forecast mode: generate forecasts using latest Prometheus data and cached models.
     Runs all forecasting models (CPU, Memory, Disk, I/O, Network) and displays predictions and anomalies.
     Optimized for frequent runs (e.g., every 15 seconds via external scheduler).
     
     Args:
-        enable_plots: If True, generates and saves plot files (PNG images). If False, plots are skipped.
+        enable_plots: If True, enables plot generation (deprecated, use enable_forecast_plots/enable_backtest_plots)
+        enable_forecast_plots: If True, generates and saves forecast plot files (PNG images)
+        enable_backtest_plots: If True, generates and saves backtest plot files (PNG images)
+        horizon_min: Forecast horizon in minutes (overrides HORIZON_MIN if provided)
     
-    Generates forecast plots for all models (when enable_plots=True) and displays:
-    - Host and Pod layer forecasts
-    - Disk full predictions
-    - I/O and Network crisis predictions
-    - Anomaly detection results
+    In forecast mode, typically only backtest plots are generated (no forecast plots).
     """
+    effective_horizon = horizon_min if horizon_min is not None else HORIZON_MIN
+    horizon_hours = effective_horizon // 60
+    horizon_mins = effective_horizon % 60
+    horizon_display = f"{horizon_hours}h {horizon_mins}m" if horizon_hours > 0 else f"{horizon_mins}m"
+    
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Forecast Mode\n")
     print("Execution mode: FORECAST (using cached models, latest Prometheus data)")
+    print(f"Forecast horizon: {effective_horizon} minutes ({horizon_display})")
     print("Running all forecasting models and displaying predictions + anomalies")
     print_cpu_info(cli_override=CLI_PARALLEL_OVERRIDE)
     # Steps: fetch metrics, run models, print summaries, dispatch alerts.
@@ -6726,13 +8462,20 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
         
         return combined[['timestamp', 'value']]
     
+    # Use effective horizon (from parameter or global HORIZON_MIN)
+    effective_horizon = horizon_min if horizon_min is not None else HORIZON_MIN
+    horizon_hours = effective_horizon // 60
+    horizon_mins = effective_horizon % 60
+    horizon_display = f"{horizon_hours}h {horizon_mins}m" if horizon_hours > 0 else f"{horizon_mins}m"
+    
     # ====================== KUBERNETES CLUSTER MODELS (Host + Pod per cluster) — FORECAST ======================
     k8s_cluster_forecasts = {}  # cluster_id -> forecast
     k8s_host_fc = None  # Combined host forecast for all K8s nodes (for divergence)
     
     if k8s_clusters:
         print("\n" + "="*80)
-        print("KUBERNETES CLUSTER MODELS (Host + Pod data per cluster) — FORECAST")
+        print(f"KUBERNETES CLUSTER MODELS (Host + Pod data per cluster) — FORECAST")
+        print(f"Forecast horizon: {effective_horizon} minutes ({horizon_display})")
         print("="*80)
         
         entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
@@ -6764,13 +8507,15 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
                     _, cluster_fc, _, _ = train_or_load_ensemble(
                         df_combined_cpu,
                         df_combined_mem,
-                        horizon_min=7*24*60,
+                        horizon_min=effective_horizon,
                         model_path=cluster_model_path,
                         force_retrain=False,
                         generate_fresh_forecast=True,
                         dump_csv_dir=csv_dump_dir,
                         context={'node': 'k8s_cluster', 'cluster_id': cluster_id},
-                        enable_plots=enable_plots
+                        enable_plots=enable_plots,
+                        enable_forecast_plots=enable_forecast_plots,
+                        enable_backtest_plots=enable_backtest_plots
                     )
                     k8s_cluster_forecasts[cluster_id] = cluster_fc
         
@@ -6787,13 +8532,15 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
                 _, k8s_host_fc, _, _ = train_or_load_ensemble(
                     df_hcpu_all_k8s,
                     df_hmem_all_k8s,
-                    horizon_min=7*24*60,
+                    horizon_min=effective_horizon,
                     model_path=HOST_MODEL_PATH,
                     force_retrain=False,
                     generate_fresh_forecast=True,
                     dump_csv_dir=None,
                     context={'node': 'k8s_host_all'},
-                    enable_plots=enable_plots
+                    enable_plots=enable_plots,
+                    enable_forecast_plots=enable_forecast_plots,
+                    enable_backtest_plots=enable_backtest_plots
                 )
     
     # Handle unknown_cluster nodes (have pods but cluster can't be determined)
@@ -6820,13 +8567,15 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
                 _, unknown_fc, _, _ = train_or_load_ensemble(
                     df_combined_cpu,
                     df_combined_mem,
-                    horizon_min=7*24*60,
+                    horizon_min=effective_horizon,
                     model_path=unknown_model_path,
                     force_retrain=False,
                     generate_fresh_forecast=True,
                     dump_csv_dir=csv_dump_dir,
                     context={'node': 'k8s_unknown_cluster'},
-                    enable_plots=enable_plots
+                    enable_plots=enable_plots,
+                    enable_forecast_plots=enable_forecast_plots,
+                    enable_backtest_plots=enable_backtest_plots
                 )
                 k8s_cluster_forecasts['unknown_cluster'] = unknown_fc
             else:
@@ -6854,13 +8603,15 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
                 _, standalone_fc, _, _ = train_or_load_ensemble(
                     df_hcpu_standalone,
                     df_hmem_standalone,
-                    horizon_min=7*24*60,
+                    horizon_min=effective_horizon,
                     model_path=STANDALONE_MODEL_PATH,
                     force_retrain=False,
                     generate_fresh_forecast=True,
                     dump_csv_dir=csv_dump_dir,
                     context={'node': 'standalone'},
-                    enable_plots=enable_plots
+                    enable_plots=enable_plots,
+                    enable_forecast_plots=enable_forecast_plots,
+                    enable_backtest_plots=enable_backtest_plots
                 )
         else:
             print("⚠ Warning: Insufficient data for standalone model")
@@ -6899,12 +8650,15 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
         contamination=CONTAMINATION,
         forecast_mode=True,
         dump_csv_dir=csv_dump_dir,
-        enable_plots=enable_plots
+        enable_plots=enable_plots,
+        enable_forecast_plots=enable_forecast_plots
     )
     
     # ====================== DISK FULL PREDICTION ======================
+    disk_horizon_days = 7  # Default for disk capacity planning
     print("\n" + "="*80)
-    print("DISK FULL PREDICTION (7-day horizon) — FORECAST")
+    print(f"DISK FULL PREDICTION ({disk_horizon_days}-day horizon) — FORECAST")
+    print(f"Forecast horizon: {disk_horizon_days} days (capacity planning)")
     print("="*80)
     
     q_disk = '''
@@ -6939,13 +8693,15 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
         
         disk_alerts, disk_manifest, manifest_changed, disk_metrics, disk_retrained_nodes = predict_disk_full_days(
             df_disk,
-            horizon_days=7,
+            horizon_days=disk_horizon_days,
             manifest=disk_manifest,
             retrain_targets=None,
-            show_backtest=False,
+            show_backtest=enable_backtest_plots,
             forecast_mode=True,
             dump_csv_dir=csv_dump_dir,
-            enable_plots=enable_plots
+            enable_plots=enable_plots,
+            enable_forecast_plots=enable_forecast_plots,
+            enable_backtest_plots=enable_backtest_plots
         )
         if manifest_changed:
             save_disk_manifest(DISK_MODEL_MANIFEST_PATH, disk_manifest)
@@ -6978,20 +8734,24 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
     
     # ====================== I/O + NETWORK CRISIS PREDICTION ======================
     print("\n" + "="*80)
+    io_net_crisis_horizon_days = 7  # Default for I/O crisis detection
     print("DISK I/O + NETWORK — CRISIS PREDICTION (FORECAST)")
+    print(f"Forecast horizon: {io_net_crisis_horizon_days} days (crisis detection)")
     print("="*80)
     
     crisis_df, io_net_manifest, io_net_manifest_changed = predict_io_and_network_crisis_with_backtest(
-        horizon_days=7,
+        horizon_days=io_net_crisis_horizon_days,
         test_days=7,
         plot_dir=None,  # Uses FORECAST_PLOTS_DIR
         force_retrain=False,
         manifest=io_net_manifest,
         retrain_targets=None,
-        show_backtest=False,
+        show_backtest=enable_backtest_plots,
         forecast_mode=True,
         dump_csv_dir=csv_dump_dir,
-        enable_plots=enable_plots
+        enable_plots=enable_plots,
+        enable_forecast_plots=enable_forecast_plots,
+        enable_backtest_plots=enable_backtest_plots
     )
     if io_net_manifest_changed:
         save_io_net_manifest(IO_NET_MODEL_MANIFEST_PATH, io_net_manifest)
@@ -6999,10 +8759,18 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
     # ====================== I/O + NETWORK ENSEMBLE FORECAST ======================
     print("\n" + "="*80)
     print("DISK I/O + NETWORK — FULL ENSEMBLE FORECAST & ANOMALY DETECTION (FORECAST)")
+    effective_horizon = horizon_min if horizon_min is not None else HORIZON_MIN
+    horizon_hours = effective_horizon // 60
+    horizon_mins = effective_horizon % 60
+    horizon_display = f"{horizon_hours}h {horizon_mins}m" if horizon_hours > 0 else f"{horizon_mins}m"
+    print(f"Forecast horizon: {effective_horizon} minutes ({horizon_display})")
     print("="*80)
     
+    # Convert horizon from minutes to days (as a float to support fractional days for short horizons)
+    horizon_days = effective_horizon / 1440.0  # Convert minutes to days (1440 minutes = 1 day)
+    
     crisis_df, anomaly_df, io_net_manifest, io_net_manifest_changed = predict_io_and_network_ensemble(
-        horizon_days=7,
+        horizon_days=horizon_days,
         test_days=7,
         plot_dir=None,  # Uses FORECAST_PLOTS_DIR
         force_retrain=False,
@@ -7011,7 +8779,9 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
         show_backtest=False,
         forecast_mode=True,
         dump_csv_dir=csv_dump_dir,
-        enable_plots=enable_plots
+        enable_plots=enable_plots,
+        enable_forecast_plots=enable_forecast_plots,
+        enable_backtest_plots=enable_backtest_plots
     )
     if io_net_manifest_changed:
         save_io_net_manifest(IO_NET_MODEL_MANIFEST_PATH, io_net_manifest)
@@ -7052,6 +8822,11 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
     dispatch_alerts(disk_alerts, crisis_df, anomaly_df, anomalies_df, classification_anomalies_df, host_pressure_df, alert_webhook, pushgateway_url, sli_slo_results)
     
     # ====================== SUMMARY ======================
+    effective_horizon = horizon_min if horizon_min is not None else HORIZON_MIN
+    horizon_hours = effective_horizon // 60
+    horizon_mins = effective_horizon % 60
+    horizon_display = f"{horizon_hours}h {horizon_mins}m" if horizon_hours > 0 else f"{horizon_mins}m"
+    
     print("\n" + "="*80)
     print("FORECAST MODE COMPLETE")
     print("="*80)
@@ -7060,6 +8835,7 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
     else:
         print("Plots skipped (use --plot flag to generate plots)")
     print(f"Forecast timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Forecast horizon: {effective_horizon} minutes ({horizon_display})")
     print("\n✓ All models executed with latest Prometheus data")
     print("✓ Forecasts generated for: Host, Pod, Disk, I/O, Network")
     print("✓ Anomalies detected and displayed above")
@@ -7082,12 +8858,32 @@ if __name__ == "__main__":
             MAX_WORKER_THREADS = args.parallel
             CLI_PARALLEL_OVERRIDE = args.parallel
     
+    # Override HORIZON_MIN if --forecast-horizon flag is provided
+    horizon_override = None
+    if args.forecast_horizon:
+        horizon_map = {
+            "realtime": 15,      # 15 minutes - short-term real-time decisions
+            "neartime": 180,     # 3 hours - near-term planning
+            "future": 10080      # 7 days - long-term capacity planning
+        }
+        horizon_override = horizon_map[args.forecast_horizon]
+        HORIZON_MIN = horizon_override
+        print(f"Forecast horizon override: {args.forecast_horizon} = {horizon_override} minutes ({horizon_override//60}h {horizon_override%60}m)")
+    
     # Forecast mode: lightweight, frequent runs
     if args.forecast:
         if args.quiet:
             VERBOSE_LEVEL = 0
         else:
             VERBOSE_LEVEL = max(VERBOSE_LEVEL, args.verbose)
+        
+        # In forecast mode: only generate plots if --plot is specified
+        # Parse plot argument to determine which plots to generate
+        plot_forecast, plot_backtest = parse_plot_argument(args.plot)
+        # Only enable plots if --plot was specified
+        enable_forecast_plots = plot_forecast if args.plot else False
+        enable_backtest_plots = plot_backtest if args.plot else False
+        enable_plots = enable_forecast_plots or enable_backtest_plots
         
         # Handle continuous runs with --interval
         if args.interval > 0:
@@ -7100,7 +8896,7 @@ if __name__ == "__main__":
                     print(f"\n{'='*80}")
                     print(f"Forecast Run #{iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                     print(f"{'='*80}")
-                    run_forecast_mode(alert_webhook=args.alert_webhook, pushgateway_url=args.pushgateway, csv_dump_dir=csv_dump_dir, sli_slo_config_path=args.sli_slo_config, enable_plots=args.plot)
+                    run_forecast_mode(alert_webhook=args.alert_webhook, pushgateway_url=args.pushgateway, csv_dump_dir=csv_dump_dir, sli_slo_config_path=args.sli_slo_config, enable_plots=enable_plots, enable_forecast_plots=enable_forecast_plots, enable_backtest_plots=enable_backtest_plots, horizon_min=horizon_override)
                     if args.interval > 0:
                         print(f"\nWaiting {args.interval} seconds until next run...")
                         time.sleep(args.interval)
@@ -7109,7 +8905,7 @@ if __name__ == "__main__":
                 sys.exit(0)
         else:
             # Single run
-            run_forecast_mode(alert_webhook=args.alert_webhook, pushgateway_url=args.pushgateway, csv_dump_dir=csv_dump_dir, sli_slo_config_path=args.sli_slo_config, enable_plots=args.plot)
+            run_forecast_mode(alert_webhook=args.alert_webhook, pushgateway_url=args.pushgateway, csv_dump_dir=csv_dump_dir, sli_slo_config_path=args.sli_slo_config, enable_plots=enable_plots, enable_forecast_plots=enable_forecast_plots, enable_backtest_plots=enable_backtest_plots, horizon_min=horizon_override)
         sys.exit(0)
     
     # Normal mode: training or pre-trained with full analysis
@@ -7128,7 +8924,32 @@ if __name__ == "__main__":
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Starting Dual-Layer + LSTM AI\n")
     mode_label = "TRAINING" if force_training else "PRE-TRAINED"
     print(f"Execution mode: {mode_label}")
-    show_backtest = args.show_backtest
+    
+    # Plot generation logic:
+    # - --training: always generate all plots (forecast + backtest), no --plot needed
+    # - --forecast: only generate plots if --plot is specified (forecast and/or backtest based on --plot value)
+    # - --show-backtest: only generate backtest plots
+    # - Otherwise: only generate plots if --plot is specified
+    if force_training:
+        # Training mode: always generate all plots by default (both forecast and backtest)
+        enable_forecast_plots = True
+        enable_backtest_plots = True
+        enable_plots = True
+        show_backtest = True  # Always show backtest in training mode
+    elif args.show_backtest:
+        # --show-backtest mode: only generate backtest plots
+        plot_forecast, plot_backtest = parse_plot_argument(args.plot)
+        enable_forecast_plots = False  # Never generate forecast plots in show-backtest mode
+        enable_backtest_plots = True
+        enable_plots = True
+        show_backtest = True
+    else:
+        # Other modes: only generate plots if --plot is specified
+        plot_forecast, plot_backtest = parse_plot_argument(args.plot)
+        enable_forecast_plots = plot_forecast
+        enable_backtest_plots = plot_backtest
+        enable_plots = plot_forecast or plot_backtest
+        show_backtest = args.show_backtest or plot_backtest
     disk_retrain_targets = parse_disk_retrain_targets(args.disk_retrain)
     disk_manifest = load_disk_manifest(DISK_MODEL_MANIFEST_PATH)
     io_net_manifest = load_io_net_manifest(IO_NET_MODEL_MANIFEST_PATH)
@@ -7245,6 +9066,10 @@ if __name__ == "__main__":
     if k8s_clusters:
         print("\n" + "="*80)
         print("KUBERNETES CLUSTER MODELS (Host + Pod data per cluster)")
+        horizon_hours = HORIZON_MIN // 60
+        horizon_mins = HORIZON_MIN % 60
+        horizon_display = f"{horizon_hours}h {horizon_mins}m" if horizon_hours > 0 else f"{horizon_mins}m"
+        print(f"Forecast horizon: {HORIZON_MIN} minutes ({horizon_display})")
         print("="*80)
         
         entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
@@ -7272,12 +9097,15 @@ if __name__ == "__main__":
                 _, cluster_fc, cluster_metrics, cluster_saved = train_or_load_ensemble(
                     df_combined_cpu,
                     df_combined_mem,
-                    horizon_min=7*24*60,
+                    horizon_min=HORIZON_MIN,
                     model_path=cluster_model_path,
                     force_retrain=force_training,
                     show_backtest=show_backtest,
                     dump_csv_dir=csv_dump_dir,
-                    context={'node': 'k8s_cluster', 'cluster_id': cluster_id}
+                    context={'node': 'k8s_cluster', 'cluster_id': cluster_id},
+                    enable_plots=enable_plots,
+                    enable_forecast_plots=enable_forecast_plots,
+                    enable_backtest_plots=enable_backtest_plots
                 )
                 
                 k8s_cluster_forecasts[cluster_id] = cluster_fc
@@ -7309,12 +9137,15 @@ if __name__ == "__main__":
             _, k8s_host_fc, _, _ = train_or_load_ensemble(
                 df_hcpu_all_k8s,
                 df_hmem_all_k8s,
-                horizon_min=7*24*60,
+                horizon_min=HORIZON_MIN,
                 model_path=HOST_MODEL_PATH,  # Reuse for backward compatibility
                 force_retrain=False,
-                show_backtest=False,
+                show_backtest=show_backtest,  # Enable backtest when --plot is used
                 dump_csv_dir=None,
-                context={'node': 'k8s_host_all'}
+                context={'node': 'k8s_host_all'},
+                enable_plots=enable_plots,
+                enable_forecast_plots=enable_forecast_plots,
+                enable_backtest_plots=enable_backtest_plots
             )
     
     # Handle unknown_cluster nodes (have pods but cluster can't be determined)
@@ -7340,12 +9171,15 @@ if __name__ == "__main__":
             _, unknown_fc, unknown_metrics, unknown_saved = train_or_load_ensemble(
                 df_combined_cpu,
                 df_combined_mem,
-                horizon_min=7*24*60,
+                horizon_min=HORIZON_MIN,
                 model_path=unknown_model_path,
                 force_retrain=force_training,
                 show_backtest=show_backtest,
                 dump_csv_dir=csv_dump_dir,
-                context={'node': 'k8s_unknown_cluster'}
+                context={'node': 'k8s_unknown_cluster'},
+                enable_plots=enable_plots,
+                enable_forecast_plots=enable_forecast_plots,
+                enable_backtest_plots=enable_backtest_plots
             )
             k8s_cluster_forecasts['unknown_cluster'] = unknown_fc
             k8s_cluster_metrics['unknown_cluster'] = unknown_metrics
@@ -7370,12 +9204,15 @@ if __name__ == "__main__":
             _, standalone_fc, standalone_metrics, standalone_saved = train_or_load_ensemble(
                 df_hcpu_standalone,
                 df_hmem_standalone,
-                horizon_min=7*24*60,
+                horizon_min=HORIZON_MIN,
                 model_path=STANDALONE_MODEL_PATH,
                 force_retrain=force_training,
                 show_backtest=show_backtest,
                 dump_csv_dir=csv_dump_dir,
-                context={'node': 'standalone'}
+                context={'node': 'standalone'},
+                enable_plots=enable_plots,
+                enable_forecast_plots=enable_forecast_plots,
+                enable_backtest_plots=enable_backtest_plots
             )
             
             if (force_training or show_backtest) and standalone_metrics:
@@ -7455,8 +9292,10 @@ if __name__ == "__main__":
     print("\nDual-layer + LSTM + classification complete.")
 
     # ====================== DISK FULL PREDICTION — FULL TRANSPARENCY ======================
+    disk_horizon_days = 7  # Default for disk capacity planning
     print("\n" + "="*80)
-    print("DISK FULL PREDICTION (7-day horizon) — FULL ETA FOR ALL DISKS")
+    print(f"DISK FULL PREDICTION ({disk_horizon_days}-day horizon) — FULL ETA FOR ALL DISKS")
+    print(f"Forecast horizon: {disk_horizon_days} days (capacity planning)")
     print("="*80)
 
     q_disk = '''
@@ -7491,11 +9330,15 @@ if __name__ == "__main__":
 
         disk_alerts, disk_manifest, manifest_changed, disk_metrics, disk_retrained_nodes = predict_disk_full_days(
             df_disk,
-            horizon_days=7,
+            horizon_days=disk_horizon_days,
             manifest=disk_manifest,
             retrain_targets=disk_retrain_targets,
             show_backtest=show_backtest,
-            dump_csv_dir=csv_dump_dir
+            forecast_mode=False,
+            dump_csv_dir=csv_dump_dir,
+            enable_plots=enable_plots,
+            enable_forecast_plots=enable_forecast_plots,
+            enable_backtest_plots=enable_backtest_plots
         )
         if manifest_changed:
             save_disk_manifest(DISK_MODEL_MANIFEST_PATH, disk_manifest)
@@ -7652,19 +9495,25 @@ if __name__ == "__main__":
         print("\nThese explain current or upcoming incidents")
 
     # ====================== I/O + NETWORK CRISIS PREDICTION ======================
+    io_net_crisis_horizon_days = 7  # Default for I/O crisis detection
     print("\n" + "="*80)
     print("DISK I/O + NETWORK CRISIS PREDICTION (user-visible slowness)")
+    print(f"Forecast horizon: {io_net_crisis_horizon_days} days (crisis detection)")
     print("="*80)
 
     crisis_df, io_net_manifest, io_net_manifest_changed = predict_io_and_network_crisis_with_backtest(
-        horizon_days=7,
+        horizon_days=io_net_crisis_horizon_days,
         test_days=7,
         plot_dir=None,  # Uses FORECAST_PLOTS_DIR
         force_retrain=force_training,
         manifest=io_net_manifest,
         retrain_targets=io_net_retrain_targets,
         show_backtest=show_backtest,
-        dump_csv_dir=csv_dump_dir
+        forecast_mode=False,  # Training mode, not forecast mode
+        dump_csv_dir=csv_dump_dir,
+        enable_plots=enable_plots,
+        enable_forecast_plots=enable_forecast_plots,
+        enable_backtest_plots=enable_backtest_plots
     )
     if io_net_manifest_changed:
         save_io_net_manifest(IO_NET_MODEL_MANIFEST_PATH, io_net_manifest)
@@ -7683,17 +9532,30 @@ if __name__ == "__main__":
     # ====================== I/O + NETWORK — FULL ENSEMBLE (CPU/MEM GRADE) ======================
     print("\n" + "="*80)
     print("DISK I/O + NETWORK — FULL ENSEMBLE FORECAST & ANOMALY DETECTION")
+    # Use horizon_override if set, otherwise use HORIZON_MIN
+    effective_horizon_min = horizon_override if horizon_override is not None else HORIZON_MIN
+    horizon_hours = effective_horizon_min // 60
+    horizon_mins = effective_horizon_min % 60
+    horizon_display = f"{horizon_hours}h {horizon_mins}m" if horizon_hours > 0 else f"{horizon_mins}m"
+    print(f"Forecast horizon: {effective_horizon_min} minutes ({horizon_display})")
     print("="*80)
+    
+    # Convert horizon from minutes to days (as a float to support fractional days for short horizons)
+    horizon_days = effective_horizon_min / 1440.0  # Convert minutes to days (1440 minutes = 1 day)
 
     io_net_crisis_df, io_net_anomaly_df, io_net_manifest, io_net_manifest_changed = predict_io_and_network_ensemble(
-        horizon_days=7,
+        horizon_days=horizon_days,
         test_days=7,
         plot_dir=None,  # Uses FORECAST_PLOTS_DIR
         force_retrain=force_training,
         manifest=io_net_manifest,
         retrain_targets=io_net_retrain_targets,
         show_backtest=show_backtest,
-        dump_csv_dir=csv_dump_dir
+        forecast_mode=False,  # Training mode, not forecast mode
+        dump_csv_dir=csv_dump_dir,
+        enable_plots=enable_plots,
+        enable_forecast_plots=enable_forecast_plots,
+        enable_backtest_plots=enable_backtest_plots
     )
     if io_net_manifest_changed:
         save_io_net_manifest(IO_NET_MODEL_MANIFEST_PATH, io_net_manifest)

@@ -13,8 +13,9 @@ This document provides a comprehensive, step-by-step explanation of all models i
 5. [I/O Network Crisis Models](#io-network-crisis-models)
 6. [I/O Network Ensemble Models](#io-network-ensemble-models)
 7. [Classification/Anomaly Detection Models](#classificationanomaly-detection-models)
-8. [Configuration Variables Impact](#configuration-variables-impact)
-9. [Execution Flow Diagrams](#execution-flow-diagrams)
+8. [Backtest Metrics Explained](#backtest-metrics-explained)
+9. [Configuration Variables Impact](#configuration-variables-impact)
+10. [Execution Flow Diagrams](#execution-flow-diagrams)
 
 ---
 
@@ -377,6 +378,16 @@ Forecasts CPU and Memory usage for Kubernetes clusters and standalone nodes usin
        'mae_arima': mean_absolute_error(test_ts, a_pred),
        'mae_lstm': mean_absolute_error(test_ts, l_back),
        'mae_ensemble': mean_absolute_error(test_ts, ens_pred),
+       # MAPE (Mean Absolute Percentage Error) - relative error metric
+       'mape_prophet': calculate_mape(test_ts, p_back),
+       'mape_arima': calculate_mape(test_ts, a_pred),
+       'mape_lstm': calculate_mape(test_ts, l_back),
+       'mape_ensemble': calculate_mape(test_ts, ens_pred),
+       # Confidence levels (1-10, where 1 is highest confidence)
+       'confidence_prophet': calculate_model_confidence(mae_prophet, mape_prophet),
+       'confidence_arima': calculate_model_confidence(mae_arima, mape_arima),
+       'confidence_lstm': calculate_model_confidence(mae_lstm, mape_lstm),
+       'confidence_ensemble': calculate_model_confidence(mae_ensemble, mape_ensemble),
        'rmse_prophet': sqrt(mean_squared_error(test_ts, p_back)),
        'rmse_arima': sqrt(mean_squared_error(test_ts, a_pred)),
        'rmse_lstm': sqrt(mean_squared_error(test_ts, l_back)),
@@ -466,13 +477,14 @@ Predicts when disk usage will reach 90% threshold for each node/mountpoint combi
        'y': train_ts.values
    })
 
-2. Fit Prophet:
+2. Fit Prophet (with daily + weekly seasonality):
    m = Prophet(
-       daily_seasonality=True,
-       weekly_seasonality=True,
-       changepoint_prior_scale=0.05
+       daily_seasonality=True,   # Learns daily patterns (e.g., daily ETL jobs, hourly backups)
+       weekly_seasonality=True,  # Learns weekly patterns (e.g., weekend batch jobs)
+       yearly_seasonality=False
    )
    m.fit(pdf)
+   # Temporal-aware: Accounts for batch job patterns to reduce false positives
 
 3. Generate forecast:
    future = m.make_future_dataframe(periods=horizon_days * 24 * 60, freq='min')
@@ -614,14 +626,15 @@ test_ts = ts.iloc[split_idx:]
        'y': train_ts.values
    })
 
-2. Fit Prophet:
+2. Fit Prophet (with daily + weekly seasonality):
    m = Prophet(
-       daily_seasonality=True,
-       weekly_seasonality=True,
-       changepoint_prior_scale=0.05,
+       daily_seasonality=True,   # Learns daily patterns (e.g., daily batch jobs)
+       weekly_seasonality=True,  # Learns weekly patterns (e.g., weekend backups)
+       changepoint_prior_scale=0.2,
        n_changepoints=10  # Optimized for speed
    )
    m.fit(pdf)
+   # Temporal-aware: Accounts for daily/weekly patterns to reduce false positives
 
 3. Generate forecast:
    future = m.make_future_dataframe(
@@ -724,21 +737,37 @@ Full ensemble forecasting (Prophet + ARIMA + LSTM) for I/O wait and network band
    ensemble = (prophet + arima + lstm) / 3
 ```
 
-#### Step 4: Anomaly Detection
+#### Step 4: Anomaly Detection (Temporal-Aware)
 ```python
-# Detects anomalies in current values
+# Detects anomalies in current values using temporal-aware baseline
 
 1. Calculate current value:
    current = ts.iloc[-1]
 
-2. Calculate forecast value:
-   forecast = ensemble.iloc[0]  # Next time step
+2. Calculate temporal-aware baseline (when 3+ months data available):
+   # Compare to same-time historical patterns
+   current_hour = now.hour
+   current_dow = now.dayofweek
+   historical_ts = ts[ts.index >= (now - 90 days)]
+   
+   # Priority: Same hour + same day-of-week > Same hour > Same day-of-week > Weekend/weekday
+   same_time_pattern = historical_ts[
+       (historical_ts.index.hour == current_hour) &
+       (historical_ts.index.dayofweek == current_dow)
+   ]
+   temporal_baseline = same_time_pattern.mean() if len(same_time_pattern) >= 3 else forecast_baseline
 
-3. Calculate deviation:
-   deviation_pct = abs(current - forecast) / forecast * 100
+3. Calculate forecast baseline (fallback):
+   forecast_baseline = ensemble.iloc[0]  # Next time step
 
-4. Apply dual threshold:
-   if deviation_pct > absolute_threshold OR deviation_pct > percentage_threshold:
+4. Use temporal baseline if available (more accurate for seasonality):
+   baseline = temporal_baseline if temporal_baseline is not None else forecast_baseline
+
+5. Calculate deviation:
+   deviation_pct = abs(current - baseline) / baseline * 100
+
+6. Apply dual threshold:
+   if deviation_pct > absolute_threshold AND deviation_pct > percentage_threshold:
        anomaly_detected = True
        severity = determine_severity(deviation_pct)
 ```
@@ -802,8 +831,125 @@ manifest[key] = {
 
 ```python
 # Same as Host/Pod ensemble backtesting
-# Calculates MAE, RMSE for Prophet, ARIMA, LSTM, and ensemble
+# Calculates MAE, MAPE, Confidence Level, and Expected Error Rate for Prophet, ARIMA, LSTM, and ensemble
 ```
+
+---
+
+## Backtest Metrics Explained
+
+All ensemble models (Host/Pod, I/O Network) generate comprehensive backtest metrics to evaluate model performance. This section explains each metric and how to interpret them.
+
+### Metrics Overview
+
+When models are trained or retrained, the system displays backtest metrics in the following format:
+
+```
+Backtest Metrics → {context}:
+  • mae_ensemble: 0.114947 (MAPE: 27.58%)
+  • mae_prophet: 0.105278 (MAPE: 27.76%)
+  • mae_arima: 0.120439 (MAPE: 27.85%)
+  • mae_lstm: 0.120439 (MAPE: 27.85%)
+  • Expected Error Rate (%):
+    - Ensemble: 27.58%
+    - Prophet: 27.76%
+    - ARIMA: 27.85%
+    - LSTM: 27.85%
+  • Confidence Level (1=highest, 10=lowest):
+    - Ensemble: 5/10 (Moderate)
+    - Prophet: 5/10 (Moderate)
+    - ARIMA: 5/10 (Moderate)
+    - LSTM: 5/10 (Moderate)
+  • Train/Test Split:
+    - Train fraction: 80%
+    - Train points: 17,281
+    - Test points: 4,320
+    - Train period: 2025-11-15 19:30:00 → 2025-11-27 19:30:00
+    - Test period: 2025-11-27 19:31:00 → 2025-11-30 19:30:00
+```
+
+### Metric Definitions
+
+#### MAE (Mean Absolute Error)
+- **Definition**: Average absolute difference between predicted and actual values
+- **Units**: Same as the metric being forecasted (e.g., percentage points for CPU, bytes for memory)
+- **Interpretation**: Lower is better. Represents the average magnitude of prediction errors.
+- **Example**: `mae_ensemble: 0.114947` means the ensemble model's predictions are off by an average of 0.11 units.
+
+#### MAPE (Mean Absolute Percentage Error)
+- **Definition**: Average percentage error relative to actual values
+- **Formula**: `mean(|actual - predicted| / |actual|) * 100`
+- **Units**: Percentage (%)
+- **Interpretation**: Lower is better. Provides a relative measure of error, useful for comparing models across different scales.
+- **Note**: For metrics with very small actual values (e.g., DISK_IO_WAIT ratios), MAPE can be misleadingly high. The system displays a note `(MAPE inflated by small actual values)` when MAPE > 50% and MAE < 0.01.
+- **Example**: `MAPE: 27.58%` means predictions are off by an average of 27.58% relative to actual values.
+
+#### Expected Error Rate (%)
+- **Definition**: Same as MAPE - the expected percentage error for future predictions
+- **Purpose**: Provides an intuitive understanding of model accuracy
+- **Interpretation**: Lower is better. Represents the expected error rate for future forecasts.
+- **Example**: `Expected Error Rate: 27.58%` means you can expect predictions to be within approximately 27.58% of actual values.
+
+#### Confidence Level (1-10 scale)
+- **Definition**: A confidence score where 1 is highest confidence and 10 is lowest confidence
+- **Calculation**: Based on both MAE and MAPE, with special handling for small values where MAPE can be misleading
+- **Scale**:
+  - **1-2**: Excellent (highest confidence)
+  - **3-4**: Good
+  - **5-6**: Moderate
+  - **7-8**: Low
+  - **9-10**: Very Low (lowest confidence)
+- **Interpretation**: Lower is better. Provides a single metric to assess model reliability.
+- **Special Handling**: For ratio metrics (like DISK_IO_WAIT), MAE is used as the primary indicator since MAPE can be inflated by small actual values.
+
+### Interpreting Results
+
+#### For Cluster-Level Models
+- **MAPE 20-30%**: Normal and acceptable for aggregated cluster metrics due to higher variability
+- **Confidence 5/10 (Moderate)**: Reasonable for cluster-level forecasting
+- **All models similar**: Indicates the limitation is data variability, not model choice
+
+#### For Node-Level Models
+- **MAPE < 10%**: Excellent accuracy
+- **MAPE 10-20%**: Good accuracy
+- **MAPE 20-30%**: Moderate accuracy (acceptable)
+- **MAPE > 50%**: Review model and data quality
+
+#### MAPE Inflation Note
+When you see `(MAPE inflated by small actual values)`, this indicates:
+- The metric has very small actual values (e.g., DISK_IO_WAIT ratios around 0.01)
+- MAPE is high (>50%) but MAE is very small (<0.01)
+- The model is actually performing well - the high MAPE is a mathematical artifact of dividing by small numbers
+- Focus on MAE for these metrics rather than MAPE
+
+### Example Interpretations
+
+**Example 1: Good Model Performance**
+```
+• mae_ensemble: 0.004243 (MAPE: 4.44%)
+• Confidence Level: 1/10 (Excellent)
+```
+- Low MAE and MAPE indicate high accuracy
+- Excellent confidence level
+- Model is reliable for predictions
+
+**Example 2: Moderate Performance (Cluster-Level)**
+```
+• mae_ensemble: 0.114947 (MAPE: 27.58%)
+• Confidence Level: 5/10 (Moderate)
+```
+- Moderate MAPE is normal for cluster-level aggregations
+- Confidence level reflects inherent variability in aggregated data
+- Model is performing as expected for this use case
+
+**Example 3: MAPE Inflation**
+```
+• mae_ensemble: 0.004243 (MAPE: 44.56%) (MAPE inflated by small actual values)
+• Confidence Level: 3/10 (Good)
+```
+- High MAPE is misleading due to small actual values
+- Low MAE indicates good absolute accuracy
+- Focus on MAE rather than MAPE for evaluation
 
 ---
 
@@ -901,13 +1047,19 @@ Detects anomalous nodes using IsolationForest, comparing nodes within the same K
 # Same as training (no separate prediction mode)
 
 1. Extract features (last LOOKBACK_HOURS):
-   # Same as training Step 1
+   # Temporal-Aware Mode (auto-enabled with 3+ months data):
+   # - Compares current values to same-time historical patterns (hour, day-of-week)
+   # - Features: *_current_context (same-time patterns) + overall averages
+   # Basic Mode (fallback):
+   # - Simple averages over LOOKBACK_HOURS window
 
 2. Group by cluster:
    # Same as training Step 2
 
 3. Predict anomalies:
    # Use trained IsolationForest models
+   # Temporal-Aware: Uses *_current_context features (8 features per node)
+   # Basic: Uses simple averages (4 features per node)
    labels = iso.predict(X)
 
 4. Return anomalous nodes:
@@ -949,6 +1101,11 @@ Detects anomalous nodes using IsolationForest, comparing nodes within the same K
 
 #### `LOOKBACK_HOURS` (24 hours)
 - **Classification**: Time window for feature extraction
+  - **Temporal-Aware Mode** (auto-enabled with 3+ months data):
+    - Compares current values to same-time historical patterns (hour, day-of-week)
+    - Reduces false positives from normal weekly/daily patterns
+  - **Basic Mode** (fallback):
+    - Simple averages over lookback window
 - **Other models**: Not used
 
 #### `CONTAMINATION` (0.12)
@@ -1022,7 +1179,7 @@ Detects anomalous nodes using IsolationForest, comparing nodes within the same K
 
 8. Backtesting
    ├─ Use test set (20% of data)
-   └─ Calculate: MAE, RMSE for all models
+   └─ Calculate: MAE, MAPE, Expected Error Rate, Confidence Level for all models
 
 9. Save Models
    └─ Save all models and manifests
