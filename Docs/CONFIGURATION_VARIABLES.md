@@ -122,10 +122,23 @@ This document explains how each configuration variable is used in training and p
   - `fetch_victoriametrics_metrics(query, start, end, step=STEP)`
   - Determines the time interval between data points in the query
   - Affects data density: smaller step = more data points, larger step = fewer points
+  - **Automatic Optimization**: System attempts to use base `STEP` (60s) first to maximize data
+  - **Adaptive Fallback**: If query fails (422 error), automatically retries with larger step sizes
+  - **Query Chunking**: For very large time ranges, queries are split into 360-hour chunks to preserve maximum data resolution
 
 ### Usage in Prediction:
 - Same as training - determines query resolution when fetching latest data
 - Affects forecast accuracy: more frequent data (smaller step) = better predictions
+- System automatically handles VictoriaMetrics query limits while maximizing data
+
+### Adaptive Step Sizing:
+The system automatically optimizes step size based on time range:
+- **Small ranges (<360 hours)**: Uses base `STEP` (60s) - maximum data resolution
+- **Large ranges (>360 hours)**: 
+  - First attempts full range with base `STEP` (60s)
+  - If query fails, splits into 360-hour chunks, each with 60s step
+  - Combines chunks to preserve all data with maximum resolution
+- **Very large ranges**: May use adaptive step sizing (300s, 600s, etc.) only if chunking fails
 
 **Example**: 
 - `STEP="60s"` = 1 data point per minute (60 data points per hour)
@@ -133,42 +146,72 @@ This document explains how each configuration variable is used in training and p
 - `STEP="3600s"` = 1 data point per hour (24 data points per day)
 
 **Code References**:
-- `fetch_and_preprocess_data()`: `step=STEP` parameter
+- `fetch_and_preprocess_data()`: `step=STEP` parameter with automatic optimization
 - `fetch_victoriametrics_metrics()`: Uses step size in query parameters
+- `calculate_adaptive_step()`: Calculates optimal step size for large ranges
 
 ---
 
 ## 5. `START_HOURS_AGO` (Default: 360 hours = 15 days)
 
-**Purpose**: How far back to fetch historical data from Prometheus.
+**Purpose**: How far back to fetch historical data from Prometheus/VictoriaMetrics.
 
 ### Usage in Training:
 - **Data Fetching**:
   - `start = int((pd.Timestamp.now() - pd.Timedelta(hours=start_hours_ago)).timestamp())`
   - Determines the time range of historical data used for training
   - More data = better model training (up to a point)
+  - **Query Optimization**: System automatically handles VictoriaMetrics query limits
+  - **Data Preservation**: Uses query chunking to preserve maximum data resolution
 
 ### Usage in Prediction:
 - Same as training - determines how much historical data to fetch for forecasts
 - Used in both training mode and forecast mode
+- System automatically optimizes queries to get maximum data
 
-**Example**: 
+### Query Optimization Strategy:
+
+The system uses a multi-tier approach to maximize data while avoiding query failures:
+
+1. **Primary Attempt**: Tries full time range with base `STEP` (60s) to get maximum data
+2. **Query Chunking**: If query fails (422 error), automatically splits into 360-hour chunks
+   - Each chunk uses 60s step (preserves maximum resolution)
+   - Chunks are combined and deduplicated
+   - Result: All data preserved with maximum resolution
+3. **Adaptive Step Fallback**: Only used if chunking fails (rare)
+   - Calculates optimal step size based on time range
+   - Targets ~15,000 data points per series to account for multiple instances
+
+### Examples:
 - `START_HOURS_AGO=360` = Fetch last 15 days of data (360 hours)
+  - Single query with 60s step → ~21,600 points per series
 - `START_HOURS_AGO=720` = Fetch last 30 days of data
-- `START_HOURS_AGO=168` = Fetch last 7 days of data
+  - Attempts single query with 60s step
+  - If fails: Splits into 2 chunks of 360h each, both with 60s step
+  - Combined result: ~43,200 points per series (all data preserved)
+- `START_HOURS_AGO=1080` = Fetch last 45 days of data
+  - Splits into 3 chunks of 360h each, all with 60s step
+  - Combined result: ~64,800 points per series
 
-**Trade-offs**:
+### Trade-offs:
 - **More data (larger value)**: 
-  - Better for capturing long-term patterns
-  - Slower queries and processing
+  - Better for capturing long-term patterns (daily, weekly, monthly seasonality)
+  - Enables monthly seasonality detection (requires ≥30 days)
+  - Slightly slower processing (chunking overhead)
   - More memory usage
 - **Less data (smaller value)**:
   - Faster queries and processing
   - May miss long-term patterns
   - Better for recent trend detection
 
+### Performance Notes:
+- **Chunking Overhead**: Minimal - chunks are processed sequentially but efficiently
+- **Data Quality**: No data loss - chunking preserves all data with original resolution
+- **Memory**: Linear scaling with time range (no exponential growth)
+
 **Code References**:
-- `fetch_and_preprocess_data()`: `start_hours_ago=START_HOURS_AGO` parameter
+- `fetch_and_preprocess_data()`: `start_hours_ago=START_HOURS_AGO` parameter with automatic optimization
+- `calculate_adaptive_step()`: Calculates optimal step size for large ranges
 - Used in all data fetching functions
 
 ---
@@ -329,7 +372,9 @@ export START_HOURS_AGO=168     # 7 days (faster queries)
 ```bash
 export HORIZON_MIN=60          # 1-hour forecasts
 export START_HOURS_AGO=720     # 30 days of history
-export STEP="300s"             # 5-minute resolution (less data)
+export STEP="60s"              # 1-minute resolution (system handles chunking automatically)
+# Note: System automatically chunks 720h queries into 360h pieces
+# Each chunk uses 60s step, preserving maximum data resolution
 ```
 
 ---

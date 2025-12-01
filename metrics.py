@@ -187,7 +187,7 @@ HORIZON_MIN, HORIZON_DEFAULT = get_env_value("HORIZON_MIN", "15", int)
 LOOKBACK_HOURS, LOOKBACK_DEFAULT = get_env_value("LOOKBACK_HOURS", "24", int)
 CONTAMINATION, CONTAM_DEFAULT = get_env_value("CONTAMINATION", "0.12", float)
 STEP, STEP_DEFAULT = get_env_value("STEP", "60s", str)
-START_HOURS_AGO, START_DEFAULT = get_env_value("START_HOURS_AGO", "360", int)
+START_HOURS_AGO, START_DEFAULT = get_env_value("START_HOURS_AGO", "720", int)
 LSTM_SEQ_LEN, LSTM_SEQ_DEFAULT = get_env_value("LSTM_SEQ_LEN", "60", int)
 LSTM_EPOCHS, LSTM_EPOCHS_DEFAULT = get_env_value("LSTM_EPOCHS", "10", int)
 TRAIN_FRACTION, TRAIN_DEFAULT = get_env_value("TRAIN_FRACTION", "0.8", float)
@@ -452,6 +452,42 @@ def save_io_net_manifest(path, manifest):
     except Exception as exc:
         print(f"Warning: failed to save disk manifest {path}: {exc}")
 
+def has_sufficient_data_for_monthly_seasonality(data, min_days=30):
+    """
+    Check if data spans at least min_days (default 30) to enable monthly seasonality.
+    
+    Args:
+        data: DataFrame with 'ds' column (Prophet format) or Series/DataFrame with datetime index
+        min_days: Minimum number of days required (default 30)
+    
+    Returns:
+        bool: True if data spans >= min_days, False otherwise
+    """
+    try:
+        if data is None or len(data) == 0:
+            return False
+        
+        # Handle DataFrame with 'ds' column (Prophet format)
+        if isinstance(data, pd.DataFrame) and 'ds' in data.columns:
+            if len(data) < 2:
+                return False
+            first_ts = pd.to_datetime(data['ds'].iloc[0])
+            last_ts = pd.to_datetime(data['ds'].iloc[-1])
+        # Handle Series or DataFrame with datetime index
+        elif hasattr(data, 'index') and isinstance(data.index, pd.DatetimeIndex):
+            if len(data) < 2:
+                return False
+            first_ts = data.index[0]
+            last_ts = data.index[-1]
+        else:
+            return False
+        
+        time_span_days = (last_ts - first_ts).total_seconds() / 86400.0
+        return time_span_days >= min_days
+    except Exception:
+        # If any error occurs, conservatively return False
+        return False
+
 def looks_like_hostname(s):
     """Check if a string looks like it could be a hostname or IP address."""
     if not s or len(s) > 253:  # Max hostname length
@@ -541,6 +577,26 @@ def print_config_summary():
     print(f"  • VM_URL        : {VM_BASE_URL}{flag(VM_URL_DEFAULT)}")
     print(f"  • STEP          : {STEP}{flag(STEP_DEFAULT)}")
     print(f"  • START_HOURS   : {START_HOURS_AGO}{flag(START_DEFAULT)}")
+    if START_HOURS_AGO > 8760:  # > 1 year
+        print(f"  ⚠️  WARNING: Very large time range ({START_HOURS_AGO/24:.1f} days)")
+        print(f"     This may cause slow processing and high memory usage")
+    if START_HOURS_AGO > 720:  # > 30 days
+        # Calculate adaptive step for large ranges
+        time_range_sec = START_HOURS_AGO * 3600
+        target_points = 15000  # Conservative target accounting for multiple series per query
+        calculated_step_sec = max(int(STEP.rstrip('s')), int(time_range_sec / target_points))
+        if calculated_step_sec <= 60:
+            adaptive_step = "60s"
+        elif calculated_step_sec <= 300:
+            adaptive_step = "300s"
+        elif calculated_step_sec <= 600:
+            adaptive_step = "600s"
+        elif calculated_step_sec <= 1800:
+            adaptive_step = "1800s"
+        else:
+            adaptive_step = "3600s"
+        print(f"  • Adaptive Step : {adaptive_step} (for {START_HOURS_AGO}h range)")
+        print(f"    Note: Large time ranges use adaptive step sizing to avoid query limits")
     print(f"  • HORIZON_MIN   : {HORIZON_MIN} minutes ({horizon_display}){flag(HORIZON_DEFAULT)}")
     print(f"  • LOOKBACK_HRS  : {LOOKBACK_HOURS}{flag(LOOKBACK_DEFAULT)}")
     print(f"  • CONTAMINATION : {CONTAMINATION}{flag(CONTAM_DEFAULT)}")
@@ -1336,12 +1392,16 @@ def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_m
                 # Create new Prophet model with same structure, but fit on latest data (minimal update)
                 m_updated = Prophet(daily_seasonality=prophet_params.get('daily_seasonality', True),
                                    weekly_seasonality=prophet_params.get('weekly_seasonality', True),
-                                   changepoint_prior_scale=prophet_params.get('changepoint_prior_scale', 0.05))
+                                   changepoint_prior_scale=prophet_params.get('changepoint_prior_scale', 0.05),
+                                   mcmc_samples=0)
                 m_updated.add_regressor('hour')
                 m_updated.add_regressor('is_weekend')
                 # Fit on recent data only (last 7 days) for faster fitting while keeping seasonality knowledge
                 # This is a minimal update - uses learned structure but incorporates recent trends
                 recent_data = pdf.tail(min(len(pdf), 7*24*60))  # Last 7 days or all if less
+                # Check original pdf for monthly seasonality (not just recent_data) since we want to know if we have enough historical data
+                if has_sufficient_data_for_monthly_seasonality(pdf, min_days=30):
+                    m_updated.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
                 m_updated.fit(recent_data)
                 
                 # Generate forecast
@@ -2206,7 +2266,20 @@ def format_sli_slo_report(sli_slo_results):
     lines.append("=" * 80)
     return "\n".join(lines)
 
-def fetch_victoriametrics_metrics(query, start, end, step=STEP):
+def fetch_victoriametrics_metrics(query, start, end, step=STEP, silent_422=False):
+    """
+    Fetch metrics from VictoriaMetrics.
+    
+    Args:
+        query: PromQL query string
+        start: Start timestamp (Unix seconds)
+        end: End timestamp (Unix seconds)
+        step: Step size (e.g., "60s", "300s")
+        silent_422: If True, don't print error message for 422 errors (used for retry logic)
+    
+    Returns:
+        DataFrame with metrics data, or empty DataFrame on error
+    """
     params = {'query': query, 'start': start, 'end': end, 'step': step}
     try:
         r = requests.get(VM_BASE_URL, params=params, timeout=30, verify=False)
@@ -2227,14 +2300,147 @@ def fetch_victoriametrics_metrics(query, start, end, step=STEP):
                 df[k] = v
             rows.append(df)
         return pd.concat(rows, ignore_index=True)
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 422:
+            if not silent_422:
+                # Calculate time range for better error message
+                time_range_hours = (end - start) / 3600
+                print(f"Query error (422): VictoriaMetrics rejected query - time range too large or query too complex")
+                print(f"  Time range: {time_range_hours:.1f} hours ({time_range_hours/24:.1f} days)")
+                print(f"  Step size: {step}")
+                estimated_points = int(time_range_hours * 3600 / int(step.rstrip('s')))
+                print(f"  Estimated data points per series: ~{estimated_points:,}")
+                print(f"  Will retry with adaptive step sizing...")
+        # Return empty DataFrame to signal failure (caller will retry)
+        return pd.DataFrame()
     except Exception as e:
-        print(f"Query error: {e}")
+        if not silent_422:
+            print(f"Query error: {e}")
         return pd.DataFrame()
 
+def calculate_adaptive_step(hours_ago, base_step=STEP):
+    """
+    Calculate adaptive step size for large time ranges to avoid VictoriaMetrics query limits.
+    
+    VictoriaMetrics may reject queries with too many data points. This function increases
+    step size for larger time ranges to keep queries manageable.
+    
+    IMPORTANT: Accounts for multiple series (instances/nodes) - queries often return
+    data for many instances, so we need to be conservative with step sizing.
+    
+    Args:
+        hours_ago: Number of hours to query
+        base_step: Base step size (default: STEP from config)
+    
+    Returns:
+        str: Step size string (e.g., "60s", "300s", "600s")
+    """
+    # Parse base step to seconds
+    base_step_sec = int(base_step.rstrip('s'))
+    
+    # Calculate time range in seconds
+    time_range_sec = hours_ago * 3600
+    
+    # Target: keep data points per series under ~15,000
+    # We use a conservative target because queries often return multiple series
+    # (one per instance/node). With 10 instances, 15k points each = 150k total points
+    # VictoriaMetrics typically rejects queries with >100k-200k total points
+    target_points_per_series = 15000
+    calculated_step_sec = max(base_step_sec, int(time_range_sec / target_points_per_series))
+    
+    # Round UP to next common step size for safety (more conservative)
+    # This ensures we stay well under limits even with many series
+    if calculated_step_sec <= 60:
+        return "60s"  # 1 minute
+    elif calculated_step_sec <= 300:
+        return "300s"  # 5 minutes (use this for 360-720 hours)
+    elif calculated_step_sec <= 600:
+        return "600s"  # 10 minutes
+    elif calculated_step_sec <= 1800:
+        return "1800s"  # 30 minutes
+    elif calculated_step_sec <= 3600:
+        return "3600s"  # 1 hour
+    else:
+        # For very large ranges, use 1 hour step (max reasonable)
+        return "3600s"  # 1 hour
+
 def fetch_and_preprocess_data(query, start_hours_ago=START_HOURS_AGO, step=STEP):
+    # Warn about very large time ranges that may cause performance issues
+    if start_hours_ago > 8760:  # > 1 year
+        print(f"  ⚠️  Warning: START_HOURS_AGO={start_hours_ago} ({start_hours_ago/24:.1f} days) is very large.")
+        print(f"     This may cause slow queries and high memory usage. Consider using a smaller value.")
+    elif start_hours_ago > 4380:  # > 6 months
+        log_verbose(f"  → Large time range: {start_hours_ago}h ({start_hours_ago/24:.1f} days) - processing may take longer")
+    
     start = int((pd.Timestamp.now() - pd.Timedelta(hours=start_hours_ago)).timestamp())
     end   = int(pd.Timestamp.now().timestamp())
+    
+    # MAXIMIZE DATA: Try with base step first (60s) to get maximum data points
+    # Only use adaptive step sizing if the query fails with 422 error
     df = fetch_victoriametrics_metrics(query, start, end, step)
+    
+    # If query failed with 422, split into chunks to get ALL data with 60s step
+    # This preserves maximum data by querying in smaller time windows that work
+    if df.empty:
+        # Use 360 hours as chunk size (we know this works with 60s step)
+        chunk_hours = 360
+        if start_hours_ago > chunk_hours:
+            print(f"  → Query failed, splitting into {chunk_hours}h chunks to preserve ALL data with {step} step...")
+            all_chunks = []
+            chunk_start = start
+            chunk_num = 1
+            total_chunks = int((end - start) / (chunk_hours * 3600)) + 1
+            
+            while chunk_start < end:
+                chunk_end = min(chunk_start + (chunk_hours * 3600), end)
+                chunk_start_dt = pd.Timestamp.fromtimestamp(chunk_start)
+                chunk_end_dt = pd.Timestamp.fromtimestamp(chunk_end)
+                print(f"    Chunk {chunk_num}/{total_chunks}: {chunk_start_dt.strftime('%Y-%m-%d %H:%M')} to {chunk_end_dt.strftime('%Y-%m-%d %H:%M')}")
+                
+                chunk_df = fetch_victoriametrics_metrics(query, chunk_start, chunk_end, step, silent_422=True)
+                if not chunk_df.empty:
+                    all_chunks.append(chunk_df)
+                    print(f"      ✓ {len(chunk_df)} rows")
+                else:
+                    # If chunk fails, try adaptive step for this chunk only
+                    chunk_hours_actual = (chunk_end - chunk_start) / 3600
+                    adaptive_step = calculate_adaptive_step(chunk_hours_actual, base_step=step)
+                    chunk_df = fetch_victoriametrics_metrics(query, chunk_start, chunk_end, adaptive_step, silent_422=True)
+                    if not chunk_df.empty:
+                        all_chunks.append(chunk_df)
+                        print(f"      ✓ {len(chunk_df)} rows (using {adaptive_step} step)")
+                    else:
+                        print(f"      ✗ Failed even with adaptive step")
+                
+                chunk_start = chunk_end
+                chunk_num += 1
+            
+            if all_chunks:
+                df = pd.concat(all_chunks, ignore_index=True)
+                # Remove duplicates at chunk boundaries (same timestamp + instance)
+                # Identify grouping columns
+                group_cols = ['ts']
+                for col in ['instance', 'entity', 'node', 'hostname', 'mountpoint', 'filesystem']:
+                    if col in df.columns:
+                        group_cols.append(col)
+                df = df.drop_duplicates(subset=group_cols, keep='first')
+                df = df.sort_values('ts').reset_index(drop=True)
+                print(f"  ✓ Combined {len(all_chunks)} chunks: {len(df):,} total rows (ALL data preserved with {step} step)")
+            else:
+                print(f"  ✗ All chunks failed")
+        else:
+            # Small range but still failed - try adaptive step
+            adaptive_step = calculate_adaptive_step(start_hours_ago, base_step=step)
+            if adaptive_step != step:
+                estimated_points_base = int(start_hours_ago * 3600 / int(step.rstrip('s')))
+                estimated_points_adaptive = int(start_hours_ago * 3600 / int(adaptive_step.rstrip('s')))
+                print(f"  → Query failed, retrying with adaptive step: {adaptive_step}")
+                print(f"    Data points per series: {estimated_points_base:,} → {estimated_points_adaptive:,}")
+                df = fetch_victoriametrics_metrics(query, start, end, adaptive_step, silent_422=True)
+                if not df.empty:
+                    print(f"  ✓ Retry successful with step={adaptive_step}")
+                else:
+                    print(f"  ✗ Retry also failed")
     if df.empty:
         return pd.DataFrame()
 
@@ -2424,15 +2630,20 @@ def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, thr
                     recent_pdf = pdf.tail(min(len(pdf), 7*24*6))
                     # Enable daily seasonality to catch daily batch job patterns (e.g., weekend backups, daily ETL jobs)
                     # Weekly seasonality already enabled for weekly patterns
-                    m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
+                    # Monthly seasonality added for longer-term patterns (e.g., monthly reports, billing cycles)
+                    # mcmc_samples=0 disables MCMC sampling for more deterministic results
+                    m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, mcmc_samples=0)
+                    if has_sufficient_data_for_monthly_seasonality(recent_pdf, min_days=30):
+                        m.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
                     m.fit(recent_pdf)
                     future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
                     forecast = m.predict(future)
                     prophet_forecast_df = forecast
-                    now_ts = pd.Timestamp.now()
-                    future_forecast = forecast[forecast['ds'] > now_ts]
+                    # Use last data point timestamp instead of current time for consistent ETA calculation
+                    last_data_ts = ts.index[-1]
+                    future_forecast = forecast[forecast['ds'] > last_data_ts]
                     over = future_forecast[future_forecast['yhat'] >= threshold_pct/100]
-                    updated_prophet_days = max(0.0, (over.iloc[0]['ds'] - now_ts).total_seconds() / 86400) if not over.empty else 9999.0
+                    updated_prophet_days = max(0.0, (over.iloc[0]['ds'] - last_data_ts).total_seconds() / 86400) if not over.empty else 9999.0
                     daily_increase = train_ts.diff().resample('1D').mean().mean()
                     current_pct = ts.iloc[-1] * 100
                     if current_pct >= threshold_pct:
@@ -2469,7 +2680,9 @@ def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, thr
                             pdf.columns = ['ds', 'y']
                             pdf['y'] = pdf['y'].clip(upper=0.99)
                             # Use all data for plotting in training mode
-                            m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
+                            m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, mcmc_samples=0)
+                            if has_sufficient_data_for_monthly_seasonality(pdf, min_days=30):
+                                m.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
                             m.fit(pdf)
                             future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
                             prophet_forecast_df = m.predict(future)
@@ -2612,7 +2825,11 @@ def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, thr
                     dump_dataframe_to_csv(fit_pdf_for_csv, dump_csv_dir, dump_label)
                 else:
                     dump_dataframe_to_csv(fit_pdf.copy(), dump_csv_dir, dump_label)
-                m = Prophet(daily_seasonality=False, weekly_seasonality=True, yearly_seasonality=False)
+                # Enable daily seasonality to catch daily batch job patterns (consistent with other functions)
+                # Monthly seasonality added for longer-term patterns (e.g., monthly reports, billing cycles)
+                m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, mcmc_samples=0)
+                if has_sufficient_data_for_monthly_seasonality(fit_pdf, min_days=30):
+                    m.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
                 m.fit(fit_pdf)
                 prophet_model = m
                 if needs_retrain and len(test_ts) > 0:
@@ -2624,10 +2841,11 @@ def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, thr
                 future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
                 forecast = m.predict(future)
                 prophet_forecast_df = forecast
-                now_ts = pd.Timestamp.now()
-                future_forecast = forecast[forecast['ds'] > now_ts]
+                # Use last data point timestamp instead of current time for consistent ETA calculation
+                last_data_ts = ts.index[-1]
+                future_forecast = forecast[forecast['ds'] > last_data_ts]
                 over = future_forecast[future_forecast['yhat'] >= threshold_pct/100]
-                prophet_days = max(0.0, (over.iloc[0]['ds'] - now_ts).total_seconds() / 86400) if not over.empty else 9999.0
+                prophet_days = max(0.0, (over.iloc[0]['ds'] - last_data_ts).total_seconds() / 86400) if not over.empty else 9999.0
             except:
                 prophet_days = max(0.0, linear_days) if 'linear_days' in locals() else 9999.0
             
@@ -3069,7 +3287,11 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                         pdf['y'] = pdf['y'].clip(upper=0.99)
                         # Enable daily seasonality to catch daily batch job patterns (e.g., weekend backups, daily ETL jobs)
                         # Weekly seasonality already enabled for weekly patterns
-                        m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
+                        # Monthly seasonality added for longer-term patterns (e.g., monthly reports, billing cycles)
+                        # mcmc_samples=0 disables MCMC sampling for more deterministic results
+                        m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, mcmc_samples=0)
+                        if has_sufficient_data_for_monthly_seasonality(pdf, min_days=30):
+                            m.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
                         m.fit(pdf)
                         if len(test_ts) > 0:
                             test_df = test_ts.reset_index()
@@ -3107,18 +3329,23 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                             # Minimal update: fit on recent data only
                             # Enable daily seasonality to catch daily batch job patterns (e.g., weekend backups, daily ETL jobs)
                             # Weekly seasonality already enabled for weekly patterns
-                            m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
+                            # Monthly seasonality added for longer-term patterns (e.g., monthly reports, billing cycles)
+                            # mcmc_samples=0 disables MCMC sampling for more deterministic results
+                            m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, mcmc_samples=0)
+                            if has_sufficient_data_for_monthly_seasonality(recent_pdf, min_days=30):
+                                m.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
                             m.fit(recent_pdf)
                             future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
                             forecast = m.predict(future)
                             prophet_forecast_df = forecast
                             # Update forecast with minimal update
                             # Only look at FUTURE forecast points (not historical)
-                            now_ts = pd.Timestamp.now()
-                            future_forecast = forecast[forecast['ds'] > now_ts]
+                            # Use last data point timestamp instead of current time for consistent ETA calculation
+                            last_data_ts = ts.index[-1]
+                            future_forecast = forecast[forecast['ds'] > last_data_ts]
                             over = future_forecast[future_forecast['yhat'] >= threshold_pct/100]
                             if not over.empty:
-                                updated_prophet_days_calc = (over.iloc[0]['ds'] - now_ts).total_seconds() / 86400
+                                updated_prophet_days_calc = (over.iloc[0]['ds'] - last_data_ts).total_seconds() / 86400
                                 # Ensure non-negative (should always be positive for future points, but clamp anyway)
                                 updated_prophet_days = max(0.0, updated_prophet_days_calc)
                             else:
@@ -3196,7 +3423,9 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                                     fit_pdf = pdf  # Use all train data for accurate backtest
                                 else:
                                     fit_pdf = pdf.tail(min(len(pdf), 7*24*6))  # Use recent data for speed
-                                m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
+                                m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, mcmc_samples=0)
+                                if has_sufficient_data_for_monthly_seasonality(fit_pdf, min_days=30):
+                                    m.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
                                 m.fit(fit_pdf)
                                 # Extend to cover test period + forecast horizon
                                 future_periods = max(horizon_days*24*10, int((test_ts.index[-1] - train_ts.index[-1]).total_seconds() / (6*3600)) + 10) if len(test_ts) > 0 else horizon_days*24*10
@@ -3372,7 +3601,11 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                         dump_dataframe_to_csv(fit_pdf.copy(), dump_csv_dir, dump_label)
                     # Enable daily seasonality to catch daily batch job patterns (e.g., weekend backups, daily ETL jobs)
                     # Weekly seasonality already enabled for weekly patterns
-                    m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False)
+                    # Monthly seasonality added for longer-term patterns (e.g., monthly reports, billing cycles)
+                    # mcmc_samples=0 disables MCMC sampling for more deterministic results
+                    m = Prophet(daily_seasonality=True, weekly_seasonality=True, yearly_seasonality=False, mcmc_samples=0)
+                    if has_sufficient_data_for_monthly_seasonality(fit_pdf, min_days=30):
+                        m.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
                     m.fit(fit_pdf)
                     prophet_model = m  # Store for plotting
                     
@@ -3389,11 +3622,12 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                     forecast = m.predict(future)
                     prophet_forecast_df = forecast  # Store for plotting
                     # Only look at FUTURE forecast points (not historical)
-                    now_ts = pd.Timestamp.now()
-                    future_forecast = forecast[forecast['ds'] > now_ts]
+                    # Use last data point timestamp instead of current time for consistent ETA calculation
+                    last_data_ts = ts.index[-1]
+                    future_forecast = forecast[forecast['ds'] > last_data_ts]
                     over = future_forecast[future_forecast['yhat'] >= threshold_pct/100]
                     if not over.empty:
-                        prophet_days_calc = (over.iloc[0]['ds'] - now_ts).total_seconds() / 86400
+                        prophet_days_calc = (over.iloc[0]['ds'] - last_data_ts).total_seconds() / 86400
                         # Ensure non-negative (should always be positive for future points, but clamp anyway)
                         prophet_days = max(0.0, prophet_days_calc)
                     else:
@@ -3729,8 +3963,11 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
     }
     m = Prophet(daily_seasonality=prophet_params['daily_seasonality'], 
                 weekly_seasonality=prophet_params['weekly_seasonality'], 
-                changepoint_prior_scale=prophet_params['changepoint_prior_scale'])
+                changepoint_prior_scale=prophet_params['changepoint_prior_scale'],
+                mcmc_samples=0)
     m.add_regressor('hour'); m.add_regressor('is_weekend')
+    if has_sufficient_data_for_monthly_seasonality(pdf, min_days=30):
+        m.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
     pdf['hour'] = pdf['ds'].dt.hour
     pdf['is_weekend'] = (pdf['ds'].dt.dayofweek>=5).astype(int)
     
@@ -3835,9 +4072,11 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
     
     if len(test_ts) >= 50:
         # Prophet backtest
-        mb = Prophet(daily_seasonality=True, weekly_seasonality=True, changepoint_prior_scale=0.05)
+        mb = Prophet(daily_seasonality=True, weekly_seasonality=True, changepoint_prior_scale=0.05, mcmc_samples=0)
         mb.add_regressor('hour')
         mb.add_regressor('is_weekend')
+        if has_sufficient_data_for_monthly_seasonality(train, min_days=30):
+            mb.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
 
         train_b = train.copy()
         train_b['hour'] = train_b['ds'].dt.hour
@@ -6058,6 +6297,8 @@ def _process_single_node_io_crisis(inst, group, name, thresholds, units, test_da
                     pdf = recent_train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
                     m_updated = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, 
                                       weekly_seasonality=True, n_changepoints=10)
+                    if has_sufficient_data_for_monthly_seasonality(pdf, min_days=30):
+                        m_updated.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
                     m_updated.fit(pdf)
                     m = m_updated
                     model_updated = True
@@ -6068,12 +6309,16 @@ def _process_single_node_io_crisis(inst, group, name, thresholds, units, test_da
                 pdf = recent_train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
                 m = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, 
                            weekly_seasonality=True, n_changepoints=10)
+                if has_sufficient_data_for_monthly_seasonality(pdf, min_days=30):
+                    m.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
                 m.fit(pdf)
                 model_updated = True
             else:
                 pdf = train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
                 m = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, 
                            weekly_seasonality=True, n_changepoints=15)
+                if has_sufficient_data_for_monthly_seasonality(pdf, min_days=30):
+                    m.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
                 m.fit(pdf)
                 model_updated = True
         
@@ -6593,6 +6838,8 @@ def predict_io_and_network_crisis_with_backtest(
                                     weekly_seasonality=True,
                                     n_changepoints=10  # Reduce changepoints from default 25 for faster fitting
                                 )
+                                if has_sufficient_data_for_monthly_seasonality(pdf, min_days=30):
+                                    m_updated.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
                                 m_updated.fit(pdf)
                                 m = m_updated  # Use updated model for forecasting
                                 manifest[key] = {'model': m}  # Save updated model to manifest
@@ -6611,6 +6858,8 @@ def predict_io_and_network_crisis_with_backtest(
                         pdf = recent_train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
                         # OPTIMIZATION: Use faster Prophet settings for minimal updates
                         m = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, weekly_seasonality=True, n_changepoints=10)
+                        if has_sufficient_data_for_monthly_seasonality(pdf, min_days=30):
+                            m.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
                         m.fit(pdf)
                         # Add node and signal metadata to CSV
                         if dump_csv_dir:
@@ -6628,6 +6877,8 @@ def predict_io_and_network_crisis_with_backtest(
                         pdf = train.reset_index().rename(columns={'timestamp': 'ds', 'value': 'y'})
                         # OPTIMIZATION: Use faster Prophet settings for first-time training
                         m = Prophet(changepoint_prior_scale=0.2, daily_seasonality=True, weekly_seasonality=True, n_changepoints=15)
+                        if has_sufficient_data_for_monthly_seasonality(pdf, min_days=30):
+                            m.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
                         m.fit(pdf)
                         manifest[key] = {'model': m}
                         manifest_changed = True
@@ -7525,6 +7776,9 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
                             recent_train_df = train_df_sorted[train_df_sorted['timestamp'] >= cutoff_time]
                             if len(recent_train_df) < 50:
                                 recent_train_df = train_df_sorted.tail(min(len(train_df_sorted), 7*24*6))  # Fallback: last N rows
+                        else:
+                            # Not in forecast mode, use full train_df
+                            recent_train_df = train_df
                         # Determine plot flags based on enable_forecast_plots and enable_backtest_plots
                         should_save_forecast = enable_forecast_plots if enable_forecast_plots is not None else (enable_plots if forecast_mode else False)
                         should_save_backtest = enable_backtest_plots if enable_backtest_plots is not None else False

@@ -23,6 +23,25 @@ df_cpu = fetch_and_preprocess_data(q_host_cpu)  # Uses START_HOURS_AGO
 - Feature extraction
 - Model updates
 
+### 2. **Automatic Query Optimization**
+
+The system automatically optimizes queries to maximize data while avoiding VictoriaMetrics limits:
+
+- **Primary Strategy**: Attempts full time range with base `STEP` (60s) for maximum data resolution
+- **Query Chunking**: If query fails (422 error), automatically splits into 360-hour chunks
+  - Each chunk uses 60s step (preserves maximum resolution)
+  - Chunks are combined and deduplicated
+  - Result: All data preserved with maximum resolution
+- **Adaptive Step Fallback**: Only used if chunking fails (rare)
+  - Calculates optimal step size based on time range
+  - Targets ~15,000 data points per series
+
+**Example with `START_HOURS_AGO=720` (30 days)**:
+1. Attempts single query: 720h with 60s step → fails (422 error)
+2. Automatically splits into 2 chunks: 360h each, both with 60s step
+3. Combines chunks: ~43,200 points per series (all data preserved)
+4. Result: Same data quality as 360h, but for 720h range
+
 ---
 
 ## Training Mode (`--training`)
@@ -34,9 +53,20 @@ df_cpu = fetch_and_preprocess_data(q_host_cpu)  # Uses START_HOURS_AGO
 
 ### Example:
 - `START_HOURS_AGO = 360` hours (15 days)
-- Fetches 15 days of historical data
+- Fetches 15 days of historical data with 60s step
+- Single query succeeds → ~21,600 points per series
 - Trains Prophet, ARIMA, LSTM on all 15 days
-- Models learn long-term patterns, seasonality, trends
+- Models learn daily and weekly patterns
+- Saves models to disk
+
+### Example with Large Time Range:
+- `START_HOURS_AGO = 720` hours (30 days)
+- Attempts single query with 60s step → fails (422 error)
+- Automatically splits into 2 chunks of 360h each
+- Each chunk uses 60s step → ~21,600 points per series per chunk
+- Combines chunks → ~43,200 points per series total
+- Trains Prophet, ARIMA, LSTM on all 30 days
+- Models learn daily, weekly, and monthly patterns (monthly seasonality enabled)
 - Saves models to disk
 
 ---

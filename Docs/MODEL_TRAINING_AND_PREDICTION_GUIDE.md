@@ -119,31 +119,37 @@ Forecasts CPU and Memory usage for Kubernetes clusters and standalone nodes usin
 
 1. Initialize Prophet model with hyperparameters:
    m = Prophet(
-       daily_seasonality=True,      # Daily patterns
-       weekly_seasonality=True,     # Weekly patterns
-       changepoint_prior_scale=0.05 # Trend flexibility
+       daily_seasonality=True,      # Daily patterns (e.g., hourly backups, daily ETL jobs)
+       weekly_seasonality=True,     # Weekly patterns (e.g., weekend batch jobs)
+       changepoint_prior_scale=0.05, # Trend flexibility
+       mcmc_samples=0               # Deterministic behavior (disables MCMC sampling)
    )
 
-2. Add regressors (external variables):
+2. Add conditional monthly seasonality (if data spans ≥30 days):
+   if has_sufficient_data_for_monthly_seasonality(train, min_days=30):
+       m.add_seasonality(name='monthly', period=30.44, fourier_order=5)
+       # Captures monthly patterns (e.g., monthly reports, billing cycles)
+
+3. Add regressors (external variables):
    m.add_regressor('hour')        # Hour of day
    m.add_regressor('is_weekend')  # Weekend flag
 
-3. Fit on training data:
+4. Fit on training data:
    m.fit(train)
 
-4. Generate future dataframe:
+5. Generate future dataframe:
    future = m.make_future_dataframe(periods=HORIZON_MIN, freq='min')
    # Creates HORIZON_MIN future data points
 
-5. Add regressors to future:
+6. Add regressors to future:
    future['hour'] = future['ds'].dt.hour
    future['is_weekend'] = (future['ds'].dt.dayofweek >= 5).astype(int)
 
-6. Generate forecast:
+7. Generate forecast:
    f_prophet = m.predict(future)['yhat']
    # Returns forecast for training period + HORIZON_MIN future points
 
-7. Save Prophet hyperparameters:
+8. Save Prophet hyperparameters:
    prophet_params = {
        'daily_seasonality': True,
        'weekly_seasonality': True,
@@ -151,6 +157,20 @@ Forecasts CPU and Memory usage for Kubernetes clusters and standalone nodes usin
    }
    # Saved to: {model_path}_prophet_params.pkl
 ```
+
+**Seasonality Configuration**:
+- **Daily**: Enabled by default - captures hourly patterns within each day
+- **Weekly**: Enabled by default - captures day-of-week patterns
+- **Monthly**: Conditionally enabled - only added if data spans ≥30 days
+  - Automatically detected based on time range
+  - Uses period=30.44 days (average month length)
+  - Fourier order=5 for pattern capture
+- **Yearly**: Disabled (not needed for infrastructure metrics)
+
+**Deterministic Behavior**:
+- `mcmc_samples=0` ensures reproducible results across runs
+- Disables MCMC sampling for faster, deterministic training
+- Same data + same configuration = same model predictions
 
 **Configuration Impact**:
 - `HORIZON_MIN`: Determines how many future points Prophet generates
@@ -477,12 +497,17 @@ Predicts when disk usage will reach 90% threshold for each node/mountpoint combi
        'y': train_ts.values
    })
 
-2. Fit Prophet (with daily + weekly seasonality):
+2. Fit Prophet (with daily + weekly + conditional monthly seasonality):
    m = Prophet(
        daily_seasonality=True,   # Learns daily patterns (e.g., daily ETL jobs, hourly backups)
        weekly_seasonality=True,  # Learns weekly patterns (e.g., weekend batch jobs)
-       yearly_seasonality=False
+       yearly_seasonality=False, # Disabled (not needed for infrastructure metrics)
+       mcmc_samples=0            # Deterministic behavior (reproducible results)
    )
+   # Conditionally add monthly seasonality if data spans ≥30 days
+   if has_sufficient_data_for_monthly_seasonality(pdf, min_days=30):
+       m.add_seasonality(name='monthly', period=30.44, fourier_order=5)
+       # Captures monthly patterns (e.g., monthly reports, billing cycles, monthly backups)
    m.fit(pdf)
    # Temporal-aware: Accounts for batch job patterns to reduce false positives
 
@@ -492,9 +517,15 @@ Predicts when disk usage will reach 90% threshold for each node/mountpoint combi
    f_prophet = m.predict(future)['yhat']
 
 4. Find when forecast reaches 90%:
-   # Search through forecast to find first point >= 90%
-   days_to_90_prophet = find_first_exceedance(f_prophet, threshold=90.0)
-   # If never reaches 90%, set to 9999
+   # Use last data point timestamp (not current time) for consistent ETA calculation
+   last_data_ts = train_ts.index[-1]
+   future_forecast = forecast[forecast['ds'] > last_data_ts]
+   over = future_forecast[future_forecast['yhat'] >= threshold_pct/100]
+   if not over.empty:
+       days_to_90_prophet = (over.iloc[0]['ds'] - last_data_ts).total_seconds() / 86400
+   else:
+       days_to_90_prophet = 9999.0
+   # Ensures deterministic ETA calculation (same data = same prediction)
 ```
 
 **Configuration Impact**:
@@ -519,6 +550,12 @@ Predicts when disk usage will reach 90% threshold for each node/mountpoint combi
    else:
        alert = 'OK'
 ```
+
+**Deterministic ETA Calculation**:
+- ETA calculations use the **last data point timestamp** (not current time) for consistency
+- Ensures reproducible results: same data + same configuration = same ETA prediction
+- Prevents time-dependent variations when running predictions at different times
+- Formula: `days_to_threshold = (threshold_timestamp - last_data_timestamp) / 86400`
 
 #### Step 6: Save Model
 ```python
@@ -626,15 +663,19 @@ test_ts = ts.iloc[split_idx:]
        'y': train_ts.values
    })
 
-2. Fit Prophet (with daily + weekly seasonality):
+2. Fit Prophet (with daily + weekly + conditional monthly seasonality):
    m = Prophet(
        daily_seasonality=True,   # Learns daily patterns (e.g., daily batch jobs)
        weekly_seasonality=True,  # Learns weekly patterns (e.g., weekend backups)
        changepoint_prior_scale=0.2,
-       n_changepoints=10  # Optimized for speed
+       n_changepoints=10,        # Optimized for speed
+       mcmc_samples=0            # Deterministic behavior (reproducible results)
    )
+   # Conditionally add monthly seasonality if data spans ≥30 days
+   if has_sufficient_data_for_monthly_seasonality(pdf, min_days=30):
+       m.add_seasonality(name='monthly', period=30.44, fourier_order=5)
    m.fit(pdf)
-   # Temporal-aware: Accounts for daily/weekly patterns to reduce false positives
+   # Temporal-aware: Accounts for daily/weekly/monthly patterns to reduce false positives
 
 3. Generate forecast:
    future = m.make_future_dataframe(
@@ -1115,6 +1156,9 @@ Detects anomalous nodes using IsolationForest, comparing nodes within the same K
 #### `STEP` ("60s")
 - **All models**: Query resolution for Prometheus data
 - Affects data density and query performance
+- **Automatic Optimization**: System attempts to use base `STEP` (60s) first
+- **Query Chunking**: Large time ranges automatically split into 360h chunks
+- **Data Preservation**: Chunking preserves maximum resolution (60s step) while avoiding query limits
 
 #### `START_HOURS_AGO` (360 hours)
 - **All models**: Historical data range
