@@ -105,6 +105,18 @@ except ImportError:
     print("TensorFlow not found. LSTM disabled. Install with: pip install tensorflow-cpu")
     LSTM_AVAILABLE = False
 
+# --- LightGBM (optional, enabled by default) ---
+try:
+    import lightgbm as lgb
+    LIGHTGBM_AVAILABLE = True
+except (ImportError, OSError) as e:
+    # OSError can occur on macOS if libomp.dylib is missing
+    # Install with: brew install libomp (then reinstall lightgbm: pip install --force-reinstall lightgbm)
+    print("LightGBM not available. LightGBM disabled.")
+    print("  Install with: pip install lightgbm")
+    print("  On macOS, if you get libomp.dylib error, run: brew install libomp")
+    LIGHTGBM_AVAILABLE = False
+
 # Additional general warning suppression (catch-all for any remaining warnings)
 warnings.filterwarnings("ignore")
 
@@ -190,6 +202,8 @@ STEP, STEP_DEFAULT = get_env_value("STEP", "60s", str)
 START_HOURS_AGO, START_DEFAULT = get_env_value("START_HOURS_AGO", "720", int)
 LSTM_SEQ_LEN, LSTM_SEQ_DEFAULT = get_env_value("LSTM_SEQ_LEN", "60", int)
 LSTM_EPOCHS, LSTM_EPOCHS_DEFAULT = get_env_value("LSTM_EPOCHS", "10", int)
+LIGHTGBM_ENABLED, LIGHTGBM_DEFAULT = get_env_value("LIGHTGBM_ENABLED", "1", int)  # 1 = enabled, 0 = disabled
+LIGHTGBM_ENABLED = bool(LIGHTGBM_ENABLED) and LIGHTGBM_AVAILABLE  # Only enable if library is available
 TRAIN_FRACTION, TRAIN_DEFAULT = get_env_value("TRAIN_FRACTION", "0.8", float)
 
 # Model paths - use MODEL_DIR unless a full path is provided in env var
@@ -563,6 +577,126 @@ def parse_io_net_retrain_targets(spec):
             targets.add(node_canon)
     return targets
 
+# ====================== OUTPUT FORMATTING HELPERS ======================
+def _get_plot_filename(plot_path):
+    """Extract just the filename from a full plot path for cleaner output."""
+    return os.path.basename(plot_path)
+
+def format_section_header(title, width=80):
+    """Format a section header with consistent styling."""
+    return f"\n{'='*width}\n{title}\n{'='*width}"
+
+def format_subsection_header(title, width=80):
+    """Format a subsection header."""
+    return f"\n{'-'*width}\n{title}\n{'-'*width}"
+
+def format_parallel_info(count, workers, mode="parallel"):
+    """Format parallel execution information."""
+    if mode == "parallel":
+        return f"[PARALLEL] Processing {count} item(s) with {workers} worker(s)"
+    else:
+        return f"[SEQUENTIAL] Processing {count} item(s)"
+
+def format_backtest_metrics_table(node, signal, metrics):
+    """Format backtest metrics in a standardized table format."""
+    lines = []
+    lines.append(f"  Node: {node} | Signal: {signal}")
+    lines.append(f"  {'─'*76}")
+    
+    # Model metrics section
+    model_metrics = []
+    for model in ['ensemble', 'prophet', 'arima', 'lstm', 'lightgbm']:
+        mae_key = f'mae_{model}'
+        mape_key = f'mape_{model}'
+        conf_key = f'confidence_{model}'
+        
+        if metrics.get(mae_key) is not None and not pd.isna(metrics[mae_key]):
+            mae_val = metrics[mae_key]
+            mape_val = metrics.get(mape_key)
+            conf_val = metrics.get(conf_key)
+            
+            model_name = model.capitalize()
+            mae_str = f"MAE: {mae_val:.6f}"
+            
+            if mape_val is not None and not pd.isna(mape_val):
+                mape_note = ""
+                if mape_val > 50 and mae_val < 0.01:
+                    mape_note = " (inflated)"
+                mae_str += f" | MAPE: {mape_val:.2f}%{mape_note}"
+            
+            if conf_val is not None:
+                # Add confidence description: <=2 Excellent, <=4 Good, <=6 Moderate, <=8 Low, >8 Very Low
+                conf_desc = "Excellent" if conf_val <= 2 else "Good" if conf_val <= 4 else "Moderate" if conf_val <= 6 else "Low" if conf_val <= 8 else "Very Low"
+                mae_str += f" | Confidence: {conf_val}/10 ({conf_desc})"
+            
+            model_metrics.append(f"    {model_name:12s} {mae_str}")
+    
+    if model_metrics:
+        lines.append("  Model Performance:")
+        lines.extend(model_metrics)
+    
+    # Train/Test split
+    if metrics.get('split_info'):
+        split_info = metrics['split_info']
+        train_pct = round(split_info.get('train_fraction', 0.8) * 100)
+        test_pct = 100 - train_pct
+        lines.append(f"  Train/Test Split: {train_pct}% / {test_pct}%")
+        lines.append(f"    Train: {split_info.get('train_points', 0):,} points")
+        if split_info.get('train_start'):
+            lines.append(f"      Period: {split_info['train_start']} → {split_info['train_end']}")
+        lines.append(f"    Test:  {split_info.get('test_points', 0):,} points")
+        if split_info.get('test_start'):
+            lines.append(f"      Period: {split_info['test_start']} → {split_info['test_end']}")
+    
+    # Features used (if available)
+    if metrics.get('features_used'):
+        features = metrics['features_used']
+        if features:
+            features_str = ', '.join(features)
+            lines.append(f"  Features Used: {features_str}")
+    
+    return "\n".join(lines)
+
+def format_cluster_result(cluster_id, status, nodes=None, error=None):
+    """Format cluster processing result."""
+    if status == "success":
+        node_info = f" ({nodes} nodes)" if nodes else ""
+        return f"  ✓ {cluster_id}{node_info}"
+    elif status == "error":
+        return f"  ✗ {cluster_id}: {error}"
+    elif status == "warning":
+        return f"  ⚠ {cluster_id}: {error}"
+    else:
+        return f"  • {cluster_id}"
+
+def format_model_metrics(metrics, indent="    "):
+    """Format model metrics in a clean, standardized way."""
+    if not metrics:
+        return ""
+    
+    lines = []
+    for k, v in metrics.items():
+        if k == 'split_info' and isinstance(v, dict):
+            lines.append(f"{indent}Train/Test Split:")
+            train_pct = round(v.get('train_fraction', 0.8) * 100)
+            test_pct = 100 - train_pct
+            lines.append(f"{indent}  Train: {train_pct}% ({v.get('train_points', 0):,} points)")
+            lines.append(f"{indent}  Test:  {test_pct}% ({v.get('test_points', 0):,} points)")
+            if v.get('train_start'):
+                lines.append(f"{indent}  Period: {v['train_start']} → {v['train_end']}")
+        elif isinstance(v, (int, float)):
+            # Format numeric values consistently
+            if abs(v) < 0.0001:
+                lines.append(f"{indent}{k}: {v:.6e}")
+            elif abs(v) < 1:
+                lines.append(f"{indent}{k}: {v:.6f}")
+            else:
+                lines.append(f"{indent}{k}: {v:.4f}")
+        else:
+            lines.append(f"{indent}{k}: {v}")
+    
+    return "\n".join(lines)
+
 def print_config_summary():
     print("\n" + "="*80)
     print("GLOBAL CONFIGURATION")
@@ -604,6 +738,7 @@ def print_config_summary():
     print(f"  • LSTM_EPOCHS   : {LSTM_EPOCHS}{flag(LSTM_EPOCHS_DEFAULT)}")
     print(f"  • TRAIN SPLIT   : {train_pct}% train / {test_pct}% test{flag(TRAIN_DEFAULT)}")
     print(f"  • LSTM Available: {LSTM_AVAILABLE}")
+    print(f"  • LightGBM      : {'Enabled' if LIGHTGBM_ENABLED else 'Disabled'}{' (library not available)' if not LIGHTGBM_AVAILABLE else ''}")
     model_dir_env = os.getenv("MODEL_FILES_DIR")
     if model_dir_env:
         print(f"  • MODEL_DIR     : {MODEL_DIR} (from MODEL_FILES_DIR env var)")
@@ -859,7 +994,7 @@ def augment_aliases_from_dns(df_host, df_pod):
         except OSError:
             continue
     if new_entries:
-        log_verbose(f"DNS alias inference added {new_entries} entries.", level=1)
+        log_verbose(f"\nDNS alias inference added {new_entries} entries.", level=1)
 
 def recanonicalize_entities(*dfs):
     for df in dfs:
@@ -880,6 +1015,10 @@ def infer_aliases_from_timeseries(df_host_cpu, df_pod_cpu, corr_threshold=0.9, m
     """
     if not AUTO_ALIAS_ENABLED or df_host_cpu.empty or df_pod_cpu.empty:
         return
+    
+    # Add spacing before timeseries alias inference output
+    if VERBOSE_LEVEL >= 2:
+        print()  # Add blank line before timeseries alias inference messages
 
     host_groups = df_host_cpu.groupby('entity')
     pod_groups = df_pod_cpu.groupby('entity')
@@ -910,7 +1049,7 @@ def infer_aliases_from_timeseries(df_host_cpu, df_pod_cpu, corr_threshold=0.9, m
             INSTANCE_ALIAS_MAP[canon_host] = canon_pod
             INSTANCE_ALIAS_MAP.setdefault(canon_pod, canon_pod)
             new_entries += 1
-            log_verbose(f"Timeseries alias inferred: {canon_host} → {canon_pod} (corr={best_corr:.2f})", level=1)
+            log_verbose(f"Timeseries alias inferred: {canon_host} → {canon_pod} (corr={best_corr:.2f})", level=2)
 
     if new_entries == 0:
         log_verbose("Timeseries alias inference found no additional matches.", level=2)
@@ -1057,7 +1196,7 @@ def persist_model_metadata(model_path, metadata):
     try:
         with open(meta_path, "w", encoding="utf-8") as fh:
             json.dump(metadata, fh, indent=2, default=str)
-        print(f"Metadata saved → {meta_path}")
+        log_debug(f"Metadata saved → {meta_path}", level=2)
     except Exception as exc:
         print(f"Warning: unable to write metadata {meta_path}: {exc}")
 
@@ -1079,11 +1218,10 @@ def summarize_instance_roles(df_host, df_pod):
     print(f"  • Hosts in Kubernetes clusters         : {len(hosts_with_pods)}")
     print(f"  • Standalone hosts (no pods detected)  : {len(host_only)}")
     print(f"  • Pod-only metrics (no host data)      : {len(pod_only)}")
-    if should_verbose():
-        if host_only:
-            print(f"    ↳ Host-only sample: {', '.join(host_only[:6])}{' …' if len(host_only) > 6 else ''}")
-        if pod_only:
-            print(f"    ↳ Pod-only sample : {', '.join(pod_only[:6])}{' …' if len(pod_only) > 6 else ''}")
+    if host_only:
+        print(f"    ↳ Host-only sample: {', '.join(host_only[:6])}{' …' if len(host_only) > 6 else ''}")
+    if pod_only:
+        print(f"    ↳ Pod-only sample : {', '.join(pod_only[:6])}{' …' if len(pod_only) > 6 else ''}")
     if not hosts_with_pods and not INSTANCE_ALIAS_MAP:
         print("  (No overlap detected — configure INSTANCE_ALIAS_MAP to map host aliases/IPs)")
 
@@ -1196,10 +1334,18 @@ def load_cached_ensemble(model_path):
         return artifact
 
     if isinstance(artifact, dict):
-        forecast_df = artifact.get('forecast') or artifact.get('forecast_df')
+        # Handle new consolidated model structure
+        forecast_df = artifact.get('forecast')
+        if forecast_df is None:
+            forecast_df = artifact.get('forecast_df')
+        
         metrics = artifact.get('metrics')
-        model = artifact.get('prophet') or artifact.get('model')
-        if forecast_df is not None and metrics is not None:
+        model = artifact.get('prophet')
+        if model is None:
+            model = artifact.get('model')
+        
+        # Check if we have the required components
+        if forecast_df is not None and metrics is not None and model is not None:
             return (model, forecast_df, metrics)
 
     return None
@@ -1281,7 +1427,7 @@ def generate_forecast_plots_from_cache(df_cpu, df_mem, cached_result, horizon_mi
         plt.savefig(plot_path, dpi=180, bbox_inches='tight')
         if os.path.exists(plot_path):
             file_size = os.path.getsize(plot_path)
-            print(f"✓ Saved forecast plot: {plot_path} ({file_size} bytes)")
+            log_debug(f"    Plot: {_get_plot_filename(plot_path)}", level=2)
         else:
             print(f"✗ Warning: Plot file not found after save: {plot_path}")
     if MATPLOTLIB_AVAILABLE:
@@ -1295,6 +1441,16 @@ def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_m
     prophet_model, _, metrics = cached_result
     if prophet_model is None:
         return None
+    
+    # Extract LightGBM model from cached artifact if available (consolidated model structure)
+    lgb_model = None
+    if model_path:
+        try:
+            artifact = joblib.load(model_path)
+            if isinstance(artifact, dict):
+                lgb_model = artifact.get('lightgbm')
+        except:
+            pass
     
     # Extract instance metadata before aggregation
     instances_included = []
@@ -1537,8 +1693,43 @@ def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_m
     if len(lstm_plot_vals) < plot_forecast_minutes:
         lstm_plot_vals = np.pad(lstm_plot_vals, (0, plot_forecast_minutes - len(lstm_plot_vals)), mode='edge')
     
+    # Load and use LightGBM if available
+    f_lightgbm = None
+    lightgbm_active = False
+    if lgb_model is not None and LIGHTGBM_ENABLED and len(pdf) > 100:
+        try:
+            # Prepare features for LightGBM (same as training)
+            feature_cols = ['hour', 'is_weekend']
+            # Note: In cached model forecast, we may not have all features available
+            # Use what we have from pdf
+            for col in pdf.columns:
+                if col not in ['ds', 'y'] and col not in feature_cols:
+                    feature_cols.append(col)
+            
+            if len(feature_cols) >= 4:  # Need at least 4 features
+                # Prepare future data for prediction
+                future_lgb = pd.DataFrame({
+                    'ds': f_prophet.index[:horizon_min]
+                })
+                future_lgb['hour'] = future_lgb['ds'].dt.hour
+                future_lgb['is_weekend'] = (future_lgb['ds'].dt.dayofweek >= 5).astype(int)
+                # Use last known values for other features
+                for feat in feature_cols:
+                    if feat not in ['hour', 'is_weekend'] and feat in pdf.columns:
+                        last_value = pdf[feat].iloc[-1] if len(pdf) > 0 else 0
+                        future_lgb[feat] = last_value
+                
+                X_future = future_lgb[feature_cols].fillna(0)
+                lg_pred = lgb_model.predict(X_future)
+                f_lightgbm = pd.Series(lg_pred, index=f_prophet.index[:horizon_min])
+                lightgbm_active = True
+        except Exception as e:
+            log_verbose(f"LightGBM forecast from cached model failed: {e}")
+            f_lightgbm = None
+            lightgbm_active = False
+    
     # For return value: use horizon_min values (first horizon_min values from forecasts)
-    # f_prophet, f_arima, f_lstm all start from the latest data point, so we take first horizon_min
+    # f_prophet, f_arima, f_lstm, f_lightgbm all start from the latest data point, so we take first horizon_min
     prophet_vals = f_prophet.head(horizon_min).values[:horizon_min] if len(f_prophet) >= horizon_min else f_prophet.values
     arima_vals = f_arima.head(horizon_min).values[:horizon_min] if len(f_arima) >= horizon_min else f_arima.values
     lstm_vals = f_lstm.head(horizon_min).values[:horizon_min] if len(f_lstm) >= horizon_min else f_lstm.values
@@ -1554,8 +1745,17 @@ def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_m
     arima_vals = arima_vals[:horizon_min]
     lstm_vals = lstm_vals[:horizon_min]
     
-    # Create ensemble with exactly horizon_min values
-    ensemble_vals = (prophet_vals + arima_vals + lstm_vals) / 3
+    # Create ensemble with all active models (Prophet, ARIMA, LSTM, LightGBM)
+    active_models = [prophet_vals, arima_vals, lstm_vals]
+    if lightgbm_active and f_lightgbm is not None:
+        lightgbm_vals = f_lightgbm.head(horizon_min).values[:horizon_min] if len(f_lightgbm) >= horizon_min else f_lightgbm.values
+        if len(lightgbm_vals) < horizon_min:
+            lightgbm_vals = np.pad(lightgbm_vals, (0, horizon_min - len(lightgbm_vals)), mode='edge')
+        lightgbm_vals = lightgbm_vals[:horizon_min]
+        active_models.append(lightgbm_vals)
+    
+    # Average all active models
+    ensemble_vals = np.mean(active_models, axis=0)
     
     # Create forecast DataFrame using f_prophet's index (which is the forecast period)
     # f_prophet is already a Series with forecast_periods values starting from latest data point
@@ -1655,7 +1855,7 @@ def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_m
             plt.savefig(plot_path, dpi=180, bbox_inches='tight')
             if os.path.exists(plot_path):
                 file_size = os.path.getsize(plot_path)
-                print(f"✓ Saved forecast plot: {plot_path} ({file_size} bytes)")
+                log_debug(f"    Plot: {_get_plot_filename(plot_path)}", level=2)
             else:
                 print(f"✗ Warning: Plot file not found after save: {plot_path}")
         except Exception as e:
@@ -1670,7 +1870,9 @@ def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_m
 def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrain=False,
                            generate_fresh_forecast=False, show_backtest=False,
                            dump_csv_dir=None, context=None, enable_plots=True,
-                           enable_forecast_plots=None, enable_backtest_plots=None):
+                           enable_forecast_plots=None, enable_backtest_plots=None,
+                           df_host_cpu=None, df_host_mem=None, df_pod_cpu=None, df_pod_mem=None,
+                           df_disk_io_wait=None, df_net_tx_bw=None):
     """
     Train or load an ensemble forecasting model with intelligent caching and minimal updates.
     
@@ -1711,7 +1913,7 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
     if not force_retrain:
         cached = load_cached_ensemble(model_path)
         if cached is not None:
-            log_verbose(f"Loaded pre-trained ensemble artifacts: {model_path}")
+            log_debug(f"Loaded pre-trained ensemble artifacts: {model_path}", level=2)
             # Generate fresh forecasts from latest data if requested (forecast mode)
             # Check if we need backtest plots - if so, we'll generate them after forecast
             should_generate_backtest = show_backtest or (enable_backtest_plots if enable_backtest_plots is not None else False)
@@ -1775,7 +1977,9 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
                 should_save_forecast = enable_forecast_plots if enable_forecast_plots is not None else False
                 should_save_backtest = enable_backtest_plots if enable_backtest_plots is not None else enable_plots
                 plot_type = "forecast + backtest" if should_save_forecast else "backtest"
-                log_verbose(f"Regenerating {plot_type} plots for {model_path} (show_backtest={show_backtest}, force_retrain={force_retrain}, enable_forecast_plots={should_save_forecast})")
+                log_debug(f"Regenerating {plot_type} plots for {model_path} (show_backtest={show_backtest}, force_retrain={force_retrain}, enable_forecast_plots={should_save_forecast})", level=2)
+                # Allow saving ARIMA/Prophet models (separate files) even when not updating main ensemble model
+                # This ensures consistency with force_retrain=True path and provides complete model artifacts
                 result = build_ensemble_forecast_model(
                     df_cpu=df_cpu,
                     df_mem=df_mem,
@@ -1785,9 +1989,15 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
                     save_forecast_plot=should_save_forecast,  # Generate forecast plots if flag is set
                     save_backtest_plot=should_save_backtest,  # Generate backtest plots
                     print_backtest_metrics=True,
-                    save_model=False,  # Don't save model files - only generate plots
+                    save_model=True,  # Save ARIMA/Prophet models (separate files) for consistency
                     dump_csv_dir=dump_csv_dir,
-                    enable_plots=enable_plots
+                    enable_plots=enable_plots,
+                    df_host_cpu=df_host_cpu,
+                    df_host_mem=df_host_mem,
+                    df_pod_cpu=df_pod_cpu,
+                    df_pod_mem=df_pod_mem,
+                    df_disk_io_wait=df_disk_io_wait,
+                    df_net_tx_bw=df_net_tx_bw
                 )
                 if result is not None:
                     # Return fresh forecast result if available, otherwise return cached model
@@ -1809,7 +2019,7 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
             else:
                 return (cached, None, {}, False)
 
-    log_verbose(f"Training ensemble model → {model_path}")
+    print(f"Training ensemble model → {model_path}")
     # Determine plot flags based on mode:
     # - Training mode: generate both forecast and backtest plots
     # - show_backtest only (not training): only backtest plots
@@ -1827,11 +2037,17 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
         save_backtest_plot=save_backtest,
         print_backtest_metrics=show_backtest,
         dump_csv_dir=dump_csv_dir,
-        enable_plots=enable_plots
+        enable_plots=enable_plots,
+        df_host_cpu=df_host_cpu,
+        df_host_mem=df_host_mem,
+        df_pod_cpu=df_pod_cpu,
+        df_pod_mem=df_pod_mem,
+        df_disk_io_wait=df_disk_io_wait,
+        df_net_tx_bw=df_net_tx_bw
     )
     try:
         joblib.dump(result, model_path)
-        print(f"Saved ensemble artifacts → {model_path}")
+        log_debug(f"Saved ensemble artifacts → {model_path}", level=2)
         was_saved = True
         metrics = result[-1] if isinstance(result, tuple) and result else {}
         split_info = metrics.get('split_info') if isinstance(metrics, dict) else None
@@ -2266,7 +2482,7 @@ def format_sli_slo_report(sli_slo_results):
     lines.append("=" * 80)
     return "\n".join(lines)
 
-def fetch_victoriametrics_metrics(query, start, end, step=STEP, silent_422=False):
+def fetch_victoriametrics_metrics(query, start, end, step=STEP, silent_422=False, metric_name=None):
     """
     Fetch metrics from VictoriaMetrics.
     
@@ -2288,7 +2504,8 @@ def fetch_victoriametrics_metrics(query, start, end, step=STEP, silent_422=False
         if data['status'] != 'success':
             raise ValueError(data.get('error'))
         result = data['data']['result']
-        log_verbose(f"Query returned {len(result)} series.")
+        metric_label = f"{metric_name}: " if metric_name else ""
+        log_verbose(f"{metric_label}Query returned {len(result)} series.", level=2)
         if not result:
             return pd.DataFrame()
         rows = []
@@ -2303,14 +2520,8 @@ def fetch_victoriametrics_metrics(query, start, end, step=STEP, silent_422=False
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 422:
             if not silent_422:
-                # Calculate time range for better error message
-                time_range_hours = (end - start) / 3600
-                print(f"Query error (422): VictoriaMetrics rejected query - time range too large or query too complex")
-                print(f"  Time range: {time_range_hours:.1f} hours ({time_range_hours/24:.1f} days)")
-                print(f"  Step size: {step}")
-                estimated_points = int(time_range_hours * 3600 / int(step.rstrip('s')))
-                print(f"  Estimated data points per series: ~{estimated_points:,}")
-                print(f"  Will retry with adaptive step sizing...")
+                # Query rejected - will be handled by chunking logic
+                pass
         # Return empty DataFrame to signal failure (caller will retry)
         return pd.DataFrame()
     except Exception as e:
@@ -2364,7 +2575,38 @@ def calculate_adaptive_step(hours_ago, base_step=STEP):
         # For very large ranges, use 1 hour step (max reasonable)
         return "3600s"  # 1 hour
 
+def _extract_metric_name(query):
+    """Extract a readable metric name from a PromQL query."""
+    # Common patterns to identify metrics
+    if 'node_cpu_seconds_total' in query or 'cpu' in query.lower():
+        if 'container_cpu' in query:
+            return 'Pod CPU'
+        return 'Host CPU'
+    elif 'node_memory' in query or 'memory' in query.lower():
+        if 'container_memory' in query:
+            return 'Pod Memory'
+        return 'Host Memory'
+    elif 'disk_io_wait' in query.lower() or 'disk_io' in query.lower():
+        return 'Disk I/O Wait'
+    elif 'net_tx_bw' in query.lower() or 'network' in query.lower():
+        return 'Network TX'
+    elif 'filesystem' in query.lower() or 'disk' in query.lower():
+        return 'Disk Usage'
+    else:
+        # Try to extract metric name from query
+        import re
+        match = re.search(r'(\w+)\s*\{', query)
+        if match:
+            metric = match.group(1)
+            # Clean up common prefixes
+            metric = metric.replace('node_', '').replace('container_', '')
+            return metric.replace('_', ' ').title()
+        return 'Metrics'
+
 def fetch_and_preprocess_data(query, start_hours_ago=START_HOURS_AGO, step=STEP):
+    # Extract metric name for better logging
+    metric_name = _extract_metric_name(query)
+    
     # Warn about very large time ranges that may cause performance issues
     if start_hours_ago > 8760:  # > 1 year
         print(f"  ⚠️  Warning: START_HOURS_AGO={start_hours_ago} ({start_hours_ago/24:.1f} days) is very large.")
@@ -2376,71 +2618,67 @@ def fetch_and_preprocess_data(query, start_hours_ago=START_HOURS_AGO, step=STEP)
     end   = int(pd.Timestamp.now().timestamp())
     
     # MAXIMIZE DATA: Try with base step first (60s) to get maximum data points
-    # Only use adaptive step sizing if the query fails with 422 error
-    df = fetch_victoriametrics_metrics(query, start, end, step)
-    
-    # If query failed with 422, split into chunks to get ALL data with 60s step
-    # This preserves maximum data by querying in smaller time windows that work
-    if df.empty:
-        # Use 360 hours as chunk size (we know this works with 60s step)
-        chunk_hours = 360
-        if start_hours_ago > chunk_hours:
-            print(f"  → Query failed, splitting into {chunk_hours}h chunks to preserve ALL data with {step} step...")
-            all_chunks = []
-            chunk_start = start
-            chunk_num = 1
-            total_chunks = int((end - start) / (chunk_hours * 3600)) + 1
-            
-            while chunk_start < end:
-                chunk_end = min(chunk_start + (chunk_hours * 3600), end)
-                chunk_start_dt = pd.Timestamp.fromtimestamp(chunk_start)
-                chunk_end_dt = pd.Timestamp.fromtimestamp(chunk_end)
-                print(f"    Chunk {chunk_num}/{total_chunks}: {chunk_start_dt.strftime('%Y-%m-%d %H:%M')} to {chunk_end_dt.strftime('%Y-%m-%d %H:%M')}")
-                
-                chunk_df = fetch_victoriametrics_metrics(query, chunk_start, chunk_end, step, silent_422=True)
+    # For large time ranges (>360h), use chunking by default to avoid 422 errors
+    # This saves time by not attempting the full query first
+    chunk_hours = 360
+    if start_hours_ago > chunk_hours:
+        # Use chunking by default for large time ranges
+        total_chunks = int((end - start) / (chunk_hours * 3600)) + 1
+        log_verbose(f"  Fetching {metric_name}: splitting into {total_chunks} chunks ({chunk_hours}h each)...", level=2)
+        all_chunks = []
+        chunk_start = start
+        chunk_num = 1
+        
+        while chunk_start < end:
+            chunk_end = min(chunk_start + (chunk_hours * 3600), end)
+            chunk_df = fetch_victoriametrics_metrics(query, chunk_start, chunk_end, step, silent_422=True, metric_name=metric_name)
+            if not chunk_df.empty:
+                all_chunks.append(chunk_df)
+                log_debug(f"    Chunk {chunk_num}/{total_chunks}: {len(chunk_df):,} rows", level=2)
+            else:
+                # If chunk fails, try adaptive step for this chunk only
+                chunk_hours_actual = (chunk_end - chunk_start) / 3600
+                adaptive_step = calculate_adaptive_step(chunk_hours_actual, base_step=step)
+                chunk_df = fetch_victoriametrics_metrics(query, chunk_start, chunk_end, adaptive_step, silent_422=True, metric_name=metric_name)
                 if not chunk_df.empty:
                     all_chunks.append(chunk_df)
-                    print(f"      ✓ {len(chunk_df)} rows")
-                else:
-                    # If chunk fails, try adaptive step for this chunk only
-                    chunk_hours_actual = (chunk_end - chunk_start) / 3600
-                    adaptive_step = calculate_adaptive_step(chunk_hours_actual, base_step=step)
-                    chunk_df = fetch_victoriametrics_metrics(query, chunk_start, chunk_end, adaptive_step, silent_422=True)
-                    if not chunk_df.empty:
-                        all_chunks.append(chunk_df)
-                        print(f"      ✓ {len(chunk_df)} rows (using {adaptive_step} step)")
-                    else:
-                        print(f"      ✗ Failed even with adaptive step")
-                
-                chunk_start = chunk_end
-                chunk_num += 1
+                    log_debug(f"    Chunk {chunk_num}/{total_chunks}: {len(chunk_df):,} rows (using {adaptive_step})", level=2)
             
-            if all_chunks:
-                df = pd.concat(all_chunks, ignore_index=True)
-                # Remove duplicates at chunk boundaries (same timestamp + instance)
-                # Identify grouping columns
-                group_cols = ['ts']
-                for col in ['instance', 'entity', 'node', 'hostname', 'mountpoint', 'filesystem']:
-                    if col in df.columns:
-                        group_cols.append(col)
-                df = df.drop_duplicates(subset=group_cols, keep='first')
-                df = df.sort_values('ts').reset_index(drop=True)
-                print(f"  ✓ Combined {len(all_chunks)} chunks: {len(df):,} total rows (ALL data preserved with {step} step)")
-            else:
-                print(f"  ✗ All chunks failed")
+            chunk_start = chunk_end
+            chunk_num += 1
+        
+        if all_chunks:
+            df = pd.concat(all_chunks, ignore_index=True)
+            # Remove duplicates at chunk boundaries (same timestamp + instance)
+            # Identify grouping columns
+            group_cols = ['ts']
+            for col in ['instance', 'entity', 'node', 'hostname', 'mountpoint', 'filesystem']:
+                if col in df.columns:
+                    group_cols.append(col)
+            rows_before_dedup = len(df)
+            df = df.drop_duplicates(subset=group_cols, keep='first')
+            rows_after_dedup = len(df)
+            df = df.sort_values('ts').reset_index(drop=True)
+            print(f"  ✓ {metric_name}: {len(df):,} total rows from {len(all_chunks)} chunks")
+            if rows_before_dedup != rows_after_dedup:
+                log_verbose(f"  Deduplication: {rows_before_dedup:,} → {rows_after_dedup:,} rows (removed {rows_before_dedup - rows_after_dedup:,} duplicates)", level=2)
         else:
-            # Small range but still failed - try adaptive step
+            print(f"  ✗ {metric_name}: Query failed - all chunks failed")
+            df = pd.DataFrame()
+    else:
+        # Small range - try direct query first
+        df = fetch_victoriametrics_metrics(query, start, end, step, metric_name=metric_name)
+        
+        # If query failed with 422, try adaptive step
+        if df.empty:
             adaptive_step = calculate_adaptive_step(start_hours_ago, base_step=step)
             if adaptive_step != step:
-                estimated_points_base = int(start_hours_ago * 3600 / int(step.rstrip('s')))
-                estimated_points_adaptive = int(start_hours_ago * 3600 / int(adaptive_step.rstrip('s')))
-                print(f"  → Query failed, retrying with adaptive step: {adaptive_step}")
-                print(f"    Data points per series: {estimated_points_base:,} → {estimated_points_adaptive:,}")
-                df = fetch_victoriametrics_metrics(query, start, end, adaptive_step, silent_422=True)
+                log_verbose(f"  {metric_name}: Retrying with adaptive step ({adaptive_step})...", level=2)
+                df = fetch_victoriametrics_metrics(query, start, end, adaptive_step, silent_422=True, metric_name=metric_name)
                 if not df.empty:
-                    print(f"  ✓ Retry successful with step={adaptive_step}")
+                    log_verbose(f"  ✓ Retry successful", level=2)
                 else:
-                    print(f"  ✗ Retry also failed")
+                    print(f"  ✗ {metric_name}: Query failed - retry with adaptive step also failed")
     if df.empty:
         return pd.DataFrame()
 
@@ -2480,12 +2718,10 @@ def fetch_and_preprocess_data(query, start_hours_ago=START_HOURS_AGO, step=STEP)
     for col in ['mountpoint', 'filesystem']:
         if col in df.columns:
             group_cols.append(col)
-    # Preserve cluster labels and other important metadata
+    # NOTE: Do NOT include cluster labels in group_cols - they can vary for the same entity
+    # and would cause incorrect row reduction. Instead, preserve them via aggregation.
     cluster_label_cols = ['cluster', 'cluster_id', 'cluster_name', 'cluster_label', 
                          'kubernetes_cluster', 'k8s_cluster']
-    for col in cluster_label_cols:
-        if col in df.columns:
-            group_cols.append(col)
     
     agg_spec = {
         'value':'mean',
@@ -2497,10 +2733,27 @@ def fetch_and_preprocess_data(query, start_hours_ago=START_HOURS_AGO, step=STEP)
         agg_spec['raw_entity'] = 'first'
     if 'raw_instance' in df.columns:
         agg_spec['raw_instance'] = 'first'
-    # mountpoint/filesystem and cluster labels are preserved via group_cols
+    # Preserve cluster labels via aggregation (not grouping) to avoid row reduction
+    for col in cluster_label_cols:
+        if col in df.columns:
+            agg_spec[col] = 'first'  # Use 'first' to preserve cluster label without grouping by it
+    
+    # Diagnostic: Check row counts before and after groupby
+    rows_before_groupby = len(df)
+    if 'memory' in query.lower() or 'mem' in query.lower():
+        log_debug(f"DEBUG fetch_and_preprocess_data (memory): Before groupby: {rows_before_groupby} rows, group_cols: {group_cols}", level=2)
+        if len(df) > 0:
+            log_debug(f"  Unique timestamps: {df['ts'].nunique()}, unique entities: {df['entity'].nunique() if 'entity' in df.columns else 'N/A'}", level=2)
+    
     df = df.groupby(group_cols).agg(agg_spec).reset_index()
+    
+    rows_after_groupby = len(df)
+    if 'memory' in query.lower() or 'mem' in query.lower():
+        log_debug(f"DEBUG fetch_and_preprocess_data (memory): After groupby: {rows_after_groupby} rows (reduced by {rows_before_groupby - rows_after_groupby} rows)", level=2)
+        if rows_before_groupby != rows_after_groupby:
+            log_debug(f"  ⚠️ Groupby reduced rows from {rows_before_groupby} to {rows_after_groupby} (removed {rows_before_groupby - rows_after_groupby} rows)", level=2)
 
-    log_verbose(f"Pre-processed {len(df)} rows.")
+    # Pre-processing complete (row count already shown in combined chunks message)
     df = df.rename(columns={'ts':'timestamp'}).sort_values('timestamp')
     if 'entity' in df.columns:
         df['entity'] = df['entity'].map(canonical_identity)
@@ -2728,7 +2981,7 @@ def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, thr
                     if enable_forecast_plots:
                         plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_forecast.png")
                         plt.savefig(plot_file, dpi=180, bbox_inches='tight')
-                        log_verbose(f"  → Disk forecast plot saved (cached): {plot_file}")
+                        log_debug(f"    Plot: {_get_plot_filename(plot_file)}", level=2)
                     
                     # Save backtest plot if backtest plots are enabled (separate plot focusing on train/test)
                     if enable_backtest_plots and len(test_ts) > 0:
@@ -2762,7 +3015,7 @@ def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, thr
                         backtest_plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_backtest.png")
                         plt.savefig(backtest_plot_file, dpi=180, bbox_inches='tight')
                         file_size = os.path.getsize(backtest_plot_file) if os.path.exists(backtest_plot_file) else 0
-                        print(f"✓ Saved backtest plot: {backtest_plot_file} ({file_size} bytes)")
+                        log_debug(f"    Plot: {_get_plot_filename(backtest_plot_file)}", level=2)
                         plt.close()
                     else:
                         plt.close()
@@ -2863,14 +3116,49 @@ def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, thr
         
         # Ensemble MAE
         ensemble_mae = None
+        ensemble_pred = None
         if needs_retrain:
             if linear_pred is not None and prophet_pred is not None and len(test_ts) > 0:
                 ensemble_pred = pd.Series(np.minimum(linear_pred.values, prophet_pred), index=test_ts.index)
                 ensemble_mae = mean_absolute_error(test_ts.values, ensemble_pred.values)
             elif prophet_pred is not None and len(test_ts) > 0:
                 ensemble_mae = prophet_mae
+                ensemble_pred = pd.Series(prophet_pred, index=test_ts.index)
             elif linear_pred is not None and len(test_ts) > 0:
                 ensemble_mae = linear_mae
+                ensemble_pred = linear_pred
+        
+        # Calculate MAPE for all models
+        def calculate_mape(actual, predicted):
+            """Calculate MAPE (Mean Absolute Percentage Error)"""
+            if actual is None or predicted is None or len(actual) == 0 or len(predicted) == 0:
+                return np.nan
+            actual_series = pd.Series(actual) if not isinstance(actual, pd.Series) else actual
+            predicted_series = pd.Series(predicted) if not isinstance(predicted, pd.Series) else predicted
+            non_zero_mask = actual_series.abs() > 1e-10
+            if non_zero_mask.sum() == 0:
+                return np.nan
+            try:
+                mape = ((actual_series[non_zero_mask] - predicted_series[non_zero_mask]).abs() / actual_series[non_zero_mask].abs()).mean() * 100
+                return mape if not (pd.isna(mape) or np.isinf(mape)) else np.nan
+            except:
+                return np.nan
+        
+        linear_mape = None
+        prophet_mape = None
+        ensemble_mape = None
+        if needs_retrain and len(test_ts) > 0:
+            if linear_pred is not None:
+                linear_mape = calculate_mape(test_ts.values, linear_pred.values)
+            if prophet_pred is not None:
+                prophet_mape = calculate_mape(test_ts.values, prophet_pred)
+            if ensemble_pred is not None:
+                ensemble_mape = calculate_mape(test_ts.values, ensemble_pred.values)
+        
+        # Calculate confidence levels
+        linear_conf = calculate_model_confidence(linear_mae if linear_mae is not None else np.nan, linear_mape if linear_mape is not None else np.nan) if linear_mae is not None else None
+        prophet_conf = calculate_model_confidence(prophet_mae if prophet_mae is not None else np.nan, prophet_mape if prophet_mape is not None else np.nan) if prophet_mae is not None else None
+        ensemble_conf = calculate_model_confidence(ensemble_mae if ensemble_mae is not None else np.nan, ensemble_mape if ensemble_mape is not None else np.nan) if ensemble_mae is not None else None
         
         record = {
             'instance': node,
@@ -2886,7 +3174,13 @@ def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, thr
         metrics = {
             'linear_mae': linear_mae,
             'prophet_mae': prophet_mae,
-            'ensemble_mae': ensemble_mae
+            'ensemble_mae': ensemble_mae,
+            'linear_mape': linear_mape,
+            'prophet_mape': prophet_mape,
+            'ensemble_mape': ensemble_mape,
+            'linear_confidence': linear_conf,
+            'prophet_confidence': prophet_conf,
+            'ensemble_confidence': ensemble_conf
         } if needs_retrain else None
         
         # Generate plots for retrained disks when plot flags are enabled
@@ -2930,7 +3224,7 @@ def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, thr
                 if enable_forecast_plots:
                     plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_forecast.png")
                     plt.savefig(plot_file, dpi=180, bbox_inches='tight')
-                    log_verbose(f"  → Disk forecast plot saved (retrained): {plot_file}")
+                    log_verbose(f"    Plot: {_get_plot_filename(plot_file)}", level=2)
                 
                 # Save backtest plot if backtest plots are enabled (separate plot focusing on train/test)
                 if enable_backtest_plots and len(test_ts) > 0:
@@ -2969,8 +3263,7 @@ def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, thr
                     plt.tight_layout()
                     backtest_plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_backtest.png")
                     plt.savefig(backtest_plot_file, dpi=180, bbox_inches='tight')
-                    file_size = os.path.getsize(backtest_plot_file) if os.path.exists(backtest_plot_file) else 0
-                    print(f"✓ Saved backtest plot: {backtest_plot_file} ({file_size} bytes)")
+                    log_verbose(f"    Plot: {_get_plot_filename(backtest_plot_file)}", level=2)
                     plt.close()
                 else:
                     plt.close()
@@ -3055,6 +3348,14 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
     all_mae_linear = []
     all_mae_prophet = []
     all_mae_ensemble = []
+    all_mae_linear = []
+    all_mae_prophet = []
+    all_mape_ensemble = []
+    all_mape_linear = []
+    all_mape_prophet = []
+    all_confidence_ensemble = []
+    all_confidence_linear = []
+    all_confidence_prophet = []
     all_train_points = []
     all_test_points = []
     train_starts = []
@@ -3118,12 +3419,24 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
             
             # Collect metrics
             if proc_result['metrics']:
-                if proc_result['metrics']['linear_mae'] is not None:
+                if proc_result['metrics'].get('linear_mae') is not None:
                     all_mae_linear.append(proc_result['metrics']['linear_mae'])
-                if proc_result['metrics']['prophet_mae'] is not None:
+                if proc_result['metrics'].get('prophet_mae') is not None:
                     all_mae_prophet.append(proc_result['metrics']['prophet_mae'])
-                if proc_result['metrics']['ensemble_mae'] is not None:
+                if proc_result['metrics'].get('ensemble_mae') is not None:
                     all_mae_ensemble.append(proc_result['metrics']['ensemble_mae'])
+                if proc_result['metrics'].get('linear_mape') is not None and not pd.isna(proc_result['metrics']['linear_mape']):
+                    all_mape_linear.append(proc_result['metrics']['linear_mape'])
+                if proc_result['metrics'].get('prophet_mape') is not None and not pd.isna(proc_result['metrics']['prophet_mape']):
+                    all_mape_prophet.append(proc_result['metrics']['prophet_mape'])
+                if proc_result['metrics'].get('ensemble_mape') is not None and not pd.isna(proc_result['metrics']['ensemble_mape']):
+                    all_mape_ensemble.append(proc_result['metrics']['ensemble_mape'])
+                if proc_result['metrics'].get('linear_confidence') is not None:
+                    all_confidence_linear.append(proc_result['metrics']['linear_confidence'])
+                if proc_result['metrics'].get('prophet_confidence') is not None:
+                    all_confidence_prophet.append(proc_result['metrics']['prophet_confidence'])
+                if proc_result['metrics'].get('ensemble_confidence') is not None:
+                    all_confidence_ensemble.append(proc_result['metrics']['ensemble_confidence'])
             
             if proc_result['train_points']:
                 all_train_points.append(proc_result['train_points'])
@@ -3144,7 +3457,15 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
         if total_disks > 5:
             print()  # New line after progress
         successful_disks = len([r for r in processed_results if r is not None])
-        print(f"    ✓ Parallel execution complete: {successful_disks}/{total_disks} disks processed successfully")
+        print(f"  ✓ Processed {successful_disks}/{total_disks} disks successfully")
+        if enable_forecast_plots or enable_backtest_plots:
+            plot_count = successful_disks * (2 if (enable_forecast_plots and enable_backtest_plots) else 1)
+            plot_types = []
+            if enable_forecast_plots:
+                plot_types.append("forecast")
+            if enable_backtest_plots:
+                plot_types.append("backtest")
+            log_verbose(f"  Generated {plot_count} plot(s) ({', '.join(plot_types)})", level=2)
     else:
         # Sequential processing (original code)
         for (entity, mountpoint), group in disk_groups:
@@ -3269,18 +3590,41 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                         test_starts.append(str(test_ts.index[0]))
                         test_ends.append(str(test_ts.index[-1]))
                     
-                    # Compute linear MAE
+                    # Helper function to calculate MAPE
+                    def calculate_mape(actual, predicted):
+                        """Calculate MAPE (Mean Absolute Percentage Error)"""
+                        if actual is None or predicted is None or len(actual) == 0 or len(predicted) == 0:
+                            return np.nan
+                        actual_series = pd.Series(actual) if not isinstance(actual, pd.Series) else actual
+                        predicted_series = pd.Series(predicted) if not isinstance(predicted, pd.Series) else predicted
+                        non_zero_mask = actual_series.abs() > 1e-10
+                        if non_zero_mask.sum() == 0:
+                            return np.nan
+                        try:
+                            mape = ((actual_series[non_zero_mask] - predicted_series[non_zero_mask]).abs() / actual_series[non_zero_mask].abs()).mean() * 100
+                            return mape if not (pd.isna(mape) or np.isinf(mape)) else np.nan
+                        except:
+                            return np.nan
+                    
+                    # Compute linear MAE and MAPE
                     daily_increase = train_ts.diff().resample('1D').mean().mean()
                     linear_pred = None
+                    linear_mae = None
+                    linear_mape = None
                     if len(test_ts) > 1:
                         base_value = train_ts.iloc[-1]
                         time_diffs = (test_ts.index - train_ts.index[-1]).total_seconds() / 86400
                         linear_pred = base_value + time_diffs * daily_increase
                         linear_mae = mean_absolute_error(test_ts.values, linear_pred.values)
+                        linear_mape = calculate_mape(test_ts.values, linear_pred.values)
                         all_mae_linear.append(linear_mae)
+                        if not pd.isna(linear_mape):
+                            all_mape_linear.append(linear_mape)
                     
-                    # Compute Prophet MAE
+                    # Compute Prophet MAE and MAPE
                     prophet_pred = None
+                    prophet_mae = None
+                    prophet_mape = None
                     try:
                         pdf = train_ts.reset_index()
                         pdf.columns = ['ds', 'y']
@@ -3299,19 +3643,42 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                             test_forecast = m.predict(test_df[['ds']])
                             prophet_pred = test_forecast['yhat'].values
                             prophet_mae = mean_absolute_error(test_df['y'].values, prophet_pred)
+                            prophet_mape = calculate_mape(test_df['y'].values, prophet_pred)
                             all_mae_prophet.append(prophet_mae)
+                            if not pd.isna(prophet_mape):
+                                all_mape_prophet.append(prophet_mape)
                     except:
                         pass
                     
-                    # Compute ensemble MAE
+                    # Compute ensemble MAE and MAPE
+                    ensemble_mae = None
+                    ensemble_mape = None
                     if linear_pred is not None and prophet_pred is not None and len(test_ts) > 0:
                         ensemble_pred = pd.Series(np.minimum(linear_pred.values, prophet_pred), index=test_ts.index)
                         ensemble_mae = mean_absolute_error(test_ts.values, ensemble_pred.values)
+                        ensemble_mape = calculate_mape(test_ts.values, ensemble_pred.values)
                         all_mae_ensemble.append(ensemble_mae)
+                        if not pd.isna(ensemble_mape):
+                            all_mape_ensemble.append(ensemble_mape)
                     elif prophet_pred is not None and len(test_ts) > 0:
                         all_mae_ensemble.append(prophet_mae)
+                        if not pd.isna(prophet_mape):
+                            all_mape_ensemble.append(prophet_mape)
                     elif linear_pred is not None and len(test_ts) > 0:
                         all_mae_ensemble.append(linear_mae)
+                        if not pd.isna(linear_mape):
+                            all_mape_ensemble.append(linear_mape)
+                    
+                    # Calculate confidence levels
+                    if linear_mae is not None:
+                        linear_conf = calculate_model_confidence(linear_mae, linear_mape if linear_mape is not None else np.nan)
+                        all_confidence_linear.append(linear_conf)
+                    if prophet_mae is not None:
+                        prophet_conf = calculate_model_confidence(prophet_mae, prophet_mape if prophet_mape is not None else np.nan)
+                        all_confidence_prophet.append(prophet_conf)
+                    if ensemble_mae is not None:
+                        ensemble_conf = calculate_model_confidence(ensemble_mae, ensemble_mape if ensemble_mape is not None else np.nan)
+                        all_confidence_ensemble.append(ensemble_conf)
                 
                 # MINIMAL UPDATE: Use recent data only (last 7 days) for faster fitting - only in forecast mode
                 # This incorporates latest trends while preserving learned patterns
@@ -3477,7 +3844,7 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                             if enable_forecast_plots:
                                 plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_forecast.png")
                                 plt.savefig(plot_file, dpi=180, bbox_inches='tight')
-                                print(f"  → Disk plot saved: {plot_file}")
+                                log_debug(f"    Plot: {_get_plot_filename(plot_file)}", level=2)
                             
                             # Save backtest plot if backtest plots are enabled (separate plot focusing on train/test)
                             if enable_backtest_plots and len(test_ts) > 0:
@@ -3511,7 +3878,7 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                                 backtest_plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_backtest.png")
                                 plt.savefig(backtest_plot_file, dpi=180, bbox_inches='tight')
                                 file_size = os.path.getsize(backtest_plot_file) if os.path.exists(backtest_plot_file) else 0
-                                print(f"✓ Saved backtest plot: {backtest_plot_file} ({file_size} bytes)")
+                                log_debug(f"    Plot: {_get_plot_filename(backtest_plot_file)}", level=2)
                                 plt.close()
                             else:
                                 plt.close()
@@ -3561,14 +3928,28 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                     # No significant increase, disk not approaching threshold
                     linear_days = 9999.0
             
-            # Compute linear MAE on test set (only when retraining)
+            # Compute linear MAE and MAPE on test set (only when retraining)
             linear_pred = None
+            linear_mae = None
+            linear_mape = None
             if needs_retrain and len(test_ts) > 1:
                 base_value = train_ts.iloc[-1]
                 time_diffs = (test_ts.index - train_ts.index[-1]).total_seconds() / 86400
                 linear_pred = base_value + time_diffs * daily_increase
                 linear_mae = mean_absolute_error(test_ts.values, linear_pred.values)
+                # Calculate MAPE
+                non_zero_mask = test_ts.abs() > 1e-10
+                if non_zero_mask.sum() > 0:
+                    linear_mape = ((test_ts[non_zero_mask] - linear_pred[non_zero_mask]).abs() / test_ts[non_zero_mask].abs()).mean() * 100
+                    if pd.isna(linear_mape) or np.isinf(linear_mape):
+                        linear_mape = np.nan
+                else:
+                    linear_mape = np.nan
                 all_mae_linear.append(linear_mae)
+                if not pd.isna(linear_mape):
+                    all_mape_linear.append(linear_mape)
+                linear_conf = calculate_model_confidence(linear_mae, linear_mape if linear_mape is not None else np.nan)
+                all_confidence_linear.append(linear_conf)
 
             # Prophet ETA (seasonal correction) - only if not already exceeded
             if current_pct < threshold_pct:
@@ -3609,14 +3990,26 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                     m.fit(fit_pdf)
                     prophet_model = m  # Store for plotting
                     
-                    # Compute Prophet MAE on test set (only when retraining)
+                    # Compute Prophet MAE and MAPE on test set (only when retraining)
                     if needs_retrain and len(test_ts) > 0:
                         test_df = test_ts.reset_index()
                         test_df.columns = ['ds', 'y']
                         test_forecast = m.predict(test_df[['ds']])
                         prophet_pred = test_forecast['yhat'].values
                         prophet_mae = mean_absolute_error(test_df['y'].values, prophet_pred)
+                        # Calculate MAPE
+                        non_zero_mask = test_df['y'].abs() > 1e-10
+                        if non_zero_mask.sum() > 0:
+                            prophet_mape = ((test_df['y'][non_zero_mask] - pd.Series(prophet_pred)[non_zero_mask]).abs() / test_df['y'][non_zero_mask].abs()).mean() * 100
+                            if pd.isna(prophet_mape) or np.isinf(prophet_mape):
+                                prophet_mape = np.nan
+                        else:
+                            prophet_mape = np.nan
                         all_mae_prophet.append(prophet_mae)
+                        if not pd.isna(prophet_mape):
+                            all_mape_prophet.append(prophet_mape)
+                        prophet_conf = calculate_model_confidence(prophet_mae, prophet_mape if prophet_mape is not None else np.nan)
+                        all_confidence_prophet.append(prophet_conf)
                     
                     future = m.make_future_dataframe(periods=horizon_days*24*10, freq='6H')
                     forecast = m.predict(future)
@@ -3637,18 +4030,44 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                     # Fallback to linear_days, but ensure it's non-negative
                     prophet_days = max(0.0, linear_days) if 'linear_days' in locals() else 9999.0
 
-            # Compute ensemble MAE (min of linear and prophet) - only when retraining
+            # Compute ensemble MAE and MAPE (min of linear and prophet) - only when retraining
             if needs_retrain:
+                ensemble_mae = None
+                ensemble_mape = None
                 if linear_pred is not None and prophet_pred is not None and len(test_ts) > 0:
                     ensemble_pred = pd.Series(np.minimum(linear_pred.values, prophet_pred), index=test_ts.index)
                     ensemble_mae = mean_absolute_error(test_ts.values, ensemble_pred.values)
+                    # Calculate MAPE
+                    non_zero_mask = test_ts.abs() > 1e-10
+                    if non_zero_mask.sum() > 0:
+                        ensemble_mape = ((test_ts[non_zero_mask] - ensemble_pred[non_zero_mask]).abs() / test_ts[non_zero_mask].abs()).mean() * 100
+                        if pd.isna(ensemble_mape) or np.isinf(ensemble_mape):
+                            ensemble_mape = np.nan
+                    else:
+                        ensemble_mape = np.nan
                     all_mae_ensemble.append(ensemble_mae)
+                    if not pd.isna(ensemble_mape):
+                        all_mape_ensemble.append(ensemble_mape)
+                    ensemble_conf = calculate_model_confidence(ensemble_mae, ensemble_mape if ensemble_mape is not None else np.nan)
+                    all_confidence_ensemble.append(ensemble_conf)
                 elif prophet_pred is not None and len(test_ts) > 0:
                     # Fallback to prophet if linear not available
-                    all_mae_ensemble.append(prophet_mae)
+                    ensemble_mae = prophet_mae
+                    ensemble_mape = prophet_mape if 'prophet_mape' in locals() and not pd.isna(prophet_mape) else np.nan
+                    all_mae_ensemble.append(ensemble_mae)
+                    if not pd.isna(ensemble_mape):
+                        all_mape_ensemble.append(ensemble_mape)
+                    ensemble_conf = calculate_model_confidence(ensemble_mae, ensemble_mape if ensemble_mape is not None else np.nan)
+                    all_confidence_ensemble.append(ensemble_conf)
                 elif linear_pred is not None and len(test_ts) > 0:
                     # Fallback to linear if prophet not available
-                    all_mae_ensemble.append(linear_mae)
+                    ensemble_mae = linear_mae
+                    ensemble_mape = linear_mape if 'linear_mape' in locals() and not pd.isna(linear_mape) else np.nan
+                    all_mae_ensemble.append(ensemble_mae)
+                    if not pd.isna(ensemble_mape):
+                        all_mape_ensemble.append(ensemble_mape)
+                    ensemble_conf = calculate_model_confidence(ensemble_mae, ensemble_mape if ensemble_mape is not None else np.nan)
+                    all_confidence_ensemble.append(ensemble_conf)
 
             # Only calculate hybrid_days if not already exceeded
             if current_pct < threshold_pct:
@@ -3721,7 +4140,7 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                     if enable_forecast_plots:
                         plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_forecast.png")
                         plt.savefig(plot_file, dpi=180, bbox_inches='tight')
-                        print(f"  → Disk forecast plot saved: {plot_file}")
+                        log_debug(f"    Plot: {_get_plot_filename(plot_file)}", level=2)
                     
                     # Save backtest plot if backtest plots are enabled (separate plot focusing on train/test)
                     if enable_backtest_plots and len(test_ts) > 0:
@@ -3760,7 +4179,7 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                         plt.tight_layout()
                         backtest_plot_file = os.path.join(FORECAST_PLOTS_DIR, f"disk_{safe_node}_{safe_mount}_backtest.png")
                         plt.savefig(backtest_plot_file, dpi=180, bbox_inches='tight')
-                        print(f"  → Disk backtest plot saved: {backtest_plot_file}")
+                        log_debug(f"    Plot: {_get_plot_filename(backtest_plot_file)}", level=2)
                         plt.close()
                     else:
                         plt.close()
@@ -3774,6 +4193,19 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
     alerts_df = (pd.DataFrame(alerts).sort_values('days_to_90pct')
                  if alerts else pd.DataFrame(columns=["instance","mountpoint","current_%","days_to_90pct","ensemble_eta","linear_eta","prophet_eta","alert"]))
     
+    # Summary for sequential processing
+    if not use_parallel and total_disks > 0:
+        successful_disks = len(alerts)
+        print(f"  ✓ Processed {successful_disks}/{total_disks} disks successfully")
+        if enable_forecast_plots or enable_backtest_plots:
+            plot_count = successful_disks * (2 if (enable_forecast_plots and enable_backtest_plots) else 1)
+            plot_types = []
+            if enable_forecast_plots:
+                plot_types.append("forecast")
+            if enable_backtest_plots:
+                plot_types.append("backtest")
+            log_verbose(f"  Generated {plot_count} plot(s) ({', '.join(plot_types)})", level=2)
+    
     # Aggregate metrics
     disk_metrics = {}
     if all_mae_ensemble:
@@ -3782,6 +4214,18 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
         disk_metrics['mae_linear'] = np.mean(all_mae_linear)
     if all_mae_prophet:
         disk_metrics['mae_prophet'] = np.mean(all_mae_prophet)
+    if all_mape_ensemble:
+        disk_metrics['mape_ensemble'] = np.mean(all_mape_ensemble)
+    if all_mape_linear:
+        disk_metrics['mape_linear'] = np.mean(all_mape_linear)
+    if all_mape_prophet:
+        disk_metrics['mape_prophet'] = np.mean(all_mape_prophet)
+    if all_confidence_ensemble:
+        disk_metrics['confidence_ensemble'] = int(round(np.mean(all_confidence_ensemble)))
+    if all_confidence_linear:
+        disk_metrics['confidence_linear'] = int(round(np.mean(all_confidence_linear)))
+    if all_confidence_prophet:
+        disk_metrics['confidence_prophet'] = int(round(np.mean(all_confidence_prophet)))
     if all_train_points:
         disk_metrics['split_info'] = {
             'train_fraction': TRAIN_FRACTION,
@@ -3865,13 +4309,16 @@ def calculate_model_confidence(mae, mape):
 def build_ensemble_forecast_model(df_cpu, df_mem=None,
                                  horizon_min=HORIZON_MIN, model_path='model.pkl', context=None,
                                  save_forecast_plot=True, save_backtest_plot=True, print_backtest_metrics=True,
-                                 save_model=True, dump_csv_dir=None, enable_plots=True):
+                                 save_model=True, dump_csv_dir=None, enable_plots=True,
+                                 df_host_cpu=None, df_host_mem=None, df_pod_cpu=None, df_pod_mem=None,
+                                 df_disk_io_wait=None, df_net_tx_bw=None):
     """
-    Build an ensemble forecasting model combining Prophet, ARIMA, and LSTM.
+    Build an ensemble forecasting model combining Prophet, ARIMA, LSTM, and LightGBM.
     
     This function trains or loads an ensemble model for CPU/Memory forecasting using
-    three complementary algorithms: Prophet (seasonality), ARIMA (autoregressive patterns),
-    and LSTM (nonlinear dependencies). The final prediction is a simple average of all three.
+    four complementary algorithms: Prophet (seasonality), ARIMA (autoregressive patterns),
+    LSTM (nonlinear dependencies), and LightGBM (gradient boosting, optional, enabled by default).
+    The final prediction is a simple average of all active models.
     
     Args:
         df_cpu: DataFrame with CPU metrics (columns: timestamp, value, instance/entity)
@@ -3896,6 +4343,7 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
         - Train/test split is time-ordered (chronological, not random)
         - Models account for daily/weekly seasonality patterns
         - LSTM is optional (requires TensorFlow)
+        - LightGBM is optional (enabled by default, can be disabled via LIGHTGBM_ENABLED env var)
         - All models use the same train/test split for fair comparison
     """
     # Ensure horizon_min is always an integer (required for slice operations and Prophet periods)
@@ -3916,33 +4364,402 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
     elif 'entity' in df_cpu.columns:
         instances_included = sorted(df_cpu['entity'].unique().tolist())
     
-    cpu_agg = df_cpu.groupby('timestamp')['value'].mean().reset_index(name='cpu')
-    cpu_agg['hour'] = cpu_agg['timestamp'].dt.hour
-    cpu_agg['is_weekend'] = (cpu_agg['timestamp'].dt.dayofweek>=5).astype(int)
-
+    # Start with main metric (df_cpu is the target metric - could be CPU, I/O wait, Network, etc.)
+    # Ensure timestamp is datetime type
+    if not pd.api.types.is_datetime64_any_dtype(df_cpu['timestamp']):
+        df_cpu = df_cpu.copy()
+        df_cpu['timestamp'] = pd.to_datetime(df_cpu['timestamp'])
+    
+    # Diagnostic: Log raw data statistics before aggregation
+    if context and context.get('node') == 'k8s_host_all':
+        log_debug(f"DEBUG k8s_host_all: df_cpu has {len(df_cpu)} rows, {df_cpu['value'].nunique()} unique values", level=2)
+        log_debug(f"  df_cpu value stats: mean={df_cpu['value'].mean():.6f}, std={df_cpu['value'].std():.6f}, min={df_cpu['value'].min():.6f}, max={df_cpu['value'].max():.6f}", level=2)
+        if 'entity' in df_cpu.columns:
+            log_debug(f"  df_cpu entities: {sorted(df_cpu['entity'].unique().tolist())}", level=2)
+        elif 'instance' in df_cpu.columns:
+            log_debug(f"  df_cpu instances: {sorted(df_cpu['instance'].unique().tolist())}", level=2)
+    
+    main_agg = df_cpu.groupby('timestamp')['value'].mean().reset_index(name='target')
+    
+    # Diagnostic: Log aggregated data statistics
+    if context and context.get('node') == 'k8s_host_all':
+        log_debug(f"DEBUG k8s_host_all: main_agg (after groupby) has {len(main_agg)} rows, {main_agg['target'].nunique()} unique values", level=1)
+        log_debug(f"  main_agg target stats: mean={main_agg['target'].mean():.6f}, std={main_agg['target'].std():.6f}, min={main_agg['target'].min():.6f}, max={main_agg['target'].max():.6f}", level=2)
+        if main_agg['target'].nunique() <= 1:
+            log_debug(f"  ⚠️ BUG DETECTED: main_agg has only {main_agg['target'].nunique()} unique value(s) after aggregation!", level=2)
+            log_debug(f"  Sample values: {main_agg['target'].head(10).tolist()}", level=2)
+    
+    main_agg['hour'] = main_agg['timestamp'].dt.hour
+    main_agg['is_weekend'] = (main_agg['timestamp'].dt.dayofweek>=5).astype(int)
+    
+    # Merge legacy df_mem if provided (for backward compatibility)
+    # Note: New feature merging logic below handles all features including host/pod metrics
     if df_mem is not None:
+        # Diagnostic: Log raw memory data statistics before aggregation
+        if context and context.get('node') == 'k8s_host_all':
+            log_debug(f"DEBUG k8s_host_all: df_mem has {len(df_mem)} rows, {df_mem['value'].nunique()} unique values", level=1)
+            log_debug(f"  df_mem value stats: mean={df_mem['value'].mean():.6f}, std={df_mem['value'].std():.6f}, min={df_mem['value'].min():.6f}, max={df_mem['value'].max():.6f}", level=2)
+            if 'entity' in df_mem.columns:
+                log_debug(f"  df_mem entities: {sorted(df_mem['entity'].unique().tolist())}", level=2)
+            elif 'instance' in df_mem.columns:
+                log_debug(f"  df_mem instances: {sorted(df_mem['instance'].unique().tolist())}", level=2)
+        
         mem_agg = df_mem.groupby('timestamp')['value'].mean().reset_index(name='mem')
-        mem_agg = mem_agg.set_index('timestamp').reindex(cpu_agg.set_index('timestamp').index).ffill().reset_index()
-        cpu_agg['mem'] = mem_agg['mem']
+        
+        # Diagnostic: Log aggregated memory data statistics
+        if context and context.get('node') == 'k8s_host_all':
+            log_debug(f"DEBUG k8s_host_all: mem_agg (after groupby) has {len(mem_agg)} rows, {mem_agg['mem'].nunique()} unique values", level=1)
+            log_debug(f"  mem_agg mem stats: mean={mem_agg['mem'].mean():.6f}, std={mem_agg['mem'].std():.6f}, min={mem_agg['mem'].min():.6f}, max={mem_agg['mem'].max():.6f}", level=2)
+            if mem_agg['mem'].nunique() <= 1:
+                log_debug(f"  ⚠️ BUG DETECTED: mem_agg has only {mem_agg['mem'].nunique()} unique value(s) after aggregation!", level=2)
+                log_debug(f"  Sample values: {mem_agg['mem'].head(10).tolist()}", level=2)
+        # Ensure timestamp types match
+        if not pd.api.types.is_datetime64_any_dtype(main_agg['timestamp']):
+            main_agg['timestamp'] = pd.to_datetime(main_agg['timestamp'])
+        if not pd.api.types.is_datetime64_any_dtype(mem_agg['timestamp']):
+            mem_agg['timestamp'] = pd.to_datetime(mem_agg['timestamp'])
+        main_agg = pd.merge(main_agg, mem_agg, on='timestamp', how='left')
+        if 'mem' in main_agg.columns:
+            # Diagnostic: Check mem column before filling
+            if context and context.get('node') == 'k8s_host_all':
+                log_debug(f"DEBUG k8s_host_all: After merge, mem column has {main_agg['mem'].notna().sum()} non-null values, {main_agg['mem'].nunique()} unique values", level=1)
+                if main_agg['mem'].notna().sum() > 0:
+                    log_debug(f"  mem stats (before fill): mean={main_agg['mem'].mean():.6f}, std={main_agg['mem'].std():.6f}", level=2)
+            
+            # IMPORTANT: Do NOT fill NaN values in 'mem' if df_mem is provided (it will be the target)
+            # If df_mem is provided, 'mem' will be the target, and we want to drop rows with NaN target values
+            # If df_mem is NOT provided, 'mem' might be used as a feature, so we should fill NaN values
+            # We'll determine this based on whether df_mem is provided
+            if df_mem is None:
+                # 'mem' is a feature, fill NaN values
+                main_agg['mem'] = main_agg['mem'].ffill().bfill().fillna(0)
+                if context and context.get('node') == 'k8s_host_all':
+                    log_debug(f"DEBUG k8s_host_all: mem is a feature, filled NaN values", level=1)
+            else:
+                # 'mem' is the target, leave NaN values (will be dropped later)
+                if context and context.get('node') == 'k8s_host_all':
+                    log_debug(f"DEBUG k8s_host_all: mem is the target, leaving NaN values (will drop rows with NaN target)", level=1)
+            
+            # Diagnostic: Check mem column after conditional filling
+            if context and context.get('node') == 'k8s_host_all':
+                log_debug(f"DEBUG k8s_host_all: mem column stats: mean={main_agg['mem'].mean():.6f}, std={main_agg['mem'].std():.6f}, unique={main_agg['mem'].nunique()}, non-null={main_agg['mem'].notna().sum()}", level=1)
+    
+    # Determine what metric we're predicting to exclude it from features
+    # The target is determined by what's in df_cpu and df_mem
+    target_metric_name = None
+    if context:
+        signal = context.get('signal', '')
+        node = context.get('node', '')
+        # For UNIFIED_CORRELATED model, target is always 'target' (composite metric)
+        # All individual metrics should be used as features
+        if signal == 'UNIFIED_CORRELATED':
+            target_metric_name = 'target'
+        # For I/O/Network metrics, use signal
+        elif signal == 'DISK_IO_WAIT':
+            target_metric_name = 'disk_io_wait'
+        elif signal == 'NET_TX_BW':
+            target_metric_name = 'net_tx_bw'
+        # For Host/Pod metrics, determine from node context and whether df_mem is provided
+        elif 'host' in node.lower() or 'standalone' in node.lower():
+            # If df_mem is provided, we're predicting memory; otherwise CPU
+            # Note: The column in main_agg is 'mem' (not 'host_mem') when df_mem is merged
+            # The column is 'target' when df_cpu is aggregated
+            if df_mem is not None:
+                # We're predicting memory - use 'mem' since that's what gets merged into main_agg
+                target_metric_name = 'mem'
+            else:
+                # We're predicting CPU - use 'target' since that's what df_cpu becomes after aggregation
+                target_metric_name = 'target'
+        elif 'pod' in node.lower() or 'cluster' in node.lower():
+            # For pod/cluster, if df_mem is provided, we're predicting pod memory; otherwise pod CPU
+            # Note: The actual column name is 'mem' (not 'pod_mem') when df_mem is merged, and 'target' (not 'pod_cpu') when df_cpu is aggregated
+            if df_mem is not None:
+                target_metric_name = 'mem'  # Column name is 'mem' after merge, not 'pod_mem'
+            else:
+                target_metric_name = 'target'  # Column name is 'target' after aggregation, not 'pod_cpu'
+    
+    # If we couldn't determine from context, infer from df_cpu/df_mem
+    # df_cpu is always the main metric (could be host_cpu, pod_cpu, disk_io_wait, or net_tx_bw)
+    # If df_mem is provided, that becomes the target instead
+    if target_metric_name is None:
+        if df_mem is not None:
+            # We're predicting memory - use 'mem' since that's what gets merged into main_agg
+            target_metric_name = 'mem'
+        else:
+            # We're predicting whatever is in df_cpu - use 'target' since that's what df_cpu becomes after aggregation
+            target_metric_name = 'target'
+    
+    # Diagnostic: Log target determination
+    if context and context.get('node') == 'k8s_host_all':
+        log_debug(f"DEBUG k8s_host_all: target_metric_name='{target_metric_name}', df_mem is {'provided' if df_mem is not None else 'None'}", level=1)
+        log_debug(f"  main_agg columns: {list(main_agg.columns)}", level=2)
+        if target_metric_name in main_agg.columns:
+            log_debug(f"  {target_metric_name} column stats: mean={main_agg[target_metric_name].mean():.6f}, std={main_agg[target_metric_name].std():.6f}, unique={main_agg[target_metric_name].nunique()}", level=2)
+        else:
+            log_debug(f"  ⚠️ BUG: target_metric_name '{target_metric_name}' not in main_agg columns!", level=2)
+    
+    # Merge ALL available feature metrics (they will be excluded from features if they match target)
+    # Always merge host_cpu and host_mem if provided (will be excluded if they're the target)
+    if df_host_cpu is not None and target_metric_name != 'host_cpu':
+        try:
+            if not df_host_cpu.empty and 'timestamp' in df_host_cpu.columns and 'value' in df_host_cpu.columns:
+                # Ensure timestamp is datetime type before groupby
+                df_hcpu = df_host_cpu.copy()
+                if not pd.api.types.is_datetime64_any_dtype(df_hcpu['timestamp']):
+                    df_hcpu['timestamp'] = pd.to_datetime(df_hcpu['timestamp'])
+                hcpu_agg = df_hcpu.groupby('timestamp')['value'].mean().reset_index(name='host_cpu')
+                # Ensure timestamp types match for merge
+                if not pd.api.types.is_datetime64_any_dtype(main_agg['timestamp']):
+                    main_agg['timestamp'] = pd.to_datetime(main_agg['timestamp'])
+                if not pd.api.types.is_datetime64_any_dtype(hcpu_agg['timestamp']):
+                    hcpu_agg['timestamp'] = pd.to_datetime(hcpu_agg['timestamp'])
+                
+                # Check for overlapping timestamps before merge
+                main_timestamps = set(main_agg['timestamp'])
+                hcpu_timestamps = set(hcpu_agg['timestamp'])
+                overlap = len(main_timestamps & hcpu_timestamps)
+                log_debug(f"  host_cpu merge: main_agg has {len(main_timestamps)} timestamps, hcpu_agg has {len(hcpu_timestamps)}, overlap: {overlap}", level=2)
+                
+                main_agg = pd.merge(main_agg, hcpu_agg, on='timestamp', how='left')
+                if 'host_cpu' in main_agg.columns:
+                    main_agg['host_cpu'] = main_agg['host_cpu'].ffill().bfill().fillna(0)
+                    log_debug(f"  Successfully merged host_cpu: {main_agg['host_cpu'].notna().sum()} non-null values", level=2)
+                else:
+                    # Try to find if it was renamed (e.g., host_cpu_x, host_cpu_y)
+                    host_cpu_cols = [col for col in main_agg.columns if 'host_cpu' in col]
+                    if host_cpu_cols:
+                        log_verbose(f"  Warning: host_cpu column renamed to {host_cpu_cols}, using first one", level=2)
+                        main_agg['host_cpu'] = main_agg[host_cpu_cols[0]].ffill().bfill().fillna(0)
+                        # Drop the renamed columns
+                        for col in host_cpu_cols:
+                            if col != 'host_cpu':
+                                main_agg = main_agg.drop(columns=[col])
+                    else:
+                        log_verbose(f"  Warning: host_cpu column not found after merge (main_agg cols: {list(main_agg.columns)})", level=2)
+        except (KeyError, Exception) as e:
+            log_verbose(f"  Warning: Failed to merge host_cpu feature: {e}", level=2)
+    
+    if df_host_mem is not None and target_metric_name != 'host_mem':
+        try:
+            if not df_host_mem.empty and 'timestamp' in df_host_mem.columns and 'value' in df_host_mem.columns:
+                # Ensure timestamp is datetime type before groupby
+                df_hmem = df_host_mem.copy()
+                if not pd.api.types.is_datetime64_any_dtype(df_hmem['timestamp']):
+                    df_hmem['timestamp'] = pd.to_datetime(df_hmem['timestamp'])
+                hmem_agg = df_hmem.groupby('timestamp')['value'].mean().reset_index(name='host_mem')
+                # Ensure timestamp types match for merge
+                if not pd.api.types.is_datetime64_any_dtype(main_agg['timestamp']):
+                    main_agg['timestamp'] = pd.to_datetime(main_agg['timestamp'])
+                if not pd.api.types.is_datetime64_any_dtype(hmem_agg['timestamp']):
+                    hmem_agg['timestamp'] = pd.to_datetime(hmem_agg['timestamp'])
+                main_agg = pd.merge(main_agg, hmem_agg, on='timestamp', how='left')
+                if 'host_mem' in main_agg.columns:
+                    main_agg['host_mem'] = main_agg['host_mem'].ffill().bfill().fillna(0)
+                else:
+                    log_verbose(f"  Warning: host_mem column not found after merge (main_agg cols: {list(main_agg.columns)})", level=2)
+        except (KeyError, Exception) as e:
+            log_verbose(f"  Warning: Failed to merge host_mem feature: {e}", level=2)
+    
+    if df_pod_cpu is not None and target_metric_name != 'pod_cpu':
+        try:
+            if not df_pod_cpu.empty and 'timestamp' in df_pod_cpu.columns and 'value' in df_pod_cpu.columns:
+                # Ensure timestamp is datetime type before groupby
+                df_pcpu = df_pod_cpu.copy()
+                if not pd.api.types.is_datetime64_any_dtype(df_pcpu['timestamp']):
+                    df_pcpu['timestamp'] = pd.to_datetime(df_pcpu['timestamp'])
+                pcpu_agg = df_pcpu.groupby('timestamp')['value'].mean().reset_index(name='pod_cpu')
+                # Ensure timestamp types match for merge
+                if not pd.api.types.is_datetime64_any_dtype(main_agg['timestamp']):
+                    main_agg['timestamp'] = pd.to_datetime(main_agg['timestamp'])
+                if not pd.api.types.is_datetime64_any_dtype(pcpu_agg['timestamp']):
+                    pcpu_agg['timestamp'] = pd.to_datetime(pcpu_agg['timestamp'])
+                main_agg = pd.merge(main_agg, pcpu_agg, on='timestamp', how='left')
+                if 'pod_cpu' in main_agg.columns:
+                    main_agg['pod_cpu'] = main_agg['pod_cpu'].ffill().bfill().fillna(0)
+                else:
+                    log_verbose(f"  Warning: pod_cpu column not found after merge (main_agg cols: {list(main_agg.columns)})", level=2)
+        except (KeyError, Exception) as e:
+            log_verbose(f"  Warning: Failed to merge pod_cpu feature: {e}", level=2)
+    
+    if df_pod_mem is not None and target_metric_name != 'pod_mem':
+        try:
+            if not df_pod_mem.empty and 'timestamp' in df_pod_mem.columns and 'value' in df_pod_mem.columns:
+                # Ensure timestamp is datetime type before groupby
+                df_pmem = df_pod_mem.copy()
+                if not pd.api.types.is_datetime64_any_dtype(df_pmem['timestamp']):
+                    df_pmem['timestamp'] = pd.to_datetime(df_pmem['timestamp'])
+                pmem_agg = df_pmem.groupby('timestamp')['value'].mean().reset_index(name='pod_mem')
+                # Ensure timestamp types match for merge
+                if not pd.api.types.is_datetime64_any_dtype(main_agg['timestamp']):
+                    main_agg['timestamp'] = pd.to_datetime(main_agg['timestamp'])
+                if not pd.api.types.is_datetime64_any_dtype(pmem_agg['timestamp']):
+                    pmem_agg['timestamp'] = pd.to_datetime(pmem_agg['timestamp'])
+                main_agg = pd.merge(main_agg, pmem_agg, on='timestamp', how='left')
+                if 'pod_mem' in main_agg.columns:
+                    main_agg['pod_mem'] = main_agg['pod_mem'].ffill().bfill().fillna(0)
+                else:
+                    log_verbose(f"  Warning: pod_mem column not found after merge (main_agg cols: {list(main_agg.columns)})", level=2)
+        except (KeyError, Exception) as e:
+            log_verbose(f"  Warning: Failed to merge pod_mem feature: {e}", level=2)
+    
+    # Only merge I/O/Network metrics if they're NOT the target we're predicting
+    if df_disk_io_wait is not None and target_metric_name != 'disk_io_wait':
+        try:
+            if not df_disk_io_wait.empty and 'timestamp' in df_disk_io_wait.columns and 'value' in df_disk_io_wait.columns:
+                # Ensure timestamp is datetime type before groupby
+                df_diow = df_disk_io_wait.copy()
+                if not pd.api.types.is_datetime64_any_dtype(df_diow['timestamp']):
+                    df_diow['timestamp'] = pd.to_datetime(df_diow['timestamp'])
+                diow_agg = df_diow.groupby('timestamp')['value'].mean().reset_index(name='disk_io_wait')
+                # Ensure timestamp types match for merge
+                if not pd.api.types.is_datetime64_any_dtype(main_agg['timestamp']):
+                    main_agg['timestamp'] = pd.to_datetime(main_agg['timestamp'])
+                if not pd.api.types.is_datetime64_any_dtype(diow_agg['timestamp']):
+                    diow_agg['timestamp'] = pd.to_datetime(diow_agg['timestamp'])
+                main_agg = pd.merge(main_agg, diow_agg, on='timestamp', how='left')
+                if 'disk_io_wait' in main_agg.columns:
+                    main_agg['disk_io_wait'] = main_agg['disk_io_wait'].ffill().bfill().fillna(0)
+                else:
+                    log_verbose(f"  Warning: disk_io_wait column not found after merge (main_agg cols: {list(main_agg.columns)})", level=2)
+        except (KeyError, Exception) as e:
+            log_verbose(f"  Warning: Failed to merge disk_io_wait feature: {e}", level=2)
+    
+    if df_net_tx_bw is not None and target_metric_name != 'net_tx_bw':
+        try:
+            if not df_net_tx_bw.empty and 'timestamp' in df_net_tx_bw.columns and 'value' in df_net_tx_bw.columns:
+                # Ensure timestamp is datetime type before groupby
+                df_ntx = df_net_tx_bw.copy()
+                if not pd.api.types.is_datetime64_any_dtype(df_ntx['timestamp']):
+                    df_ntx['timestamp'] = pd.to_datetime(df_ntx['timestamp'])
+                ntx_agg = df_ntx.groupby('timestamp')['value'].mean().reset_index(name='net_tx_bw')
+                # Ensure timestamp types match for merge
+                if not pd.api.types.is_datetime64_any_dtype(main_agg['timestamp']):
+                    main_agg['timestamp'] = pd.to_datetime(main_agg['timestamp'])
+                if not pd.api.types.is_datetime64_any_dtype(ntx_agg['timestamp']):
+                    ntx_agg['timestamp'] = pd.to_datetime(ntx_agg['timestamp'])
+                main_agg = pd.merge(main_agg, ntx_agg, on='timestamp', how='left')
+                if 'net_tx_bw' in main_agg.columns:
+                    main_agg['net_tx_bw'] = main_agg['net_tx_bw'].ffill().bfill().fillna(0)
+                else:
+                    log_verbose(f"  Warning: net_tx_bw column not found after merge (main_agg cols: {list(main_agg.columns)})", level=2)
+        except (KeyError, Exception) as e:
+            log_verbose(f"  Warning: Failed to merge net_tx_bw feature: {e}", level=2)
+    
+    # Determine target column - use target_metric_name if it was determined from context
+    # Otherwise fall back to simple logic
+    if target_metric_name and target_metric_name in main_agg.columns:
+        target = target_metric_name
+    elif df_mem is not None and 'mem' in main_agg.columns:
         target = 'mem'
     else:
-        target = 'cpu'
-
-    pdf = cpu_agg[['timestamp', target]].rename(columns={'timestamp':'ds', target:'y'}).dropna()
+        target = 'target'
+    
+    # Create Prophet dataframe with target and all features
+    # Don't include the target itself as a feature
+    feature_cols = ['timestamp', target, 'hour', 'is_weekend']
+    available_features = []
+    
+    # Log what columns we have in main_agg for debugging
+    log_debug(f"  main_agg columns after all merges: {list(main_agg.columns)}", level=2)
+    
+    for feat in ['mem', 'host_cpu', 'host_mem', 'pod_cpu', 'pod_mem', 'disk_io_wait', 'net_tx_bw']:
+        if feat in main_agg.columns and feat != target:  # Don't include target as a feature
+            feature_cols.append(feat)
+            available_features.append(feat)
+        else:
+            if feat != target:  # Only log if it's not the target
+                # This is expected for models that don't use additional features (e.g., Kubernetes cluster models)
+                log_debug(f"  Feature {feat} not available (target={target}) - expected if feature dataframes not provided", level=2)
+    
+    # Log which features are being used (only in very verbose mode to avoid cluttering output)
+    if available_features and should_verbose():
+        node_info = ""
+        if context:
+            node = context.get('node', '')
+            signal = context.get('signal', '')
+            if node and signal:
+                node_info = f" for {node} | {signal}"
+        log_debug(f"Using {len(available_features)} feature(s){node_info}: {', '.join(available_features)}", level=2)
+    
+    # Ensure target column exists in main_agg
+    if target not in main_agg.columns:
+        log_verbose(f"Warning: target '{target}' not in main_agg columns {list(main_agg.columns)}. Falling back to 'target' or 'mem'.", level=1)
+        # Try to find the correct column
+        if 'mem' in main_agg.columns and df_mem is not None:
+            target = 'mem'
+            log_verbose(f"  Using 'mem' as target instead.", level=1)
+        elif 'target' in main_agg.columns:
+            target = 'target'
+            log_verbose(f"  Using 'target' as target instead.", level=1)
+        else:
+            raise ValueError(f"Cannot find target column '{target}' in main_agg. Available columns: {list(main_agg.columns)}")
+    
+    # Create pdf with target column renamed to 'y'
+    pdf_before_dropna = main_agg[feature_cols].rename(columns={'timestamp':'ds', target:'y'})
+    
+    # Diagnostic: Check pdf data before dropna
+    if context and context.get('node') == 'k8s_host_all':
+        log_debug(f"DEBUG k8s_host_all: pdf (after rename, before dropna) has {len(pdf_before_dropna)} rows, target='{target}', y column has {pdf_before_dropna['y'].nunique()} unique values", level=2)
+        if len(pdf_before_dropna) > 0:
+            nan_count = pdf_before_dropna['y'].isna().sum()
+            non_nan_count = pdf_before_dropna['y'].notna().sum()
+            log_debug(f"  pdf y: {non_nan_count} non-null, {nan_count} NaN values", level=2)
+            if non_nan_count > 0:
+                log_debug(f"  pdf y stats (non-null only): mean={pdf_before_dropna['y'].mean():.6f}, std={pdf_before_dropna['y'].std():.6f}, min={pdf_before_dropna['y'].min():.6f}, max={pdf_before_dropna['y'].max():.6f}", level=2)
+    
+    # Drop rows with NaN y values
+    pdf = pdf_before_dropna.dropna(subset=['y'])
+    
+    # Diagnostic: Check pdf data after dropna
+    if context and context.get('node') == 'k8s_host_all':
+        log_debug(f"DEBUG k8s_host_all: pdf (after dropna) has {len(pdf)} rows, y column has {pdf['y'].nunique()} unique values", level=2)
+        if len(pdf) > 0:
+            log_debug(f"  pdf y stats: mean={pdf['y'].mean():.6f}, std={pdf['y'].std():.6f}, min={pdf['y'].min():.6f}, max={pdf['y'].max():.6f}", level=2)
+            if pdf['y'].nunique() <= 1:
+                log_debug(f"  ⚠️ BUG DETECTED: pdf['y'] has only {pdf['y'].nunique()} unique value(s) after dropna!", level=2)
+    
     pdf = pdf.set_index('ds')
     freq = pd.infer_freq(pdf.index)
     if freq: pdf.index.freq = freq
     pdf = pdf.reset_index()
+    
+    # Diagnostic: Check pdf data after processing
+    if context and context.get('node') == 'k8s_host_all':
+        log_debug(f"DEBUG k8s_host_all: pdf (after processing) has {len(pdf)} rows, y column has {pdf['y'].nunique()} unique values", level=2)
+        if len(pdf) > 0:
+            log_debug(f"  pdf y stats: mean={pdf['y'].mean():.6f}, std={pdf['y'].std():.6f}, min={pdf['y'].min():.6f}, max={pdf['y'].max():.6f}", level=2)
 
     # --- Train/Test Split (time-ordered, chronological) ---
     # Time-ordered split ensures training data is always from the past and test data from the future
     # This prevents data leakage and provides realistic backtest evaluation
+    # IMPORTANT: pdf should only contain rows with non-null y values after dropna
+    # If pdf still has many rows but only a few have actual y values, the split will be wrong
+    if len(pdf) == 0:
+        raise ValueError(f"No valid data points after dropna for target '{target}'. Check data quality.")
+    
     split_idx = max(1, int(len(pdf) * TRAIN_FRACTION))
     if split_idx >= len(pdf):
         split_idx = len(pdf) - 1
     test_cutoff = pdf.iloc[split_idx]['ds']
     test_ts = pdf[pdf['ds'] > test_cutoff].set_index('ds')['y']
     train = pdf[pdf['ds'] <= test_cutoff]
+    
+    # Diagnostic: Check train/test split
+    if context and context.get('node') == 'k8s_host_all':
+        log_debug(f"DEBUG k8s_host_all: Train/test split: {len(train)} train rows, {len(test_ts)} test rows", level=2)
+        log_debug(f"  Train period: {train['ds'].min()} to {train['ds'].max()}", level=2)
+        log_debug(f"  Test period: {test_ts.index.min()} to {test_ts.index.max()}", level=2)
+    
+    # Diagnostic: Check training data after split
+    if context and context.get('node') == 'k8s_host_all':
+        train_y = train['y']
+        log_debug(f"DEBUG k8s_host_all: train (after split) has {len(train)} rows, y column has {train_y.nunique()} unique values", level=2)
+        log_debug(f"  train y stats: mean={train_y.mean():.6f}, std={train_y.std():.6f}, min={train_y.min():.6f}, max={train_y.max():.6f}", level=2)
+        if train_y.nunique() <= 1:
+            log_debug(f"  ⚠️ BUG DETECTED: train['y'] has only {train_y.nunique()} unique value(s) after train/test split!", level=2)
+            log_debug(f"  Sample train y values: {train_y.head(20).tolist()}", level=2)
+            log_debug(f"  train columns: {list(train.columns)}", level=2)
+            log_debug(f"  train['ds'] range: {train['ds'].min()} to {train['ds'].max()}", level=2)
     split_info = {
         "train_fraction": TRAIN_FRACTION,
         "train_points": int(len(train)),
@@ -3952,7 +4769,7 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
         "test_start": str(test_ts.index.min()) if len(test_ts) else None,
         "test_end": str(test_ts.index.max()) if len(test_ts) else None
     }
-    log_verbose(f"Split info ({model_path or 'N/A'}): {split_info}")
+    log_debug(f"Split info ({model_path or 'N/A'}): {split_info}", level=2)
 
     # --- Prophet ---
     # Save hyperparameters for minimal updates during forecast
@@ -3965,11 +4782,25 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
                 weekly_seasonality=prophet_params['weekly_seasonality'], 
                 changepoint_prior_scale=prophet_params['changepoint_prior_scale'],
                 mcmc_samples=0)
-    m.add_regressor('hour'); m.add_regressor('is_weekend')
+    m.add_regressor('hour')
+    m.add_regressor('is_weekend')
+    # Add all available feature metrics as regressors
+    regressors_added = []
+    for feat in available_features:
+        if feat in pdf.columns:
+            m.add_regressor(feat)
+            regressors_added.append(feat)
+    
+    # Log regressors added (only in very verbose mode)
+    if regressors_added and should_verbose():
+        log_debug(f"Prophet regressors added: hour, is_weekend" + (f", {', '.join(regressors_added)}" if regressors_added else ""), level=2)
     if has_sufficient_data_for_monthly_seasonality(pdf, min_days=30):
         m.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
-    pdf['hour'] = pdf['ds'].dt.hour
-    pdf['is_weekend'] = (pdf['ds'].dt.dayofweek>=5).astype(int)
+    # Ensure hour and is_weekend are set (they should already be, but ensure)
+    if 'hour' not in pdf.columns:
+        pdf['hour'] = pdf['ds'].dt.hour
+    if 'is_weekend' not in pdf.columns:
+        pdf['is_weekend'] = (pdf['ds'].dt.dayofweek>=5).astype(int)
     
     # Add instance/node metadata to CSV if dumping
     if dump_csv_dir:
@@ -4013,18 +4844,27 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
     future = m.make_future_dataframe(periods=horizon_min, freq='min')
     future['hour'] = future['ds'].dt.hour
     future['is_weekend'] = (future['ds'].dt.dayofweek>=5).astype(int)
+    # Add feature values to future dataframe (use last known values for forecast period)
+    for feat in available_features:
+        if feat in pdf.columns:
+            last_value = pdf[feat].iloc[-1] if len(pdf) > 0 else 0
+            future[feat] = last_value  # Use last known value for forecast
     f_prophet = m.predict(future)['yhat']
 
     # --- ARIMA ---
     ts = pd.Series(pdf.set_index('ds')['y'])
     if ts.index.freq is None:
         ts.index.freq = pd.infer_freq(ts.index)
+    
+    # Use fixed ARIMA order (2,1,0) - proven stable for time series
     arima = ARIMA(ts, order=(2,1,0)).fit()
     f_arima = arima.forecast(steps=horizon_min)
     f_arima.index = pd.date_range(start=ts.index[-1] + pd.Timedelta(minutes=1), periods=horizon_min, freq='min')
 
     # --- LSTM (CPU-only) ---
     f_lstm = None
+    lstm_artifact = None  # Store LSTM model for consolidated save
+    lstm_active = False  # Track if LSTM is actually active (not a fallback)
     if LSTM_AVAILABLE and len(ts) > LSTM_SEQ_LEN + horizon_min:
         scaler = MinMaxScaler()
         scaled = scaler.fit_transform(ts.values.reshape(-1, 1))
@@ -4048,19 +4888,186 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
         lstm_pred = model.predict(last_seq, verbose=0)
         f_lstm = pd.Series(scaler.inverse_transform(lstm_pred)[0],
                            index=f_arima.index)
-
-        # Save LSTM (only if save_model is True)
-        if save_model:
-            joblib.dump({'model': model, 'scaler': scaler}, LSTM_MODEL_PATH)
-            print(f"LSTM model saved: {LSTM_MODEL_PATH}")
+        
+        # Store LSTM model and scaler for consolidated save (not separately)
+        lstm_artifact = {'model': model, 'scaler': scaler}
+        lstm_active = True  # LSTM is actually trained and active
     else:
         f_lstm = f_arima.copy()  # fallback
-        log_verbose("LSTM skipped: not enough data or TensorFlow missing")
+        lstm_artifact = None
+        lstm_active = False
+        log_debug("LSTM skipped: not enough data or TensorFlow missing", level=2)
 
-    # --- Ensemble (Prophet + ARIMA + LSTM) ---
+    # --- LightGBM (optional, enabled by default) ---
+    f_lightgbm = None
+    lgb_model = None  # Store LightGBM model for consolidated save
+    lightgbm_active = False  # Track if LightGBM is actually active (not a fallback)
+    if LIGHTGBM_ENABLED and len(pdf) > 100:  # Need minimum data for LightGBM
+        try:
+            # Prepare features for LightGBM
+            # Use all available features + time-based features
+            feature_cols = ['hour', 'is_weekend']
+            for feat in available_features:
+                if feat in pdf.columns:
+                    feature_cols.append(feat)
+            
+            # Prepare training data
+            train_lgb = train.copy()
+            X_train = train_lgb[feature_cols].fillna(0)
+            y_train = train_lgb['y'].values
+            
+            # Prepare future data for prediction
+            future_lgb = future.tail(horizon_min).copy()
+            X_future = future_lgb[feature_cols].fillna(0)
+            
+            # Train LightGBM with accuracy-focused parameters
+            # Use early stopping for optimal performance - adapts to data complexity automatically
+            # For large datasets, use more capacity but let early stopping prevent overfitting
+            # Note: If too few features (< 4), LightGBM may not be very useful - consider disabling
+            n_samples = len(X_train)
+            n_features = len(feature_cols)
+            
+            # Disable LightGBM if too few features (not enough information to learn from)
+            if n_features < 4:
+                log_debug(f"LightGBM skipped: insufficient features ({n_features} features, need at least 4)", level=2)
+                f_lightgbm = None  # Don't create fallback - we'll skip it entirely
+                lightgbm_active = False
+            else:
+                # Proceed with LightGBM training
+                if n_samples > 50000:
+                    # Very large dataset: maximum capacity, early stopping will prevent overfitting
+                    n_estimators = 2000  # Very high limit for complex patterns
+                    max_depth = 12
+                    num_leaves = 511
+                    min_data_in_leaf = 50
+                elif n_samples > 20000:
+                    # Large dataset: high capacity, early stopping will prevent overfitting
+                    n_estimators = 1500  # Increased from 1000 to allow more complex patterns
+                    max_depth = 10
+                    num_leaves = 255
+                    min_data_in_leaf = 50
+                elif n_samples > 10000:
+                    # Medium-large dataset
+                    n_estimators = 1000  # Increased from 800
+                    max_depth = 9
+                    num_leaves = 200
+                    min_data_in_leaf = 50
+                else:
+                    # Smaller dataset: conservative settings
+                    n_estimators = 500
+                    max_depth = 7
+                    num_leaves = 127
+                    min_data_in_leaf = 50
+                
+                # Split training data for validation (use last 20% for validation, time-series aware)
+                # For time series, we use the last portion, not random split
+                # Ensure minimum validation set size for reliable early stopping
+                min_val_size = 100  # Minimum 100 samples for validation
+                val_size = max(int(len(X_train) * 0.2), min_val_size)
+                
+                # Don't use validation if training set is too small
+                if len(X_train) > min_val_size * 2:  # Need at least 2x minimum for train+val
+                    X_train_split = X_train[:-val_size]
+                    X_val_split = X_train[-val_size:]
+                    y_train_split = y_train[:-val_size]
+                    y_val_split = y_train[-val_size:]
+                    use_validation = True
+                else:
+                    # If dataset too small, use all data for training (no validation, no early stopping)
+                    X_train_split = X_train
+                    X_val_split = None
+                    y_train_split = y_train
+                    y_val_split = None
+                    use_validation = False
+                    log_debug(f"LightGBM: dataset too small ({len(X_train)} samples), skipping validation/early stopping", level=2)
+                
+                lgb_model = lgb.LGBMRegressor(
+                    n_estimators=n_estimators,
+                    max_depth=max_depth,
+                    learning_rate=0.03,
+                    num_leaves=num_leaves,
+                    min_data_in_leaf=min_data_in_leaf,
+                    feature_fraction=0.8,
+                    bagging_fraction=0.8,
+                    bagging_freq=5,
+                    lambda_l1=0.1,
+                    lambda_l2=1.0,
+                    n_jobs=-1,
+                    verbose=-1,
+                    random_state=42
+                )
+                
+                # Train with early stopping if validation set is available
+                if use_validation:
+                    lgb_model.fit(
+                        X_train_split, y_train_split,
+                        eval_set=[(X_val_split, y_val_split)],
+                        callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)]  # Stop if no improvement for 50 rounds
+                    )
+                    
+                    # Log training details including early stopping info
+                    actual_trees = lgb_model.best_iteration_ if hasattr(lgb_model, 'best_iteration_') and lgb_model.best_iteration_ is not None else n_estimators
+                    
+                    # Warn if early stopping triggered too early (might indicate validation set issues)
+                    if actual_trees < 10:
+                        log_verbose(f"Warning: LightGBM early stopping at {actual_trees} trees - validation set may be too small or problematic", level=1)
+                        # Use more trees as fallback if early stopping triggered too early
+                        if actual_trees < 5:
+                            log_verbose(f"LightGBM: Re-training with more conservative early stopping (stopping_rounds=10)", level=1)
+                            lgb_model.fit(
+                                X_train_split, y_train_split,
+                                eval_set=[(X_val_split, y_val_split)],
+                                callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=False)]  # More lenient
+                            )
+                            actual_trees = lgb_model.best_iteration_ if hasattr(lgb_model, 'best_iteration_') and lgb_model.best_iteration_ is not None else n_estimators
+                else:
+                    # No validation set - train without early stopping
+                    lgb_model.fit(X_train_split, y_train_split)
+                    actual_trees = n_estimators
+                
+                log_debug(f"LightGBM trained successfully with {len(X_train)} samples, {len(feature_cols)} features", level=2)
+                log_debug(f"LightGBM used {actual_trees}/{n_estimators} trees (early stopping: {'active' if use_validation else 'disabled'})", level=2)
+                
+                # Print to console if early stopping triggered (user-friendly feedback)
+                if use_validation and actual_trees < n_estimators:
+                    log_verbose(f"LightGBM early stopping: optimal at {actual_trees} trees (saved {n_estimators - actual_trees} iterations)", level=1)
+                
+                # Predict
+                lgb_pred = lgb_model.predict(X_future)
+                f_lightgbm = pd.Series(lgb_pred, index=f_arima.index)
+                log_debug(f"LightGBM prediction completed: {len(lgb_pred)} points", level=2)
+                lightgbm_active = True  # LightGBM is actually trained and active
+                
+                # LightGBM model will be saved in consolidated file (not separately)
+        except Exception as e:
+            log_verbose(f"Warning: LightGBM training failed: {e}", level=1)
+            f_lightgbm = f_arima.copy()  # fallback
+            lightgbm_active = False
+            log_debug(f"LightGBM skipped due to error: {e}", level=2)
+    else:
+        f_lightgbm = f_arima.copy()  # fallback
+        lightgbm_active = False
+        if not LIGHTGBM_ENABLED:
+            log_debug("LightGBM disabled or not available", level=2)
+        else:
+            log_debug("LightGBM skipped: insufficient data", level=2)
+
+    # --- Ensemble (Prophet + ARIMA + LSTM + LightGBM) ---
     tail = future.tail(horizon_min)
     prophet_tail = pd.Series(f_prophet.tail(horizon_min).values, index=tail['ds'])
-    ensemble = (prophet_tail + f_arima + f_lstm) / 3
+    
+    # Count active models for ensemble averaging (only include actually active models, not fallbacks)
+    active_models = [prophet_tail, f_arima]
+    # Only include LSTM if it's actually active (not a fallback)
+    if lstm_active and f_lstm is not None:
+        active_models.append(f_lstm)
+    # Only include LightGBM if it's actually active (not a fallback)
+    if lightgbm_active and f_lightgbm is not None:
+        active_models.append(f_lightgbm)
+    num_models = len(active_models)
+    
+    # Simple average of all active models
+    ensemble = sum(active_models) / num_models
 
     # --- ROBUST BACKTEST — WORKS WITH 1m, 5m, 10m, 1h DATA ---
     # Initialize backtest variables
@@ -4070,46 +5077,232 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
     ens_pred = None
     metrics = {}
     
+    # Check if training data has zero variance (would make all models produce constant predictions)
+    train_ts_check = train.set_index('ds')['y'] if 'ds' in train.columns else train['y'] if 'y' in train.columns else None
+    training_data_constant = False
+    if train_ts_check is not None and len(train_ts_check) > 0:
+        train_std_check = train_ts_check.std()
+        train_unique_check = train_ts_check.nunique()
+        if train_std_check < 1e-10 or train_unique_check <= 1:
+            training_data_constant = True
+            log_verbose(f"Warning: Training data is constant (std={train_std_check:.6f}, unique_values={train_unique_check}) - backtest metrics will be misleading", level=1)
+    
     if len(test_ts) >= 50:
-        # Prophet backtest
+        # Prophet backtest - use same features as training
         mb = Prophet(daily_seasonality=True, weekly_seasonality=True, changepoint_prior_scale=0.05, mcmc_samples=0)
         mb.add_regressor('hour')
         mb.add_regressor('is_weekend')
+        # Add all available feature metrics as regressors
+        for feat in available_features:
+            if feat in train.columns:
+                mb.add_regressor(feat)
         if has_sufficient_data_for_monthly_seasonality(train, min_days=30):
             mb.add_seasonality(name='monthly', period=30.44, fourier_order=5)  # ~30.44 days = average month
 
         train_b = train.copy()
-        train_b['hour'] = train_b['ds'].dt.hour
-        train_b['is_weekend'] = (train_b['ds'].dt.dayofweek >= 5).astype(int)
-        mb.fit(train_b)
+        # Ensure all features are present
+        if 'hour' not in train_b.columns:
+            train_b['hour'] = train_b['ds'].dt.hour
+        if 'is_weekend' not in train_b.columns:
+            train_b['is_weekend'] = (train_b['ds'].dt.dayofweek >= 5).astype(int)
+        
+        p_back = None
+        try:
+            mb.fit(train_b)
 
-        # Make future at minute resolution (Prophet requirement)
-        fut_b = mb.make_future_dataframe(periods=len(test_ts), freq='min')
-        fut_b['hour'] = fut_b['ds'].dt.hour
-        fut_b['is_weekend'] = (fut_b['ds'].dt.dayofweek >= 5).astype(int)
+            # Make future at minute resolution (Prophet requirement)
+            fut_b = mb.make_future_dataframe(periods=len(test_ts), freq='min')
+            fut_b['hour'] = fut_b['ds'].dt.hour
+            fut_b['is_weekend'] = (fut_b['ds'].dt.dayofweek >= 5).astype(int)
+            # Add feature values to future dataframe (use last known values for test period)
+            for feat in available_features:
+                if feat in train_b.columns:
+                    last_value = train_b[feat].iloc[-1] if len(train_b) > 0 else 0
+                    fut_b[feat] = last_value  # Use last known value for test period
 
-        prophet_pred_full = mb.predict(fut_b).set_index('ds')
-        # Align to actual test timestamps (10m data may have gaps)
-        prophet_full = mb.predict(fut_b).set_index('ds')
-        p_back = prophet_full.reindex(test_ts.index, method='nearest')['yhat']
-        # Ensure p_back is numeric and has no NaN/inf
-        p_back = pd.to_numeric(p_back, errors='coerce').replace([np.inf, -np.inf], np.nan)
+            prophet_pred_full = mb.predict(fut_b).set_index('ds')
+            # Align to actual test timestamps (10m data may have gaps)
+            prophet_full = mb.predict(fut_b).set_index('ds')
+            p_back_raw = prophet_full.reindex(test_ts.index, method='nearest')['yhat']
+            # Ensure p_back is numeric and has no NaN/inf
+            p_back = pd.to_numeric(p_back_raw, errors='coerce').replace([np.inf, -np.inf], np.nan)
+            
+            # Check if Prophet produced all NaN or constant values
+            if p_back is not None and len(p_back) > 0:
+                nan_count = p_back.isna().sum()
+                unique_count = p_back.nunique()
+                if nan_count == len(p_back):
+                    log_verbose(f"Warning: Prophet backtest produced all NaN values - using fallback", level=1)
+                    p_back = None
+                elif unique_count == 1:
+                    log_verbose(f"Warning: Prophet backtest produced constant predictions (value={p_back.iloc[0]:.6f}) - this may indicate a problem", level=1)
+            
+            # Diagnostic: Log Prophet prediction statistics
+            if p_back is not None and len(p_back) > 0:
+                log_debug(f"Prophet backtest: {len(p_back)} predictions, mean={p_back.mean():.6f}, std={p_back.std():.6f}, unique_values={p_back.nunique()}", level=2)
+        except Exception as e:
+            log_verbose(f"Prophet backtest failed: {e}")
+            p_back = None
+        
+        # Fallback for Prophet if it failed or produced all NaN
+        if p_back is None or (len(p_back) > 0 and p_back.isna().all()):
+            fallback_value = train.set_index('ds')['y'].mean() if not train.empty else (test_ts.mean() if not test_ts.empty else 0.0)
+            if pd.isna(fallback_value) or np.isinf(fallback_value):
+                fallback_value = 0.0
+            p_back = pd.Series([fallback_value] * len(test_ts), index=test_ts.index)
+            log_verbose(f"Prophet backtest: Using fallback (constant={fallback_value:.6f})", level=1)
 
         # ARIMA — use original timestamps
         train_ts = train.set_index('ds')['y']
-        try:
-            a_model = ARIMA(train_ts, order=(2,1,0)).fit()
-            a_pred = pd.Series(a_model.forecast(steps=len(test_ts)), index=test_ts.index)
-            # Ensure a_pred is numeric and has no NaN/inf
-            a_pred = pd.to_numeric(a_pred, errors='coerce').replace([np.inf, -np.inf], np.nan)
-        except Exception as e:
-            log_verbose(f"ARIMA backtest failed: {e}")
-            # Fallback: use mean of test_ts or 0
-            fallback_value = test_ts.mean() if not test_ts.empty and not test_ts.isna().all() else 0.0
+        
+        # Skip ARIMA for unified correlated models (normalized 0-1 composite targets)
+        # ARIMA consistently fails on normalized data, and we have Prophet + LightGBM for these models
+        signal_type = context.get('signal', '') if context else ''
+        skip_arima_for_unified = (signal_type == 'UNIFIED_CORRELATED')
+        
+        # Diagnostic: Check training data variance
+        train_mean = train_ts.mean()
+        train_std = train_ts.std()
+        train_unique = train_ts.nunique()
+        if train_std < 1e-6:
+            log_verbose(f"Warning: Training data has very low variance (std={train_std:.6f}, unique_values={train_unique}) - ARIMA may produce constant forecasts", level=1)
+        
+        a_pred = None
+        if skip_arima_for_unified:
+            log_debug(f"ARIMA skipped for unified correlated model (normalized composite target not suitable for ARIMA)", level=2)
+            a_pred = None
+        else:
+            try:
+                # Check if training data is suitable for ARIMA
+                if len(train_ts) < 10:
+                    log_debug(f"ARIMA backtest skipped: insufficient training data ({len(train_ts)} points, need 10+)", level=2)
+                    a_pred = None
+                elif train_std < 1e-10:
+                    log_debug(f"ARIMA backtest skipped: training data has zero variance (std={train_std:.10f})", level=2)
+                    a_pred = None
+                else:
+                    # Try ARIMA with fixed order first
+                    try:
+                        a_model = ARIMA(train_ts, order=(2,1,0)).fit()
+                        
+                        # Check if model converged properly
+                        if hasattr(a_model, 'mle_retvals') and a_model.mle_retvals.get('converged', True) == False:
+                            log_debug(f"ARIMA(2,1,0) did not converge properly", level=2)
+                            a_pred = None
+                        else:
+                            # Try get_forecast() first (more robust than forecast())
+                            try:
+                                forecast_result = a_model.get_forecast(steps=len(test_ts))
+                                a_pred_raw = forecast_result.predicted_mean
+                                # Check if forecast returned NaN immediately
+                                if isinstance(a_pred_raw, (pd.Series, np.ndarray)):
+                                    if len(a_pred_raw) > 0:
+                                        nan_check = pd.isna(a_pred_raw) if isinstance(a_pred_raw, pd.Series) else np.isnan(a_pred_raw)
+                                        if nan_check.all():
+                                            # get_forecast() returned all NaN, try forecast() instead
+                                            log_debug(f"ARIMA.get_forecast() returned all NaN, trying forecast() instead", level=2)
+                                            a_pred_raw = a_model.forecast(steps=len(test_ts))
+                                            # Check again
+                                            if isinstance(a_pred_raw, (pd.Series, np.ndarray)) and len(a_pred_raw) > 0:
+                                                nan_check2 = pd.isna(a_pred_raw) if isinstance(a_pred_raw, pd.Series) else np.isnan(a_pred_raw)
+                                                if nan_check2.all():
+                                                    # forecast() also returned NaN, try predict() instead
+                                                    log_debug(f"ARIMA.forecast() also returned all NaN, trying predict() instead", level=2)
+                                                    a_pred_raw = a_model.predict(start=len(train_ts), end=len(train_ts) + len(test_ts) - 1)
+                            except Exception as forecast_err:
+                                # get_forecast() method failed, try forecast() instead
+                                log_debug(f"ARIMA.get_forecast() failed: {forecast_err}, trying forecast() instead", level=2)
+                                try:
+                                    a_pred_raw = a_model.forecast(steps=len(test_ts))
+                                    # Check if forecast returned NaN
+                                    if isinstance(a_pred_raw, (pd.Series, np.ndarray)) and len(a_pred_raw) > 0:
+                                        nan_check = pd.isna(a_pred_raw) if isinstance(a_pred_raw, pd.Series) else np.isnan(a_pred_raw)
+                                        if nan_check.all():
+                                            # forecast() returned NaN, try predict() instead
+                                            log_debug(f"ARIMA.forecast() returned all NaN, trying predict() instead", level=2)
+                                            a_pred_raw = a_model.predict(start=len(train_ts), end=len(train_ts) + len(test_ts) - 1)
+                                except Exception as forecast_err2:
+                                    # forecast() method failed, try predict() instead
+                                    log_debug(f"ARIMA.forecast() failed: {forecast_err2}, trying predict() instead", level=2)
+                                    try:
+                                        a_pred_raw = a_model.predict(start=len(train_ts), end=len(train_ts) + len(test_ts) - 1)
+                                    except Exception as predict_err:
+                                        log_debug(f"ARIMA.predict() also failed: {predict_err}", level=2)
+                                        a_pred_raw = None
+                            
+                            if a_pred_raw is not None:
+                                a_pred = pd.Series(a_pred_raw, index=test_ts.index)
+                                # Ensure a_pred is numeric and has no NaN/inf
+                                a_pred = pd.to_numeric(a_pred, errors='coerce').replace([np.inf, -np.inf], np.nan)
+                            else:
+                                a_pred = None
+                    except Exception as e1:
+                        # Try simpler ARIMA order if (2,1,0) fails
+                        log_debug(f"ARIMA(2,1,0) fit failed: {e1}, trying ARIMA(1,1,0)", level=2)
+                        try:
+                            a_model = ARIMA(train_ts, order=(1,1,0)).fit()
+                            try:
+                                a_pred_raw = a_model.forecast(steps=len(test_ts))
+                                if isinstance(a_pred_raw, (pd.Series, np.ndarray)) and len(a_pred_raw) > 0:
+                                    if pd.isna(a_pred_raw).all() or np.isnan(a_pred_raw).all():
+                                        a_pred_raw = a_model.predict(start=len(train_ts), end=len(train_ts) + len(test_ts) - 1)
+                            except:
+                                a_pred_raw = a_model.predict(start=len(train_ts), end=len(train_ts) + len(test_ts) - 1)
+                            a_pred = pd.Series(a_pred_raw, index=test_ts.index)
+                            a_pred = pd.to_numeric(a_pred, errors='coerce').replace([np.inf, -np.inf], np.nan)
+                        except Exception as e2:
+                            # Try even simpler order
+                            log_debug(f"ARIMA(1,1,0) failed: {e2}, trying ARIMA(1,0,0)", level=2)
+                            try:
+                                a_model = ARIMA(train_ts, order=(1,0,0)).fit()
+                                try:
+                                    a_pred_raw = a_model.forecast(steps=len(test_ts))
+                                    if isinstance(a_pred_raw, (pd.Series, np.ndarray)) and len(a_pred_raw) > 0:
+                                        if pd.isna(a_pred_raw).all() or np.isnan(a_pred_raw).all():
+                                            a_pred_raw = a_model.predict(start=len(train_ts), end=len(train_ts) + len(test_ts) - 1)
+                                except:
+                                    a_pred_raw = a_model.predict(start=len(train_ts), end=len(train_ts) + len(test_ts) - 1)
+                                a_pred = pd.Series(a_pred_raw, index=test_ts.index)
+                                a_pred = pd.to_numeric(a_pred, errors='coerce').replace([np.inf, -np.inf], np.nan)
+                            except Exception as e3:
+                                log_debug(f"ARIMA(1,0,0) also failed: {e3}", level=2)
+                                a_pred = None
+                
+                # Check if ARIMA produced all NaN or constant values (only if we attempted it)
+                if a_pred is not None and len(a_pred) > 0:
+                    nan_count = a_pred.isna().sum()
+                    unique_count = a_pred.nunique()
+                    if nan_count == len(a_pred):
+                        log_debug(f"Warning: ARIMA backtest produced all NaN values (training: {len(train_ts)} points, std={train_std:.6f}) - using fallback", level=2)
+                        a_pred = None
+                    elif unique_count == 1:
+                        log_debug(f"Warning: ARIMA backtest produced constant predictions (value={a_pred.iloc[0]:.6f}) - training std={train_std:.6f}", level=2)
+                
+                # Diagnostic: Log ARIMA prediction statistics
+                if a_pred is not None and len(a_pred) > 0:
+                    log_debug(f"ARIMA backtest: {len(a_pred)} predictions, mean={a_pred.mean():.6f}, std={a_pred.std():.6f}, unique_values={a_pred.nunique()}", level=2)
+            except Exception as e:
+                log_verbose(f"ARIMA backtest failed with exception: {e}", level=1)
+                import traceback
+                log_debug(f"ARIMA backtest traceback: {traceback.format_exc()}", level=2)
+                a_pred = None
+        
+        # Fallback for ARIMA if it failed or produced all NaN
+        if a_pred is None or (len(a_pred) > 0 and a_pred.isna().all()):
+            # Use training mean as fallback (more stable than test mean)
+            fallback_value = train_mean if not pd.isna(train_mean) and not np.isinf(train_mean) else (test_ts.mean() if not test_ts.empty and not test_ts.isna().all() else 0.0)
+            if pd.isna(fallback_value) or np.isinf(fallback_value):
+                fallback_value = 0.0
             a_pred = pd.Series([fallback_value] * len(test_ts), index=test_ts.index)
+            # Only log fallback message if ARIMA was attempted (not skipped for unified models)
+            if not skip_arima_for_unified:
+                log_debug(f"ARIMA backtest: Using fallback (constant={fallback_value:.6f})", level=2)
+            else:
+                log_debug(f"ARIMA backtest: Using fallback (constant={fallback_value:.6f}) for unified correlated model", level=2)
 
         # LSTM backtest
         l_back = a_pred.copy()  # fallback
+        lstm_backtest_active = False  # Track if LSTM backtest is actually active
         if LSTM_AVAILABLE and len(train_ts) > LSTM_SEQ_LEN + len(test_ts):
             try:
                 scaler_b = MinMaxScaler()
@@ -4135,11 +5328,78 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
                     l_back = pd.Series(scaler_b.inverse_transform(l_pred)[0], index=test_ts.index)
                     # Ensure l_back is numeric and has no NaN/inf
                     l_back = pd.to_numeric(l_back, errors='coerce').replace([np.inf, -np.inf], np.nan)
+                    lstm_backtest_active = True  # LSTM backtest is actually active
             except Exception as e:
                 print(f"LSTM backtest failed: {e}")
                 l_back = a_pred.copy()
                 # Ensure l_back is numeric
                 l_back = pd.to_numeric(l_back, errors='coerce').replace([np.inf, -np.inf], np.nan)
+                lstm_backtest_active = False
+
+        # LightGBM backtest
+        lg_back = None  # Don't create fallback - we'll skip it if not available
+        lightgbm_backtest_active = False  # Track if LightGBM backtest is actually active
+        if LIGHTGBM_ENABLED and len(train) > 100:
+            try:
+                # Prepare features for LightGBM (same as training)
+                feature_cols = ['hour', 'is_weekend']
+                for feat in available_features:
+                    if feat in train.columns:
+                        feature_cols.append(feat)
+                
+                # Check if we have enough features (same check as main training)
+                n_features_backtest = len(feature_cols)
+                if n_features_backtest < 4:
+                    log_debug(f"LightGBM backtest skipped: insufficient features ({n_features_backtest} features, need at least 4)", level=2)
+                    lg_back = None
+                    lightgbm_backtest_active = False
+                else:
+                    # Prepare training data
+                    X_train_b = train[feature_cols].fillna(0)
+                    y_train_b = train['y'].values
+                    
+                    # Prepare test data
+                    test_df = test_ts.reset_index()
+                    test_df['ds'] = pd.to_datetime(test_df['ds'])
+                    test_df['hour'] = test_df['ds'].dt.hour
+                    test_df['is_weekend'] = (test_df['ds'].dt.dayofweek >= 5).astype(int)
+                    for feat in available_features:
+                        if feat in train.columns:
+                            last_value = train[feat].iloc[-1] if len(train) > 0 else 0
+                            test_df[feat] = last_value
+                    X_test_b = test_df[feature_cols].fillna(0)
+                    
+                    # Train LightGBM
+                    lgb_model_b = lgb.LGBMRegressor(
+                        n_estimators=300,
+                        max_depth=7,
+                        learning_rate=0.03,
+                        num_leaves=127,
+                        min_data_in_leaf=50,
+                        feature_fraction=0.8,
+                        bagging_fraction=0.8,
+                        bagging_freq=5,
+                        lambda_l1=0.1,
+                        lambda_l2=1.0,
+                        n_jobs=-1,
+                        verbose=-1,
+                        random_state=42
+                    )
+                    lgb_model_b.fit(X_train_b, y_train_b)
+                    
+                    # Predict
+                    lg_pred = lgb_model_b.predict(X_test_b)
+                    lg_back = pd.Series(lg_pred, index=test_ts.index)
+                    lg_back = pd.to_numeric(lg_back, errors='coerce').replace([np.inf, -np.inf], np.nan)
+                    lightgbm_backtest_active = True  # LightGBM backtest is actually active
+            except Exception as e:
+                log_verbose(f"LightGBM backtest failed: {e}")
+                lg_back = None
+                lightgbm_backtest_active = False
+            else:
+                # LightGBM not enabled or insufficient data
+                lg_back = None
+                lightgbm_backtest_active = False
 
         # Ensemble - handle NaN values gracefully
         # First, ensure all predictions are Series with proper index alignment
@@ -4148,31 +5408,132 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
         if pd.isna(test_mean) or np.isinf(test_mean):
             test_mean = 0.0
         
+        # Diagnostic: Log test_mean value (used for filling NaN predictions)
+        log_debug(f"Test mean (for filling NaN): {test_mean:.6f} (from {len(test_ts)} test points)", level=2)
+        
         # Clean predictions: replace inf, fill NaN, ensure numeric
-        p_back_clean = pd.to_numeric(p_back, errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(test_mean)
-        a_pred_clean = pd.to_numeric(a_pred, errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(test_mean)
-        l_back_clean = pd.to_numeric(l_back, errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(test_mean)
+        # Diagnostic: Check for NaN values before filling
+        if p_back is not None:
+            p_back_numeric = pd.to_numeric(p_back, errors='coerce').replace([np.inf, -np.inf], np.nan)
+            nan_count = p_back_numeric.isna().sum()
+            if nan_count > 0:
+                log_verbose(f"Warning: Prophet backtest has {nan_count}/{len(p_back_numeric)} NaN values - will be filled with test_mean={test_mean:.6f}", level=1)
+            p_back_clean = p_back_numeric.fillna(test_mean)
+        else:
+            p_back_clean = None
+            
+        if a_pred is not None:
+            a_pred_numeric = pd.to_numeric(a_pred, errors='coerce').replace([np.inf, -np.inf], np.nan)
+            nan_count = a_pred_numeric.isna().sum()
+            if nan_count > 0:
+                log_verbose(f"Warning: ARIMA backtest has {nan_count}/{len(a_pred_numeric)} NaN values - will be filled with test_mean={test_mean:.6f}", level=1)
+            a_pred_clean = a_pred_numeric.fillna(test_mean)
+        else:
+            a_pred_clean = None
+            
+        if l_back is not None:
+            l_back_numeric = pd.to_numeric(l_back, errors='coerce').replace([np.inf, -np.inf], np.nan)
+            nan_count = l_back_numeric.isna().sum()
+            if nan_count > 0:
+                log_debug(f"LSTM backtest has {nan_count}/{len(l_back_numeric)} NaN values - will be filled with test_mean={test_mean:.6f}", level=2)
+            l_back_clean = l_back_numeric.fillna(test_mean)
+        else:
+            l_back_clean = None
+            
+        if lg_back is not None:
+            lg_back_numeric = pd.to_numeric(lg_back, errors='coerce').replace([np.inf, -np.inf], np.nan)
+            nan_count = lg_back_numeric.isna().sum()
+            if nan_count > 0:
+                log_debug(f"LightGBM backtest has {nan_count}/{len(lg_back_numeric)} NaN values - will be filled with test_mean={test_mean:.6f}", level=2)
+            lg_back_clean = lg_back_numeric.fillna(test_mean)
+        else:
+            lg_back_clean = None
         
-        # Ensure all have same index as test_ts
-        p_back_clean = p_back_clean.reindex(test_ts.index, fill_value=test_mean)
-        a_pred_clean = a_pred_clean.reindex(test_ts.index, fill_value=test_mean)
-        l_back_clean = l_back_clean.reindex(test_ts.index, fill_value=test_mean)
+        # Diagnostic: Check if all predictions are identical (indicates a problem)
+        if len(p_back_clean) > 0 and len(a_pred_clean) > 0:
+            if p_back_clean.equals(a_pred_clean):
+                log_verbose(f"Warning: Prophet and ARIMA backtest predictions are identical - possible fallback issue", level=1)
+                # Log sample values to help debug
+                if len(p_back_clean) > 10:
+                    log_debug(f"  Sample Prophet values: {p_back_clean.head(5).tolist()}", level=2)
+                    log_debug(f"  Sample ARIMA values: {a_pred_clean.head(5).tolist()}", level=2)
+                    log_debug(f"  Prophet mean: {p_back_clean.mean():.6f}, std: {p_back_clean.std():.6f}", level=2)
+                    log_debug(f"  ARIMA mean: {a_pred_clean.mean():.6f}, std: {a_pred_clean.std():.6f}", level=2)
         
-        # Calculate ensemble (ensure no NaN or inf in result)
-        ens_pred = (p_back_clean + a_pred_clean + l_back_clean) / 3
+        # Check if ensemble is identical to individual models (very suspicious)
+        if ens_pred is not None and len(ens_pred) > 0:
+            if p_back_clean is not None and len(p_back_clean) > 0:
+                if ens_pred.equals(p_back_clean):
+                    log_verbose(f"Warning: Ensemble predictions identical to Prophet - all models may be producing same output", level=1)
+            if a_pred_clean is not None and len(a_pred_clean) > 0:
+                if ens_pred.equals(a_pred_clean):
+                    log_verbose(f"Warning: Ensemble predictions identical to ARIMA - all models may be producing same output", level=1)
+        
+        # Ensure all have same index as test_ts (only if not None)
+        if p_back_clean is not None:
+            p_back_clean = p_back_clean.reindex(test_ts.index, fill_value=test_mean)
+        if a_pred_clean is not None:
+            a_pred_clean = a_pred_clean.reindex(test_ts.index, fill_value=test_mean)
+        if l_back_clean is not None:
+            l_back_clean = l_back_clean.reindex(test_ts.index, fill_value=test_mean)
+        if lg_back_clean is not None:
+            lg_back_clean = lg_back_clean.reindex(test_ts.index, fill_value=test_mean)
+        
+        # Calculate ensemble (simple average of active models only)
+        # Only include models that are actually active (not fallbacks)
+        active_models = []
+        if p_back_clean is not None:
+            active_models.append(p_back_clean)
+        if a_pred_clean is not None:
+            active_models.append(a_pred_clean)
+        # Only include LSTM if it's actually active (not a fallback)
+        if lstm_backtest_active and l_back_clean is not None:
+            active_models.append(l_back_clean)
+        # Only include LightGBM if it's actually active (not a fallback)
+        if lightgbm_backtest_active and lg_back_clean is not None:
+            active_models.append(lg_back_clean)
+        
+        # Diagnostic: Check if all active models are identical (very suspicious)
+        all_identical = False
+        if len(active_models) >= 2:
+            all_identical = True
+            for i in range(1, len(active_models)):
+                if not active_models[0].equals(active_models[i]):
+                    all_identical = False
+                    break
+            if all_identical:
+                log_verbose(f"Warning: All {len(active_models)} active models have identical predictions - this is very suspicious!", level=1)
+                log_debug(f"  Sample values from first model: {active_models[0].head(10).tolist()}", level=2)
+                log_debug(f"  Mean: {active_models[0].mean():.6f}, Std: {active_models[0].std():.6f}, Min: {active_models[0].min():.6f}, Max: {active_models[0].max():.6f}", level=2)
+        
+        ens_pred = sum(active_models) / len(active_models)
+        
         ens_pred = pd.to_numeric(ens_pred, errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(test_mean)
         
         # Clean test_ts as well
         test_ts_clean = pd.to_numeric(test_ts, errors='coerce').replace([np.inf, -np.inf], np.nan)
+        
+        # Diagnostic: Check if test data is constant (would explain identical predictions)
+        if len(test_ts_clean) > 0:
+            test_std = test_ts_clean.std()
+            test_unique = test_ts_clean.nunique()
+            if test_std < 1e-6 or test_unique <= 2:
+                log_verbose(f"Warning: Test data appears constant (std={test_std:.6f}, unique_values={test_unique}) - this may explain identical model predictions", level=1)
+            log_debug(f"Test data: {len(test_ts_clean)} points, mean={test_ts_clean.mean():.6f}, std={test_std:.6f}, unique_values={test_unique}", level=2)
+            
+            # If all models are identical, also log test data stats
+            if all_identical:
+                log_debug(f"  Test data mean: {test_ts_clean.mean():.6f}, Std: {test_ts_clean.std():.6f}", level=2)
         
         # Align all series and drop rows where test has NaN (but keep predictions)
         valid_mask = ~test_ts_clean.isna()
         if valid_mask.sum() > 0:
             test_valid = test_ts_clean[valid_mask]
             ens_valid = ens_pred[valid_mask]
-            p_back_valid = p_back_clean[valid_mask]
-            a_pred_valid = a_pred_clean[valid_mask]
-            l_back_valid = l_back_clean[valid_mask]
+            p_back_valid = p_back_clean[valid_mask] if p_back_clean is not None else None
+            a_pred_valid = a_pred_clean[valid_mask] if a_pred_clean is not None else None
+            l_back_valid = l_back_clean[valid_mask] if l_back_clean is not None else None
+            lg_back_valid = lg_back_clean[valid_mask] if lg_back_clean is not None else None
             
             # Final check: ensure no NaN or inf in any array before calling mean_absolute_error
             if (not ens_valid.isna().any() and not np.isinf(ens_valid).any() and 
@@ -4182,20 +5543,24 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
                     mae_ens = mean_absolute_error(test_valid, ens_valid)
                     if pd.isna(mae_ens) or np.isinf(mae_ens):
                         mae_ens = np.nan
-                    # Calculate MAPE (Mean Absolute Percentage Error) - statistically correct formula
-                    # MAPE = mean(|actual - predicted| / |actual|) * 100
-                    # This provides a relative error measure, useful for comparing models across different scales
-                    # Handle division by zero by filtering out zero actual values
-                    # Note: For metrics with very small actual values (e.g., DISK_IO_WAIT ratios),
-                    # MAPE can be misleadingly high. The system displays a contextual note when
-                    # MAPE > 50% and MAE < 0.01, indicating the high MAPE is due to small actual values
-                    non_zero_mask = test_valid.abs() > 1e-10  # Avoid division by very small numbers
-                    if non_zero_mask.sum() > 0:
-                        mape_ens = ((test_valid[non_zero_mask] - ens_valid[non_zero_mask]).abs() / test_valid[non_zero_mask].abs()).mean() * 100
+                    # Calculate MAPE using smart approach for normalized/composite metrics
+                    # For small values, use symmetric MAPE or mean-based denominator to avoid inflation
+                    # Standard MAPE: mean(|actual - predicted| / |actual|) * 100
+                    # Smart MAPE: Uses max(actual, predicted, threshold) or mean(actual) as denominator
+                    # This prevents MAPE from exploding when actual values are very small
+                    mean_actual = test_valid.abs().mean()
+                    if mean_actual > 1e-6:  # Only calculate if mean is meaningful
+                        # Use symmetric approach: denominator is max(actual, predicted, threshold)
+                        # Threshold is 10% of mean to handle small values gracefully
+                        threshold = max(mean_actual * 0.1, 1e-6)
+                        denominator = pd.concat([test_valid.abs(), ens_valid.abs()], axis=1).max(axis=1)
+                        denominator = denominator.clip(lower=threshold)
+                        mape_ens = ((test_valid - ens_valid).abs() / denominator).mean() * 100
                         if pd.isna(mape_ens) or np.isinf(mape_ens):
                             mape_ens = np.nan
                     else:
-                        mape_ens = np.nan
+                        # Fallback: if mean is too small, use relative error based on mean
+                        mape_ens = (mae_ens / mean_actual * 100) if mean_actual > 0 else np.nan
                 except (ValueError, Exception) as e:
                     log_verbose(f"Warning: Failed to calculate ensemble MAE: {e}")
                     mae_ens = np.nan
@@ -4210,14 +5575,17 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
                     mae_prophet = mean_absolute_error(test_valid, p_back_valid)
                     if pd.isna(mae_prophet) or np.isinf(mae_prophet):
                         mae_prophet = np.nan
-                    # Calculate MAPE (correct formula)
-                    non_zero_mask = test_valid.abs() > 1e-10
-                    if non_zero_mask.sum() > 0:
-                        mape_prophet = ((test_valid[non_zero_mask] - p_back_valid[non_zero_mask]).abs() / test_valid[non_zero_mask].abs()).mean() * 100
+                    # Calculate MAPE using smart approach (same as ensemble)
+                    mean_actual = test_valid.abs().mean()
+                    if mean_actual > 1e-6:
+                        threshold = max(mean_actual * 0.1, 1e-6)
+                        denominator = pd.concat([test_valid.abs(), p_back_valid.abs()], axis=1).max(axis=1)
+                        denominator = denominator.clip(lower=threshold)
+                        mape_prophet = ((test_valid - p_back_valid).abs() / denominator).mean() * 100
                         if pd.isna(mape_prophet) or np.isinf(mape_prophet):
                             mape_prophet = np.nan
                     else:
-                        mape_prophet = np.nan
+                        mape_prophet = (mae_prophet / mean_actual * 100) if mean_actual > 0 else np.nan
                 except (ValueError, Exception) as e:
                     log_verbose(f"Warning: Failed to calculate Prophet MAE: {e}")
                     mae_prophet = np.nan
@@ -4232,14 +5600,30 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
                     mae_arima = mean_absolute_error(test_valid, a_pred_valid)
                     if pd.isna(mae_arima) or np.isinf(mae_arima):
                         mae_arima = np.nan
-                    # Calculate MAPE (correct formula)
-                    non_zero_mask = test_valid.abs() > 1e-10
-                    if non_zero_mask.sum() > 0:
-                        mape_arima = ((test_valid[non_zero_mask] - a_pred_valid[non_zero_mask]).abs() / test_valid[non_zero_mask].abs()).mean() * 100
+                    
+                    # Diagnostic: Check if ARIMA MAE is identical to Prophet MAE (very suspicious)
+                    if p_back_valid is not None and not pd.isna(mae_prophet) and not pd.isna(mae_arima):
+                        if abs(mae_prophet - mae_arima) < 1e-10:
+                            log_verbose(f"Warning: Prophet and ARIMA have identical MAE ({mae_prophet:.6f}) - predictions may be identical", level=1)
+                            # Check if predictions are actually identical
+                            if len(p_back_valid) == len(a_pred_valid):
+                                diff = (p_back_valid - a_pred_valid).abs()
+                                max_diff = diff.max()
+                                if max_diff < 1e-10:
+                                    log_verbose(f"  Confirmed: Prophet and ARIMA predictions are identical (max diff: {max_diff:.2e})", level=1)
+                                else:
+                                    log_debug(f"  Predictions differ (max diff: {max_diff:.6f}) but MAE is identical - possible rounding issue", level=2)
+                    # Calculate MAPE using smart approach (same as ensemble)
+                    mean_actual = test_valid.abs().mean()
+                    if mean_actual > 1e-6:
+                        threshold = max(mean_actual * 0.1, 1e-6)
+                        denominator = pd.concat([test_valid.abs(), a_pred_valid.abs()], axis=1).max(axis=1)
+                        denominator = denominator.clip(lower=threshold)
+                        mape_arima = ((test_valid - a_pred_valid).abs() / denominator).mean() * 100
                         if pd.isna(mape_arima) or np.isinf(mape_arima):
                             mape_arima = np.nan
                     else:
-                        mape_arima = np.nan
+                        mape_arima = (mae_arima / mean_actual * 100) if mean_actual > 0 else np.nan
                 except (ValueError, Exception) as e:
                     log_verbose(f"Warning: Failed to calculate ARIMA MAE: {e}")
                     mae_arima = np.nan
@@ -4248,20 +5632,24 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
                 mae_arima = np.nan
                 mape_arima = np.nan
                 
-            if (not l_back_valid.isna().any() and not np.isinf(l_back_valid).any() and
+            # Only calculate LSTM metrics if it's actually active (not a fallback)
+            if lstm_backtest_active and (not l_back_valid.isna().any() and not np.isinf(l_back_valid).any() and
                 len(l_back_valid) == len(test_valid) and len(l_back_valid) > 0):
                 try:
                     mae_lstm = mean_absolute_error(test_valid, l_back_valid)
                     if pd.isna(mae_lstm) or np.isinf(mae_lstm):
                         mae_lstm = np.nan
-                    # Calculate MAPE (correct formula)
-                    non_zero_mask = test_valid.abs() > 1e-10
-                    if non_zero_mask.sum() > 0:
-                        mape_lstm = ((test_valid[non_zero_mask] - l_back_valid[non_zero_mask]).abs() / test_valid[non_zero_mask].abs()).mean() * 100
+                    # Calculate MAPE using smart approach (same as ensemble)
+                    mean_actual = test_valid.abs().mean()
+                    if mean_actual > 1e-6:
+                        threshold = max(mean_actual * 0.1, 1e-6)
+                        denominator = pd.concat([test_valid.abs(), l_back_valid.abs()], axis=1).max(axis=1)
+                        denominator = denominator.clip(lower=threshold)
+                        mape_lstm = ((test_valid - l_back_valid).abs() / denominator).mean() * 100
                         if pd.isna(mape_lstm) or np.isinf(mape_lstm):
                             mape_lstm = np.nan
                     else:
-                        mape_lstm = np.nan
+                        mape_lstm = (mae_lstm / mean_actual * 100) if mean_actual > 0 else np.nan
                 except (ValueError, Exception) as e:
                     log_verbose(f"Warning: Failed to calculate LSTM MAE: {e}")
                     mae_lstm = np.nan
@@ -4269,16 +5657,46 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
             else:
                 mae_lstm = np.nan
                 mape_lstm = np.nan
+                
+            # LightGBM metrics - only calculate if it's actually active (not a fallback or skipped)
+            # Check lightgbm_backtest_active (from backtest training) - this is the primary indicator
+            # lightgbm_active (from main training) is also checked, but backtest training takes precedence
+            if lightgbm_backtest_active and (not lg_back_valid.isna().any() and not np.isinf(lg_back_valid).any() and
+                len(lg_back_valid) == len(test_valid) and len(lg_back_valid) > 0):
+                try:
+                    mae_lightgbm = mean_absolute_error(test_valid, lg_back_valid)
+                    if pd.isna(mae_lightgbm) or np.isinf(mae_lightgbm):
+                        mae_lightgbm = np.nan
+                    # Calculate MAPE using smart approach (same as ensemble)
+                    mean_actual = test_valid.abs().mean()
+                    if mean_actual > 1e-6:
+                        threshold = max(mean_actual * 0.1, 1e-6)
+                        denominator = pd.concat([test_valid.abs(), lg_back_valid.abs()], axis=1).max(axis=1)
+                        denominator = denominator.clip(lower=threshold)
+                        mape_lightgbm = ((test_valid - lg_back_valid).abs() / denominator).mean() * 100
+                        if pd.isna(mape_lightgbm) or np.isinf(mape_lightgbm):
+                            mape_lightgbm = np.nan
+                    else:
+                        mape_lightgbm = (mae_lightgbm / mean_actual * 100) if mean_actual > 0 else np.nan
+                except (ValueError, Exception) as e:
+                    log_verbose(f"Warning: Failed to calculate LightGBM MAE: {e}")
+                    mae_lightgbm = np.nan
+                    mape_lightgbm = np.nan
+            else:
+                mae_lightgbm = np.nan
+                mape_lightgbm = np.nan
         else:
             # No valid test data
             mae_ens = np.nan
             mae_prophet = np.nan
             mae_arima = np.nan
             mae_lstm = np.nan
+            mae_lightgbm = np.nan
             mape_ens = np.nan
             mape_prophet = np.nan
             mape_arima = np.nan
             mape_lstm = np.nan
+            mape_lightgbm = np.nan
 
         # Initialize MAPE variables if not already set
         if 'mape_ens' not in locals():
@@ -4289,134 +5707,144 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
             mape_arima = np.nan
         if 'mape_lstm' not in locals():
             mape_lstm = np.nan
+        if 'mape_lightgbm' not in locals():
+            mape_lightgbm = np.nan
         
         # Calculate confidence levels for each model
         conf_ensemble = calculate_model_confidence(mae_ens, mape_ens)
         conf_prophet = calculate_model_confidence(mae_prophet, mape_prophet)
         conf_arima = calculate_model_confidence(mae_arima, mape_arima)
         conf_lstm = calculate_model_confidence(mae_lstm, mape_lstm)
+        conf_lightgbm = calculate_model_confidence(mae_lightgbm, mape_lightgbm)
         
         metrics = {
             'mae_ensemble': mae_ens,
             'mae_prophet': mae_prophet,
             'mae_arima': mae_arima,
             'mae_lstm': mae_lstm,
+            'mae_lightgbm': mae_lightgbm,
             'mape_ensemble': mape_ens,
             'mape_prophet': mape_prophet,
             'mape_arima': mape_arima,
             'mape_lstm': mape_lstm,
+            'mape_lightgbm': mape_lightgbm,
             'confidence_ensemble': conf_ensemble,
             'confidence_prophet': conf_prophet,
             'confidence_arima': conf_arima,
             'confidence_lstm': conf_lstm,
-            'split_info': split_info
+            'confidence_lightgbm': conf_lightgbm,
+            'split_info': split_info,
+            'features_used': available_features if 'available_features' in locals() else []
         }
         
         # Format metrics nicely and print only if print_backtest_metrics is True
         if print_backtest_metrics:
-            context_str = ""
+            # Extract node and signal from context
+            node = ""
+            signal = ""
             if context:
                 node = context.get('node', '')
                 signal = context.get('signal', '')
-                if node and signal:
-                    context_str = f" → {node} | {signal}"
-                elif node:
-                    context_str = f" → {node}"
             
-            print(f"\nBacktest Metrics{context_str}:")
-            # Print MAE metrics with MAPE inline (matching summary format)
-            # Note: MAPE can be misleading for metrics with very small values (e.g., DISK_IO_WAIT ratios)
-            # High MAPE doesn't necessarily mean poor model - check MAE for absolute error magnitude
-            # Context: For cluster-level aggregations, 20-30% MAPE is normal due to higher variability
-            if metrics.get('mae_ensemble') is not None and not pd.isna(metrics['mae_ensemble']):
-                mae_val = metrics['mae_ensemble']
-                mape_val = metrics.get('mape_ensemble')
-                if mape_val is not None and not pd.isna(mape_val):
-                    # For very small MAE values, MAPE can be misleadingly high
-                    # Add a note if MAPE > 50% but MAE is very small (< 0.01)
-                    mape_note = ""
-                    if mape_val > 50 and mae_val < 0.01:
-                        mape_note = " (MAPE inflated by small actual values)"
-                    print(f"  • mae_ensemble: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
-                else:
-                    print(f"  • mae_ensemble: {mae_val:.6f}")
-            if metrics.get('mae_prophet') is not None and not pd.isna(metrics['mae_prophet']):
-                mae_val = metrics['mae_prophet']
-                mape_val = metrics.get('mape_prophet')
-                if mape_val is not None and not pd.isna(mape_val):
-                    mape_note = ""
-                    if mape_val > 50 and mae_val < 0.01:
-                        mape_note = " (MAPE inflated by small actual values)"
-                    print(f"  • mae_prophet: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
-                else:
-                    print(f"  • mae_prophet: {mae_val:.6f}")
-            if metrics.get('mae_arima') is not None and not pd.isna(metrics['mae_arima']):
-                mae_val = metrics['mae_arima']
-                mape_val = metrics.get('mape_arima')
-                if mape_val is not None and not pd.isna(mape_val):
-                    mape_note = ""
-                    if mape_val > 50 and mae_val < 0.01:
-                        mape_note = " (MAPE inflated by small actual values)"
-                    print(f"  • mae_arima: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
-                else:
-                    print(f"  • mae_arima: {mae_val:.6f}")
-            if metrics.get('mae_lstm') is not None and not pd.isna(metrics['mae_lstm']):
-                mae_val = metrics['mae_lstm']
-                mape_val = metrics.get('mape_lstm')
-                if mape_val is not None and not pd.isna(mape_val):
-                    mape_note = ""
-                    if mape_val > 50 and mae_val < 0.01:
-                        mape_note = " (MAPE inflated by small actual values)"
-                    print(f"  • mae_lstm: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
-                else:
-                    print(f"  • mae_lstm: {mae_val:.6f}")
+            # Use standardized format
+            if node and signal:
+                print(f"\n  Node: {node} | Signal: {signal}")
+            elif node:
+                print(f"\n  Node: {node}")
+            else:
+                print(f"\n  Backtest Metrics:")
             
-            # Print Expected Error Rate and Confidence Level
-            print(f"  • Expected Error Rate (%):")
-            if metrics.get('mape_ensemble') is not None and not pd.isna(metrics['mape_ensemble']):
-                print(f"    - Ensemble: {metrics['mape_ensemble']:.2f}%")
-            if metrics.get('mape_prophet') is not None and not pd.isna(metrics['mape_prophet']):
-                print(f"    - Prophet: {metrics['mape_prophet']:.2f}%")
-            if metrics.get('mape_arima') is not None and not pd.isna(metrics['mape_arima']):
-                print(f"    - ARIMA: {metrics['mape_arima']:.2f}%")
-            if metrics.get('mape_lstm') is not None and not pd.isna(metrics['mape_lstm']):
-                print(f"    - LSTM: {metrics['mape_lstm']:.2f}%")
+            print(f"  {'─'*76}")
             
-            print(f"  • Confidence Level (1=highest, 10=lowest):")
-            if metrics.get('confidence_ensemble') is not None:
-                conf_ens = metrics['confidence_ensemble']
-                conf_desc = "Excellent" if conf_ens <= 2 else "Good" if conf_ens <= 4 else "Moderate" if conf_ens <= 6 else "Low" if conf_ens <= 8 else "Very Low"
-                print(f"    - Ensemble: {conf_ens}/10 ({conf_desc})")
-            if metrics.get('confidence_prophet') is not None:
-                conf_prop = metrics['confidence_prophet']
-                conf_desc = "Excellent" if conf_prop <= 2 else "Good" if conf_prop <= 4 else "Moderate" if conf_prop <= 6 else "Low" if conf_prop <= 8 else "Very Low"
-                print(f"    - Prophet: {conf_prop}/10 ({conf_desc})")
-            if metrics.get('confidence_arima') is not None:
-                conf_arima = metrics['confidence_arima']
-                conf_desc = "Excellent" if conf_arima <= 2 else "Good" if conf_arima <= 4 else "Moderate" if conf_arima <= 6 else "Low" if conf_arima <= 8 else "Very Low"
-                print(f"    - ARIMA: {conf_arima}/10 ({conf_desc})")
-            if metrics.get('confidence_lstm') is not None:
-                conf_lstm = metrics['confidence_lstm']
-                conf_desc = "Excellent" if conf_lstm <= 2 else "Good" if conf_lstm <= 4 else "Moderate" if conf_lstm <= 6 else "Low" if conf_lstm <= 8 else "Very Low"
-                print(f"    - LSTM: {conf_lstm}/10 ({conf_desc})")
+            # Warn if training data was constant (makes metrics meaningless)
+            if training_data_constant:
+                print(f"  ⚠️  Training data was constant - backtest metrics are not meaningful")
+                print(f"  {'─'*76}")
             
-            # Print split info
+            # Model performance metrics
+            model_perf = []
+            for model in ['ensemble', 'prophet', 'arima', 'lstm', 'lightgbm']:
+                mae_key = f'mae_{model}'
+                mape_key = f'mape_{model}'
+                conf_key = f'confidence_{model}'
+                
+                # For LightGBM, only show if it's actually active (not skipped/disabled)
+                if model == 'lightgbm':
+                    # Check if LightGBM was actually used (not skipped due to insufficient features)
+                    # If metrics exist but are identical to ARIMA, it's likely a fallback
+                    if metrics.get(mae_key) is not None and not pd.isna(metrics[mae_key]):
+                        mae_arima = metrics.get('mae_arima')
+                        # If LightGBM MAE is identical to ARIMA MAE, it's likely a fallback - skip it
+                        if mae_arima is not None and not pd.isna(mae_arima) and abs(metrics[mae_key] - mae_arima) < 1e-10:
+                            continue  # Skip LightGBM if it's identical to ARIMA (fallback)
+                        # LightGBM is active and has metrics
+                        mae_val = metrics[mae_key]
+                        mape_val = metrics.get(mape_key)
+                        conf_val = metrics.get(conf_key)
+                        
+                        model_name = model.capitalize()
+                        perf_str = f"MAE: {mae_val:.6f}"
+                        
+                        if mape_val is not None and not pd.isna(mape_val):
+                            mape_note = " (inflated)" if (mape_val > 50 and mae_val < 0.01) else ""
+                            perf_str += f" | MAPE: {mape_val:.2f}%{mape_note}"
+                        
+                        if conf_val is not None:
+                            conf_desc = "Excellent" if conf_val <= 2 else "Good" if conf_val <= 4 else "Moderate" if conf_val <= 6 else "Low" if conf_val <= 8 else "Very Low"
+                            perf_str += f" | Confidence: {conf_val}/10 ({conf_desc})"
+                        
+                        model_perf.append(f"    {model_name:12s} {perf_str}")
+                    elif not LIGHTGBM_ENABLED:
+                        # LightGBM is disabled
+                        model_perf.append(f"    {'LightGBM':12s} (disabled)")
+                    else:
+                        # LightGBM failed or not available
+                        model_perf.append(f"    {'LightGBM':12s} (not available)")
+                elif metrics.get(mae_key) is not None and not pd.isna(metrics[mae_key]):
+                    # Other models: only show if metrics exist
+                    mae_val = metrics[mae_key]
+                    mape_val = metrics.get(mape_key)
+                    conf_val = metrics.get(conf_key)
+                    
+                    model_name = model.capitalize()
+                    perf_str = f"MAE: {mae_val:.6f}"
+                    
+                    if mape_val is not None and not pd.isna(mape_val):
+                        mape_note = " (inflated)" if (mape_val > 50 and mae_val < 0.01) else ""
+                        perf_str += f" | MAPE: {mape_val:.2f}%{mape_note}"
+                    
+                    if conf_val is not None:
+                        # Add confidence description: <=2 Excellent, <=4 Good, <=6 Moderate, <=8 Low, >8 Very Low
+                        conf_desc = "Excellent" if conf_val <= 2 else "Good" if conf_val <= 4 else "Moderate" if conf_val <= 6 else "Low" if conf_val <= 8 else "Very Low"
+                        perf_str += f" | Confidence: {conf_val}/10 ({conf_desc})"
+                    
+                    model_perf.append(f"    {model_name:12s} {perf_str}")
+            
+            if model_perf:
+                print("  Model Performance:")
+                print("\n".join(model_perf))
+            
+            # Train/Test split
             if metrics.get('split_info') and isinstance(metrics['split_info'], dict):
                 split_info = metrics['split_info']
-                print(f"  • Train/Test Split:")
                 train_pct = round(split_info.get('train_fraction', 0.8) * 100)
-                print(f"    - Train fraction: {train_pct}%")
-                print(f"    - Train points: {split_info.get('train_points', 0):,}")
-                print(f"    - Test points: {split_info.get('test_points', 0):,}")
+                test_pct = 100 - train_pct
+                print(f"  Train/Test Split: {train_pct}% / {test_pct}%")
+                print(f"    Train: {split_info.get('train_points', 0):,} points", end="")
                 if split_info.get('train_start'):
-                    print(f"    - Train period: {split_info['train_start']} → {split_info['train_end']}")
+                    print(f" ({split_info['train_start']} → {split_info['train_end']})")
+                else:
+                    print()
+                print(f"    Test:  {split_info.get('test_points', 0):,} points", end="")
                 if split_info.get('test_start'):
-                    print(f"    - Test period: {split_info['test_start']} → {split_info['test_end']}")
+                    print(f" ({split_info['test_start']} → {split_info['test_end']})")
+                else:
+                    print()
     else:
         metrics = {
-            'mae_ensemble': np.nan, 'mae_prophet': np.nan, 'mae_arima': np.nan, 'mae_lstm': np.nan,
-            'mape_ensemble': np.nan, 'mape_prophet': np.nan, 'mape_arima': np.nan, 'mape_lstm': np.nan,
-            'confidence_ensemble': 10, 'confidence_prophet': 10, 'confidence_arima': 10, 'confidence_lstm': 10,
+            'mae_ensemble': np.nan, 'mae_prophet': np.nan, 'mae_arima': np.nan, 'mae_lstm': np.nan, 'mae_lightgbm': np.nan,
+            'mape_ensemble': np.nan, 'mape_prophet': np.nan, 'mape_arima': np.nan, 'mape_lstm': np.nan, 'mape_lightgbm': np.nan,
+            'confidence_ensemble': 10, 'confidence_prophet': 10, 'confidence_arima': 10, 'confidence_lstm': 10, 'confidence_lightgbm': 10,
             'split_info': split_info
         }
         print("Not enough test data for backtest")
@@ -4459,6 +5887,17 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
             future_plot = m.make_future_dataframe(periods=int(plot_horizon_min), freq='min')
             future_plot['hour'] = future_plot['ds'].dt.hour
             future_plot['is_weekend'] = (future_plot['ds'].dt.dayofweek >= 5).astype(int)
+            
+            # Add all regressor columns that were used during training
+            # Use the same approach as for the main forecast: forward fill last known values
+            for feat in available_features:
+                if feat in pdf.columns:
+                    last_value = pdf[feat].iloc[-1] if len(pdf) > 0 else 0
+                    future_plot[feat] = last_value  # Use last known value for forecast
+                else:
+                    # If regressor not in training data, use 0
+                    future_plot[feat] = 0
+            
             f_prophet_plot = m.predict(future_plot)['yhat']
             
             # ARIMA: generate 7-day forecast
@@ -4466,11 +5905,85 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
             f_arima_plot.index = pd.date_range(start=ts.index[-1] + pd.Timedelta(minutes=1), 
                                                periods=int(plot_horizon_min), freq='min')
             
-            # Create 7-day ensemble forecast (Prophet + ARIMA)
-            # For visualization, we use Prophet and ARIMA only (LSTM training for 7-day would be expensive)
+            # Create 7-day ensemble forecast (include all active models: Prophet, ARIMA, LSTM, LightGBM)
             tail_plot = future_plot.tail(int(plot_horizon_min))
             prophet_tail_plot = pd.Series(f_prophet_plot.tail(int(plot_horizon_min)).values, index=tail_plot['ds'])
-            plot_ensemble = (prophet_tail_plot + f_arima_plot) / 2
+            
+            # Calculate ensemble for plot (include all active models)
+            plot_models = [prophet_tail_plot, f_arima_plot]
+            
+            # LSTM: generate proper 7-day forecast for plots using recursive prediction
+            if lstm_active and lstm_artifact is not None:
+                try:
+                    model_lstm = lstm_artifact['model']
+                    scaler_lstm = lstm_artifact['scaler']
+                    
+                    # Get the last sequence from training data (scaled)
+                    scaled = scaler_lstm.transform(ts.values.reshape(-1, 1))
+                    current_seq = scaled[-LSTM_SEQ_LEN:].reshape(1, LSTM_SEQ_LEN, 1)
+                    
+                    # Generate 7-day forecast recursively
+                    lstm_pred_plot = []
+                    steps_needed = int(plot_horizon_min)
+                    steps_per_pred = horizon_min  # How many steps the model predicts at once
+                    
+                    # Predict in batches until we have enough for 7 days
+                    while len(lstm_pred_plot) < steps_needed:
+                        # Predict next batch (output is already in scaled space)
+                        pred_batch = model_lstm.predict(current_seq, verbose=0)
+                        pred_batch_scaled = pred_batch[0]  # Shape: (horizon_min,) - already scaled
+                        
+                        # Inverse transform to get actual values for output
+                        pred_values = scaler_lstm.inverse_transform(pred_batch_scaled.reshape(-1, 1)).flatten()
+                        
+                        # Add predictions (only what we need)
+                        remaining = steps_needed - len(lstm_pred_plot)
+                        lstm_pred_plot.extend(pred_values[:remaining])
+                        
+                        if len(lstm_pred_plot) >= steps_needed:
+                            break
+                        
+                        # Update sequence for next iteration: shift window forward
+                        # pred_batch_scaled is already in scaled space, so use it directly
+                        old_seq_flat = current_seq[0, :, 0].flatten()
+                        # Build new sequence: last part of old sequence + new scaled predictions
+                        new_seq_flat = np.concatenate([old_seq_flat, pred_batch_scaled])[-LSTM_SEQ_LEN:]
+                        current_seq = new_seq_flat.reshape(1, LSTM_SEQ_LEN, 1)
+                    
+                    # Create series with proper index (trim to exact length needed)
+                    f_lstm_plot = pd.Series(lstm_pred_plot[:int(plot_horizon_min)], index=tail_plot['ds'])
+                    plot_models.append(f_lstm_plot)
+                except Exception as e:
+                    log_debug(f"LSTM 7-day forecast generation failed: {e}, using extended forecast", level=2)
+                    # Fallback: extend existing forecast
+                    if f_lstm is not None:
+                        f_lstm_plot = f_lstm.head(int(plot_horizon_min))
+                        if len(f_lstm_plot) < int(plot_horizon_min):
+                            last_val = f_lstm_plot.iloc[-1] if len(f_lstm_plot) > 0 else f_arima_plot.iloc[0]
+                            extended = pd.Series([last_val] * (int(plot_horizon_min) - len(f_lstm_plot)), 
+                                                index=tail_plot['ds'].iloc[len(f_lstm_plot):])
+                            f_lstm_plot = pd.concat([f_lstm_plot, extended])
+                        f_lstm_plot.index = tail_plot['ds']
+                        plot_models.append(f_lstm_plot)
+            
+            # LightGBM: generate proper 7-day forecast for plots (much better than extending)
+            if lightgbm_active and lgb_model is not None:
+                # Use the same future_plot dataframe that Prophet uses (already has all features)
+                # Prepare features for LightGBM prediction
+                feature_cols = ['hour', 'is_weekend']
+                for feat in available_features:
+                    if feat in future_plot.columns:
+                        feature_cols.append(feat)
+                
+                # Get the tail portion for 7-day forecast
+                future_lgb_plot = tail_plot.copy()
+                X_future_plot = future_lgb_plot[feature_cols].fillna(0)
+                
+                # Generate 7-day LightGBM forecast
+                lgb_pred_plot = lgb_model.predict(X_future_plot)
+                f_lightgbm_plot = pd.Series(lgb_pred_plot, index=tail_plot['ds'])
+                plot_models.append(f_lightgbm_plot)
+            plot_ensemble = sum(plot_models) / len(plot_models)
             plot_forecast_end = tail_plot['ds'].iloc[-1]
         else:
             # Model forecast is already 7 days or longer, use it directly
@@ -4557,30 +6070,35 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
     plt.xlabel('Time')
     plt.ylabel('Value')
     plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
+    
+    # Determine safe model type for filename - use full model path basename to preserve node identifier
+    # Calculate this once so it can be reused for both forecast and backtest plots
+    if model_path:
+        basename = os.path.basename(model_path)
+        # Remove extension and use full basename (e.g., "unified_correlated_host01_forecast.pkl" -> "unified_correlated_host01_forecast")
+        safe_model_type = os.path.splitext(basename)[0].lower()
+    elif context:
+        signal = context.get('signal', 'MODEL')
+        node = context.get('node', '')
+        # Sanitize node name for filename (remove IP in parentheses, replace special chars)
+        if node:
+            safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_').replace('.', '_')
+            safe_model_type = f"{signal.lower()}_{safe_node}"
+        else:
+            safe_model_type = signal.lower()
+    else:
+        safe_model_type = "model"
+    safe_model_type = safe_model_type.replace(' ', '_').replace('/', '_').replace(':', '_').replace('(', '_').replace(')', '_')
+    
     # Save forecast plot only if save_forecast_plot is True
     if save_forecast_plot:
-        # Save plot to FORECAST_PLOTS_DIR
-        # Determine safe model type for filename
-        if model_path:
-            basename = os.path.basename(model_path)
-            if '_' in basename:
-                safe_model_type = basename.split('_')[0].lower()
-            else:
-                safe_model_type = os.path.splitext(basename)[0].lower()
-        elif context:
-            signal = context.get('signal', 'MODEL')
-            node = context.get('node', '')
-            safe_model_type = f"{signal.lower()}_{node.lower().replace(' ', '_').replace('(', '_').replace(')', '_').replace('.', '_')}" if node else signal.lower()
-        else:
-            safe_model_type = "model"
-        safe_model_type = safe_model_type.replace(' ', '_').replace('/', '_').replace(':', '_').replace('(', '_').replace(')', '_')
         plot_filename = f"{safe_model_type}_ensemble_layer_forecast.png"
         plot_path = os.path.join(FORECAST_PLOTS_DIR, plot_filename)
         try:
             plt.savefig(plot_path, dpi=180, bbox_inches='tight')
             if os.path.exists(plot_path):
                 file_size = os.path.getsize(plot_path)
-                print(f"✓ Saved forecast plot: {plot_path} ({file_size} bytes)")
+                log_debug(f"    Plot: {_get_plot_filename(plot_path)}", level=2)
             else:
                 print(f"✗ Warning: Plot file not found after save: {plot_path}")
         except Exception as e:
@@ -4600,8 +6118,10 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
             plt.plot(test_ts.index, p_back.values, label='Prophet Backtest', color='orange', ls='--', linewidth=1.5)
         if a_pred is not None:
             plt.plot(test_ts.index, a_pred.values, label='ARIMA Backtest', color='green', ls='--', linewidth=1.5)
-        if l_back is not None:
+        if l_back is not None and lstm_backtest_active:
             plt.plot(test_ts.index, l_back.values, label='LSTM Backtest', color='purple', ls=':', linewidth=1.5)
+        if lg_back is not None and lightgbm_backtest_active:
+            plt.plot(test_ts.index, lg_back.values, label='LightGBM Backtest', color='cyan', ls='-.', linewidth=1.5)
         if ens_pred is not None:
             plt.plot(test_ts.index, ens_pred.values, label='Ensemble Backtest', color='red', lw=2)
         # Mark train/test split
@@ -4610,19 +6130,28 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
             plt.axvline(split_time, color='gray', linestyle=':', alpha=0.7, linewidth=2, label='Train/Test Split')
         plt.xlabel('Date')
         plt.ylabel('Value (normalized)')
-        plt.title(f"{model_type} Layer – Backtest Performance\nMAE: Ensemble={metrics.get('mae_ensemble', 0):.6f}, Prophet={metrics.get('mae_prophet', 0):.6f}, ARIMA={metrics.get('mae_arima', 0):.6f}, LSTM={metrics.get('mae_lstm', 0):.6f}")
+        # Build title with available MAE values
+        title_parts = [f"MAE: Ensemble={metrics.get('mae_ensemble', 0):.6f}"]
+        if metrics.get('mae_prophet') is not None and not pd.isna(metrics.get('mae_prophet')):
+            title_parts.append(f"Prophet={metrics.get('mae_prophet', 0):.6f}")
+        if metrics.get('mae_arima') is not None and not pd.isna(metrics.get('mae_arima')):
+            title_parts.append(f"ARIMA={metrics.get('mae_arima', 0):.6f}")
+        if metrics.get('mae_lstm') is not None and not pd.isna(metrics.get('mae_lstm')):
+            title_parts.append(f"LSTM={metrics.get('mae_lstm', 0):.6f}")
+        if metrics.get('mae_lightgbm') is not None and not pd.isna(metrics.get('mae_lightgbm')):
+            title_parts.append(f"LightGBM={metrics.get('mae_lightgbm', 0):.6f}")
+        plt.title(f"{model_type} Layer – Backtest Performance\n{', '.join(title_parts)}")
         plt.legend()
         plt.grid(alpha=0.3)
         plt.tight_layout()
-        # Sanitize model_type for filename
-        safe_model_type = model_type.lower().replace(' ', '_').replace('/', '_').replace(':', '_').replace('(', '_').replace(')', '_')
+        # Use same safe_model_type as forecast plot (already calculated above)
         backtest_plot_filename = f"{safe_model_type}_ensemble_layer_backtest.png"
         backtest_plot_path = os.path.join(FORECAST_PLOTS_DIR, backtest_plot_filename)
         try:
             plt.savefig(backtest_plot_path, dpi=180, bbox_inches='tight')
             if os.path.exists(backtest_plot_path):
                 file_size = os.path.getsize(backtest_plot_path)
-                print(f"✓ Saved backtest plot: {backtest_plot_path} ({file_size} bytes)")
+                log_debug(f"    Plot: {_get_plot_filename(backtest_plot_path)}", level=2)
             else:
                 print(f"✗ Warning: Backtest plot file not found after save: {backtest_plot_path}")
         except Exception as e:
@@ -4638,38 +6167,57 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
     # Replace only the future part with 3-model ensemble
     out.loc[len(pdf):, 'yhat'] = ensemble.values
 
-    # Save ARIMA model separately for later use (don't retrain during forecast)
-    # Save it with a name based on model_path (e.g., host_forecast.pkl -> host_arima.pkl)
-    # Only save if model_path is provided (skip for I/O and Network models stored in manifest)
-    # Only save if save_model is True (skip when show_backtest mode to avoid updating model files)
+    # Save all models in one file (if model_path provided and save_model is True)
+    # This consolidates Prophet, ARIMA, LSTM, LightGBM, and metadata into a single file
     if model_path and save_model:
-        # Fix path construction: avoid double replacement (host_forecast.pkl -> host_arima.pkl, not host_arima_arima.pkl)
-        if model_path.endswith('_forecast.pkl'):
-            arima_model_path = model_path.replace('_forecast.pkl', '_arima.pkl')
-        else:
-            arima_model_path = model_path.replace('.pkl', '_arima.pkl')
         try:
-            joblib.dump({
-                'model': arima,
-                'last_training_point': str(ts.index[-1]),
-                'order': (2, 1, 0),
-                'training_data_end': str(pdf['ds'].max())
-            }, arima_model_path)
-            log_verbose(f"ARIMA model saved: {arima_model_path}")
+            # Collect all models and metadata into a comprehensive dict
+            ensemble_dict = {
+                'prophet': m,  # Prophet model
+                'prophet_params': prophet_params,  # Prophet hyperparameters
+                'arima': {
+                    'model': arima,
+                    'last_training_point': str(ts.index[-1]),
+                    'order': (2, 1, 0),
+                    'training_data_end': str(pdf['ds'].max())
+                },
+                'forecast': out,  # Forecast dataframe
+                'forecast_df': out,  # Alias for compatibility
+                'metrics': metrics,
+                'model': m,  # Alias for Prophet (backward compatibility)
+            }
+            
+            # Add LSTM if available (from memory, not disk)
+            if lstm_artifact is not None:
+                ensemble_dict['lstm'] = lstm_artifact
+            
+            # Add LightGBM if available (from memory, not disk)
+            if lgb_model is not None:
+                ensemble_dict['lightgbm'] = lgb_model
+            
+            # Save everything in one file
+            joblib.dump(ensemble_dict, model_path)
+            log_verbose(f"\nComplete ensemble model saved: {model_path} (includes Prophet, ARIMA, LightGBM, and metadata)", level=2)
+            
         except Exception as e:
-            log_verbose(f"Warning: Failed to save ARIMA model: {e}")
-        
-        # Save Prophet hyperparameters for minimal updates during forecast
-        # Fix path construction: avoid double replacement
-        if model_path.endswith('_forecast.pkl'):
-            prophet_params_path = model_path.replace('_forecast.pkl', '_prophet_params.pkl')
-        else:
-            prophet_params_path = model_path.replace('.pkl', '_prophet_params.pkl')
-        try:
-            joblib.dump(prophet_params, prophet_params_path)
-            log_verbose(f"Prophet parameters saved: {prophet_params_path}")
-        except Exception as e:
-            log_verbose(f"Warning: Failed to save Prophet parameters: {e}")
+            log_verbose(f"Warning: Failed to save complete ensemble model: {e}")
+            # Fallback: save individual components (backward compatibility)
+            try:
+                if model_path.endswith('_forecast.pkl'):
+                    arima_model_path = model_path.replace('_forecast.pkl', '_arima.pkl')
+                    prophet_params_path = model_path.replace('_forecast.pkl', '_prophet_params.pkl')
+                else:
+                    arima_model_path = model_path.replace('.pkl', '_arima.pkl')
+                    prophet_params_path = model_path.replace('.pkl', '_prophet_params.pkl')
+                joblib.dump({
+                    'model': arima,
+                    'last_training_point': str(ts.index[-1]),
+                    'order': (2, 1, 0),
+                    'training_data_end': str(pdf['ds'].max())
+                }, arima_model_path)
+                joblib.dump(prophet_params, prophet_params_path)
+            except Exception as e2:
+                log_verbose(f"Warning: Fallback save also failed: {e2}")
 
     # FINAL FOREVER FIX — return a dict so order never matters again
     return m, out, metrics
@@ -5915,11 +7463,14 @@ def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
 
     print("\n" + "="*80)
     print("Building Classification (Anomaly) Model...")
+    print("Identifies anomalous nodes compared to cluster/group baseline (last 24 hours)")
     if use_temporal_features:
         print("  ✓ Temporal features enabled (seasonality-aware: hour, day-of-week patterns)")
         print("    Comparing nodes to same-time historical patterns (recommended for 3+ months data)")
+        print("Monitors: Host CPU, Host Memory, Pod CPU, Pod Memory (temporal-aware)")
     else:
         print("  • Using basic features (simple averages over lookback window)")
+        print("Monitors: Host CPU, Host Memory, Pod CPU, Pod Memory")
     print("="*80)
     
     # Print cluster summary
@@ -6019,7 +7570,7 @@ def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
             plt.savefig(plot_path, dpi=180, bbox_inches='tight')
             if os.path.exists(plot_path):
                 file_size = os.path.getsize(plot_path)
-                print(f"✓ Saved classification plot: {plot_path} ({file_size} bytes)")
+                log_debug(f"    Plot: {_get_plot_filename(plot_path)}", level=2)
             else:
                 print(f"✗ Warning: Classification plot file not found after save: {plot_path}")
         except Exception as e:
@@ -6039,6 +7590,7 @@ def classification_model(df_host_cpu, df_host_mem, df_pod_cpu, df_pod_mem,
         try:
             joblib.dump(iso, ANOMALY_MODEL_PATH)
             joblib.dump(scaler, ANOMALY_SCALER_PATH)
+            print()  # Blank line before saved messages
             print(f"Saved anomaly model → {ANOMALY_MODEL_PATH}")
             print(f"Saved anomaly scaler → {ANOMALY_SCALER_PATH}")
         except Exception as exc:
@@ -6167,6 +7719,54 @@ def detect_golden_anomaly_signals(hours=1):
 # ----------------------------------------------------------------------
 # 7. IO and NETWORK
 # ----------------------------------------------------------------------
+def _fetch_io_network_data(days_back=35):
+    """
+    Fetch and preprocess I/O and Network metrics data once for reuse.
+    
+    Args:
+        days_back: Number of days of historical data to fetch (default: 35 to cover both crisis and ensemble needs)
+    
+    Returns:
+        dict: Dictionary mapping signal names to preprocessed DataFrames
+            {
+                "DISK_IO_WAIT": DataFrame,
+                "NET_TX_BW": DataFrame
+            }
+    """
+    queries = {
+        "DISK_IO_WAIT": 'avg by (instance) (rate(node_disk_io_time_seconds_total[5m]) or rate(node_cpu_seconds_total{mode="iowait"}[5m]))',
+        "NET_TX_BW": 'avg by (instance) (rate(node_network_transmit_bytes_total[5m]))'
+    }
+    
+    fetched_data = {}
+    
+    for name, query in queries.items():
+        metric_name = _extract_metric_name(query)
+        print(f"Fetching {name}...")
+        df_raw = fetch_victoriametrics_metrics(
+            query=query,
+            start=int((pd.Timestamp.now() - pd.Timedelta(days=days_back)).timestamp()),
+            end=int(pd.Timestamp.now().timestamp()),
+            step="10m"
+        )
+        
+        if df_raw.empty:
+            log_verbose(f"  → No data for {name}")
+            continue
+        
+        df = df_raw.copy()
+        df['timestamp'] = pd.to_datetime(df['ts'], unit='s')
+        
+        # Apply alias resolution and canonicalization to match nodes correctly
+        if 'instance' in df.columns:
+            df['entity'] = df['instance'].map(lambda x: canonical_identity(str(x)))
+            df['entity'] = df['entity'].map(lambda e: INSTANCE_ALIAS_MAP.get(e, e))
+            df['entity'] = df['entity'].map(lambda e: canonical_identity(str(e)) if isinstance(e, str) else e)
+        
+        fetched_data[name] = df
+    
+    return fetched_data
+
 def _process_single_node_io_crisis(inst, group, name, thresholds, units, test_days, horizon_days, 
                                     force_retrain, retrain_targets_set, retrain_all, retrain_targets_canon,
                                     manifest_snapshot, forecast_mode, dump_csv_dir, plot_dir, enable_plots, show_backtest,
@@ -6329,10 +7929,49 @@ def _process_single_node_io_crisis(inst, group, name, thresholds, units, test_da
         future = m.make_future_dataframe(periods=(test_days + horizon_days) * 1440, freq='min')
         forecast = m.predict(future)
         
-        # Backtest
+        # Backtest - ensure proper alignment and data types
         test_forecast = forecast.set_index('ds').reindex(test.index, method='nearest')
-        mae = mean_absolute_error(test, test_forecast['yhat'])
-        rmse = np.sqrt(mean_squared_error(test, test_forecast['yhat']))
+        test_pred_series = test_forecast['yhat']
+        
+        # Initialize variables for later use
+        test_final = None
+        pred_final = None
+        
+        # Align indices and filter out NaN values
+        aligned_test = test.align(test_pred_series, join='inner')[0]
+        aligned_pred = test.align(test_pred_series, join='inner')[1]
+        
+        # Remove NaN values from both series
+        valid_mask = ~(aligned_test.isna() | aligned_pred.isna())
+        if valid_mask.sum() == 0:
+            mae = np.nan
+            rmse = np.nan
+        else:
+            test_valid = aligned_test[valid_mask]
+            pred_valid = aligned_pred[valid_mask]
+            
+            # Ensure numeric types
+            test_valid = pd.to_numeric(test_valid, errors='coerce')
+            pred_valid = pd.to_numeric(pred_valid, errors='coerce')
+            
+            # Final NaN check after conversion
+            final_valid_mask = ~(test_valid.isna() | pred_valid.isna())
+            if final_valid_mask.sum() == 0:
+                mae = np.nan
+                rmse = np.nan
+            else:
+                test_final = test_valid[final_valid_mask]
+                pred_final = pred_valid[final_valid_mask]
+                
+                # Calculate MAE and RMSE
+                mae = mean_absolute_error(test_final, pred_final)
+                rmse = np.sqrt(mean_squared_error(test_final, pred_final))
+                
+                # Validate results
+                if pd.isna(mae) or np.isinf(mae):
+                    mae = np.nan
+                if pd.isna(rmse) or np.isinf(rmse):
+                    rmse = np.nan
         
         # Prophet ETA
         future_pred = forecast[forecast['ds'] > ts.index[-1]]
@@ -6359,15 +7998,17 @@ def _process_single_node_io_crisis(inst, group, name, thresholds, units, test_da
             plt.axhline(threshold, color="red", linestyle="--", linewidth=2, label=f"Threshold ({threshold})")
             test_cutoff = ts.index[-1] - pd.Timedelta(days=test_days)
             plt.axvline(test_cutoff, color="gray", linestyle=":", alpha=0.7)
+            mae_str = f"{mae:.6f}" if not pd.isna(mae) else "N/A"
+            rmse_str = f"{rmse:.6f}" if not pd.isna(rmse) else "N/A"
             plt.title(f"{node} — {name.replace('_', ' ')}\n"
-                      f"MAE: {mae:.6f} | RMSE: {rmse:.6f} | Hybrid ETA: {hybrid_eta:.1f} days → {severity}")
+                      f"MAE: {mae_str} | RMSE: {rmse_str} | Hybrid ETA: {hybrid_eta:.1f} days → {severity}")
             plt.legend(); plt.grid(alpha=0.3); plt.tight_layout()
             safe_node = node.split('(')[0].strip().replace(' ', '_').replace('/', '_')
             plot_file = os.path.join(plot_dir, f"{safe_node}_{name.lower().replace(' ', '_')}_crisis_backtest.png")
             plt.savefig(plot_file, dpi=180, bbox_inches='tight')
             if os.path.exists(plot_file):
                 file_size = os.path.getsize(plot_file)
-                print(f"✓ Saved backtest plot: {plot_file} ({file_size} bytes)")
+                log_verbose(f"    Plot: {_get_plot_filename(plot_file)}", level=2)
             plt.close()
         
         # Generate forecast plots in forecast mode OR in training mode (when enable_forecast_plots is True)
@@ -6404,7 +8045,7 @@ def _process_single_node_io_crisis(inst, group, name, thresholds, units, test_da
             plt.savefig(plot_file, dpi=180, bbox_inches='tight')
             if os.path.exists(plot_file):
                 file_size = os.path.getsize(plot_file)
-                print(f"✓ Saved forecast plot: {plot_file} ({file_size} bytes)")
+                log_verbose(f"    Plot: {_get_plot_filename(plot_file)}", level=2)
             plt.close()
         
         # Build result
@@ -6412,17 +8053,120 @@ def _process_single_node_io_crisis(inst, group, name, thresholds, units, test_da
             "node": node,
             "signal": name.replace("_", " "),
             "current": f"{current*100:.2f}%" if units[name] == "ratio" else f"{current/1e9:.2f} GB/s",
-            "mae": round(mae, 6),
+            "mae": round(mae, 6) if not pd.isna(mae) else np.nan,
             "hybrid_eta_days": round(hybrid_eta, 1),
             "severity": severity
         } if hybrid_eta < 30 else None
         
-        # Return result with model update info
+        # Build metrics for backtest display
+        metrics = None
+        if show_backtest or (needs_retrain and not forecast_mode):
+            # Use aligned and validated data from MAE calculation
+            if test_final is not None and pred_final is not None and len(test_final) > 0:
+                # Calculate MAPE using symmetric MAPE for better handling of small values
+                # Symmetric MAPE: mean(|actual - predicted| / (|actual| + |predicted|) / 2) * 100
+                # This avoids division by zero and handles small values better
+                
+                # Filter out near-zero values (both actual and predicted)
+                # Use a threshold based on the data scale
+                data_scale = max(test_final.abs().mean(), pred_final.abs().mean(), 1e-10)
+                threshold = max(1e-10, data_scale * 1e-6)  # Adaptive threshold
+                
+                valid_mask = (test_final.abs() > threshold) | (pred_final.abs() > threshold)
+                
+                if valid_mask.sum() > 0:
+                    test_valid = test_final[valid_mask]
+                    pred_valid = pred_final[valid_mask]
+                    
+                    # Calculate symmetric MAPE (more robust for small values)
+                    numerator = (test_valid - pred_valid).abs()
+                    denominator = (test_valid.abs() + pred_valid.abs()) / 2.0
+                    denominator = denominator.replace(0, np.nan)  # Avoid division by zero
+                    
+                    symmetric_mape = (numerator / denominator).mean() * 100
+                    
+                    # Fallback to traditional MAPE if symmetric MAPE fails
+                    if pd.isna(symmetric_mape) or np.isinf(symmetric_mape):
+                        # Traditional MAPE with non-zero filter
+                        non_zero_mask = test_valid.abs() > threshold
+                        if non_zero_mask.sum() > 0:
+                            prophet_mape = ((test_valid[non_zero_mask] - pred_valid[non_zero_mask]).abs() / 
+                                          test_valid[non_zero_mask].abs()).mean() * 100
+                        else:
+                            prophet_mape = np.nan
+                    else:
+                        prophet_mape = symmetric_mape
+                    
+                    # Validate result
+                    if pd.isna(prophet_mape) or np.isinf(prophet_mape):
+                        prophet_mape = np.nan
+                else:
+                    prophet_mape = np.nan
+            else:
+                # Fallback: align and calculate if variables not available
+                test_pred = test_forecast['yhat']
+                aligned_test = test.align(test_pred, join='inner')[0]
+                aligned_pred = test.align(test_pred, join='inner')[1]
+                
+                valid_mask = ~(aligned_test.isna() | aligned_pred.isna())
+                if valid_mask.sum() > 0:
+                    test_valid = pd.to_numeric(aligned_test[valid_mask], errors='coerce')
+                    pred_valid = pd.to_numeric(aligned_pred[valid_mask], errors='coerce')
+                    
+                    final_valid = ~(test_valid.isna() | pred_valid.isna())
+                    if final_valid.sum() > 0:
+                        test_final = test_valid[final_valid]
+                        pred_final = pred_valid[final_valid]
+                        
+                        data_scale = max(test_final.abs().mean(), pred_final.abs().mean(), 1e-10)
+                        threshold = max(1e-10, data_scale * 1e-6)
+                        
+                        valid_mask = (test_final.abs() > threshold) | (pred_final.abs() > threshold)
+                        if valid_mask.sum() > 0:
+                            numerator = (test_final[valid_mask] - pred_final[valid_mask]).abs()
+                            denominator = (test_final[valid_mask].abs() + pred_final[valid_mask].abs()) / 2.0
+                            denominator = denominator.replace(0, np.nan)
+                            prophet_mape = (numerator / denominator).mean() * 100
+                            if pd.isna(prophet_mape) or np.isinf(prophet_mape):
+                                prophet_mape = np.nan
+                        else:
+                            prophet_mape = np.nan
+                    else:
+                        prophet_mape = np.nan
+                else:
+                    prophet_mape = np.nan
+            
+            # Calculate confidence
+            prophet_conf = calculate_model_confidence(mae, prophet_mape if prophet_mape is not None else np.nan)
+            
+            # Calculate train/test split info
+            train_pct = round(len(train) / (len(train) + len(test)) * 100)
+            test_pct = 100 - train_pct
+            
+            metrics = {
+                'mae_prophet': mae,
+                'mape_prophet': prophet_mape if prophet_mape is not None else np.nan,
+                'confidence_prophet': prophet_conf,
+                'split_info': {
+                    'train_fraction': len(train) / (len(train) + len(test)),
+                    'train_points': len(train),
+                    'test_points': len(test),
+                    'train_start': str(train.index[0]),
+                    'train_end': str(train.index[-1]),
+                    'test_start': str(test.index[0]),
+                    'test_end': str(test.index[-1])
+                }
+            }
+        
+        # Return result with model update info and metrics
         return {
             'result': result,
             'key': key,
             'model': m if model_updated else None,
-            'needs_retrain': needs_retrain
+            'needs_retrain': needs_retrain,
+            'metrics': metrics,
+            'node': node,
+            'signal': name.replace('_', ' ')
         }
     except Exception as e:
         log_verbose(f"  Error processing {inst}: {e}")
@@ -6440,7 +8184,8 @@ def predict_io_and_network_crisis_with_backtest(
     dump_csv_dir: str | None = None,
     enable_plots: bool = True,
     enable_forecast_plots: bool = None,
-    enable_backtest_plots: bool = None
+    enable_backtest_plots: bool = None,
+    prefetched_data: dict | None = None
 ):
     """
     Predict I/O and Network crises with comprehensive backtesting and visualization.
@@ -6501,12 +8246,7 @@ def predict_io_and_network_crisis_with_backtest(
     results = []
 
     queries = {
-        "DISK_IO_WAIT": '''
-        avg by (instance) (
-          rate(node_disk_io_time_seconds_total[5m]) or
-          rate(node_cpu_seconds_total{mode="iowait"}[5m])
-        )
-        ''',
+        "DISK_IO_WAIT": 'avg by (instance) (rate(node_disk_io_time_seconds_total[5m]) or rate(node_cpu_seconds_total{mode="iowait"}[5m]))',
         "NET_TX_BW": 'avg by (instance) (rate(node_network_transmit_bytes_total[5m]))'
     }
 
@@ -6514,30 +8254,35 @@ def predict_io_and_network_crisis_with_backtest(
     units = {"DISK_IO_WAIT": "ratio", "NET_TX_BW": "bytes/sec"}
 
     for name, query in queries.items():
-        log_verbose(f"\nFetching {name}...")
-        df_raw = fetch_victoriametrics_metrics(
-            query=query,
-            start=int((pd.Timestamp.now() - pd.Timedelta(days=30)).timestamp()),
-            end=int(pd.Timestamp.now().timestamp()),
-            step="10m"
-        )
+        # Use prefetched data if available, otherwise fetch
+        if prefetched_data and name in prefetched_data:
+            df = prefetched_data[name].copy()
+            log_verbose(f"\nUsing prefetched data for {name}...")
+        else:
+            log_verbose(f"\nFetching {name}...")
+            df_raw = fetch_victoriametrics_metrics(
+                query=query,
+                start=int((pd.Timestamp.now() - pd.Timedelta(days=30)).timestamp()),
+                end=int(pd.Timestamp.now().timestamp()),
+                step="10m"
+            )
 
-        if df_raw.empty:
-            log_verbose(f"  → No data for {name}")
-            continue
+            if df_raw.empty:
+                log_verbose(f"  → No data for {name}")
+                continue
 
-        df = df_raw.copy()
-        df['timestamp'] = pd.to_datetime(df['ts'], unit='s')
-        
-        # Apply alias resolution and canonicalization to match nodes correctly
-        # This ensures nodes with IP addresses (e.g., 192.168.10.81) are matched with DNS names (e.g., host01)
-        if 'instance' in df.columns:
-            # Add entity column with canonical identities for proper matching
-            df['entity'] = df['instance'].map(lambda x: canonical_identity(str(x)))
-            # Apply alias resolution: if entity has an alias, use the alias target
-            df['entity'] = df['entity'].map(lambda e: INSTANCE_ALIAS_MAP.get(e, e))
-            # Re-canonicalize after alias resolution
-            df['entity'] = df['entity'].map(lambda e: canonical_identity(str(e)) if isinstance(e, str) else e)
+            df = df_raw.copy()
+            df['timestamp'] = pd.to_datetime(df['ts'], unit='s')
+            
+            # Apply alias resolution and canonicalization to match nodes correctly
+            # This ensures nodes with IP addresses (e.g., 192.168.10.81) are matched with DNS names (e.g., host01)
+            if 'instance' in df.columns:
+                # Add entity column with canonical identities for proper matching
+                df['entity'] = df['instance'].map(lambda x: canonical_identity(str(x)))
+                # Apply alias resolution: if entity has an alias, use the alias target
+                df['entity'] = df['entity'].map(lambda e: INSTANCE_ALIAS_MAP.get(e, e))
+                # Re-canonicalize after alias resolution
+                df['entity'] = df['entity'].map(lambda e: canonical_identity(str(e)) if isinstance(e, str) else e)
 
         processed_nodes = 0
         # Pre-compute retrain matching logic once (outside loop) for performance
@@ -6598,7 +8343,8 @@ def predict_io_and_network_crisis_with_backtest(
                 for inst, group in node_groups
             )
             
-            # Process results and update manifest
+            # Process results and update manifest, collect metrics for display
+            backtest_metrics_list = []
             for idx, proc_result in enumerate(processed_results):
                 if proc_result is None:
                     continue
@@ -6611,6 +8357,14 @@ def predict_io_and_network_crisis_with_backtest(
                     manifest[proc_result['key']] = {'model': proc_result['model']}
                     manifest_changed = True
                 
+                # Collect metrics for backtest display
+                if proc_result.get('metrics') and (show_backtest or (proc_result.get('needs_retrain') and not forecast_mode)):
+                    backtest_metrics_list.append({
+                        'node': proc_result.get('node'),
+                        'signal': proc_result.get('signal'),
+                        'metrics': proc_result['metrics']
+                    })
+                
                 processed_nodes += 1
                 if show_progress and (idx + 1) % 10 == 0:
                     print(f"    → Progress: {idx + 1}/{total_nodes} nodes processed...", end='\r')
@@ -6622,6 +8376,51 @@ def predict_io_and_network_crisis_with_backtest(
                 if skipped_nodes > 0:
                     print(f"    ⚠ Note: {skipped_nodes} node(s) skipped due to insufficient data (use -v for details)")
                 print(f"    ✓ Parallel execution complete: {successful_nodes}/{total_nodes} nodes processed successfully")
+                
+                # Display backtest metrics in standardized format
+                if backtest_metrics_list:
+                    for item in backtest_metrics_list:
+                        metrics = item['metrics']
+                        if metrics:
+                            print(f"\n  Node: {item['node']} | Signal: {item['signal']}")
+                            print(f"  {'─'*76}")
+                            
+                            # Model performance metrics (crisis prediction uses Prophet only)
+                            model_perf = []
+                            if metrics.get('mae_prophet') is not None and not pd.isna(metrics['mae_prophet']):
+                                mae_val = metrics['mae_prophet']
+                                mape_val = metrics.get('mape_prophet')
+                                conf_val = metrics.get('confidence_prophet')
+                                perf_str = f"MAE: {mae_val:.6f}"
+                                if mape_val is not None and not pd.isna(mape_val):
+                                    mape_note = " (inflated)" if (mape_val > 50 and mae_val < 0.01) else ""
+                                    perf_str += f" | MAPE: {mape_val:.2f}%{mape_note}"
+                                if conf_val is not None:
+                                    # Add confidence description: <=2 Excellent, <=4 Good, <=6 Moderate, <=8 Low, >8 Very Low
+                                    conf_desc = "Excellent" if conf_val <= 2 else "Good" if conf_val <= 4 else "Moderate" if conf_val <= 6 else "Low" if conf_val <= 8 else "Very Low"
+                                    perf_str += f" | Confidence: {conf_val}/10 ({conf_desc})"
+                                model_perf.append(f"    {'Prophet':12s} {perf_str}")
+                            
+                            if model_perf:
+                                print("  Model Performance:")
+                                print("\n".join(model_perf))
+                            
+                            # Train/Test split
+                            if metrics.get('split_info'):
+                                split_info = metrics['split_info']
+                                train_pct = round(split_info['train_fraction'] * 100)
+                                test_pct = 100 - train_pct
+                                print(f"  Train/Test Split: {train_pct}% / {test_pct}%")
+                                print(f"    Train: {split_info.get('train_points', 0):,} points", end="")
+                                if split_info.get('train_start'):
+                                    print(f" ({split_info['train_start']} → {split_info['train_end']})")
+                                else:
+                                    print()
+                                print(f"    Test:  {split_info.get('test_points', 0):,} points", end="")
+                                if split_info.get('test_start'):
+                                    print(f" ({split_info['test_start']} → {split_info['test_end']})")
+                                else:
+                                    print()
         else:
             # Sequential processing (original code)
             skipped_count = 0
@@ -6844,7 +8643,7 @@ def predict_io_and_network_crisis_with_backtest(
                                 m = m_updated  # Use updated model for forecasting
                                 manifest[key] = {'model': m}  # Save updated model to manifest
                                 manifest_changed = True
-                                log_verbose(f"  → Minimal update applied (recent 7 days): {key}")
+                                log_debug(f"  → Minimal update applied (recent 7 days): {key}", level=2)
                     else:
                         needs_retrain = True
                 
@@ -6869,7 +8668,7 @@ def predict_io_and_network_crisis_with_backtest(
                             dump_dataframe_to_csv(pdf_for_csv, dump_csv_dir, dump_label)
                         else:
                             dump_dataframe_to_csv(pdf.copy(), dump_csv_dir, dump_label)
-                        log_verbose(f"  → Minimal update (recent 7 days): {key}")
+                        log_debug(f"  → Minimal update (recent 7 days): {key}", level=2)
                     else:
                         # First-time training: use all data to learn patterns
                         if force_retrain:
@@ -6882,7 +8681,7 @@ def predict_io_and_network_crisis_with_backtest(
                         m.fit(pdf)
                         manifest[key] = {'model': m}
                         manifest_changed = True
-                        log_verbose(f"  → Trained & saved to manifest: {key}")
+                        log_debug(f"  → Trained & saved to manifest: {key}", level=2)
                         # Add node and signal metadata to CSV
                         if dump_csv_dir:
                             pdf_for_csv = pdf.copy()
@@ -6944,7 +8743,7 @@ def predict_io_and_network_crisis_with_backtest(
                     plt.savefig(plot_file, dpi=180, bbox_inches='tight')
                     if os.path.exists(plot_file):
                         file_size = os.path.getsize(plot_file)
-                        print(f"✓ Saved backtest plot: {plot_file} ({file_size} bytes)")
+                        log_debug(f"    Plot: {_get_plot_filename(plot_file)}", level=2)
                     plt.close()
                 
                 # Generate forecast plots in forecast mode OR in training mode (when enable_forecast_plots is True)
@@ -6983,20 +8782,26 @@ def predict_io_and_network_crisis_with_backtest(
                     plt.savefig(plot_file, dpi=180, bbox_inches='tight')
                     if os.path.exists(plot_file):
                         file_size = os.path.getsize(plot_file)
-                        print(f"✓ Saved forecast plot: {plot_file} ({file_size} bytes)")
+                        log_debug(f"    Plot: {_get_plot_filename(plot_file)}", level=2)
                     plt.close()
 
-                if show_backtest or should_verbose():
-                    print(f"\nBacktest complete → {node} | {name.replace('_', ' ')}")
-                    print(f"  ├─ Train period     : {train.index[0].strftime('%Y-%m-%d')} → {train.index[-1].strftime('%Y-%m-%d')} ({len(train)} pts)")
-                    print(f"  ├─ Test period      : {test.index[0].strftime('%Y-%m-%d')} → {test.index[-1].strftime('%Y-%m-%d')} ({len(test)} pts)")
-                    print(f"  ├─ Current value    : {current:,.6f} → "
-                          f"{'{:6.2f}%'.format(current*100) if units[name]=='ratio' else f'{current/1e9:.3f} GB/s'}")
-                    print(f"  ├─ Backtest MAE     : {mae:.6f}")
-                    print(f"  ├─ Backtest RMSE    : {rmse:.6f}")
-                    print(f"  ├─ Linear 7d ETA    : {linear_eta:6.1f} days")
-                    print(f"  ├─ Prophet ETA      : {prophet_eta:6.1f} days")
-                    print(f"  └─ HYBRID ETA       : {hybrid_eta:6.1f} days → {severity}")
+                # Suppress verbose output in sequential mode to match parallel mode
+                # Only show backtest metrics if explicitly requested
+                if show_backtest:
+                    current_str = f"{current*100:.2f}%" if units[name]=='ratio' else f"{current/1e9:.3f} GB/s"
+                    print(f"\n  Node: {node} | Signal: {name.replace('_', ' ')}")
+                    print(f"  {'─'*76}")
+                    print(f"  Current Value: {current_str}")
+                    print(f"  Backtest Metrics:")
+                    print(f"    MAE:  {mae:.6f}")
+                    print(f"    RMSE: {rmse:.6f}")
+                    print(f"  ETA Predictions:")
+                    print(f"    Linear:  {linear_eta:6.1f} days")
+                    print(f"    Prophet: {prophet_eta:6.1f} days")
+                    print(f"    Hybrid:  {hybrid_eta:6.1f} days → {severity}")
+                    print(f"  Data Periods:")
+                    print(f"    Train: {train.index[0].strftime('%Y-%m-%d')} → {train.index[-1].strftime('%Y-%m-%d')} ({len(train):,} points)")
+                    print(f"    Test:  {test.index[0].strftime('%Y-%m-%d')} → {test.index[-1].strftime('%Y-%m-%d')} ({len(test):,} points)")
 
                 # Only add to results if within 30 days (for crisis detection)
                 # But in training mode, we still want to count the node as processed for plot generation
@@ -7098,7 +8903,9 @@ def format_anomaly_description(node, signal, current_val, current_str, mae_ensem
 def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_days, force_retrain, retrain_targets_set,
                                      retrain_all, retrain_targets_canon, manifest_snapshot, forecast_mode,
                                      dump_csv_dir, plot_dir, enable_plots, show_backtest,
-                                     enable_forecast_plots=None, enable_backtest_plots=None):
+                                     enable_forecast_plots=None, enable_backtest_plots=None,
+                                     df_host_cpu=None, df_host_mem=None, df_pod_cpu=None, df_pod_mem=None,
+                                     io_net_dataframes=None):
     """
     Process a single node for I/O and Network ensemble forecasting and anomaly detection.
     
@@ -7170,8 +8977,65 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
         train_df = train_raw.reset_index()
         train_df.columns = ['timestamp', 'value']
         
+        # Extract Host/Pod metrics for this node/entity to use as features
+        entity_col_h = 'entity' if df_host_cpu is not None and 'entity' in df_host_cpu.columns else 'instance'
+        entity_col_p = 'entity' if df_pod_cpu is not None and 'entity' in df_pod_cpu.columns else 'instance'
+        
+        df_host_cpu_node = None
+        df_host_mem_node = None
+        df_pod_cpu_node = None
+        df_pod_mem_node = None
+        
+        if df_host_cpu is not None:
+            host_cpu_filtered = df_host_cpu[df_host_cpu[entity_col_h].apply(canonical_identity) == entity]
+            if not host_cpu_filtered.empty:
+                df_host_cpu_node = host_cpu_filtered[['timestamp', 'value']].copy()
+                df_host_cpu_node.columns = ['timestamp', 'host_cpu']
+        
+        if df_host_mem is not None:
+            host_mem_filtered = df_host_mem[df_host_mem[entity_col_h].apply(canonical_identity) == entity]
+            if not host_mem_filtered.empty:
+                df_host_mem_node = host_mem_filtered[['timestamp', 'value']].copy()
+                df_host_mem_node.columns = ['timestamp', 'host_mem']
+        
+        if df_pod_cpu is not None:
+            pod_cpu_filtered = df_pod_cpu[df_pod_cpu[entity_col_p].apply(canonical_identity) == entity]
+            if not pod_cpu_filtered.empty:
+                df_pod_cpu_node = pod_cpu_filtered[['timestamp', 'value']].copy()
+                df_pod_cpu_node.columns = ['timestamp', 'pod_cpu']
+        
+        if df_pod_mem is not None:
+            pod_mem_filtered = df_pod_mem[df_pod_mem[entity_col_p].apply(canonical_identity) == entity]
+            if not pod_mem_filtered.empty:
+                df_pod_mem_node = pod_mem_filtered[['timestamp', 'value']].copy()
+                df_pod_mem_node.columns = ['timestamp', 'pod_mem']
+        
+        # Extract BOTH I/O/Network metrics for this node/entity to use as features
+        # We extract both, and build_ensemble_forecast_model will exclude the target metric automatically
+        # This allows the model to learn cross-correlations between ALL metrics
+        df_disk_io_wait_node = None
+        df_net_tx_bw_node = None
+        
+        # Extract BOTH metrics - the model will exclude the one we're predicting
+        if io_net_dataframes:
+            entity_col_io = 'entity' if 'entity' in list(io_net_dataframes.values())[0].columns else 'instance'
+            
+            # Always extract DISK_IO_WAIT if available (will be excluded if it's the target)
+            if 'DISK_IO_WAIT' in io_net_dataframes:
+                disk_io_filtered = io_net_dataframes['DISK_IO_WAIT'][io_net_dataframes['DISK_IO_WAIT'][entity_col_io].apply(canonical_identity) == entity]
+                if not disk_io_filtered.empty:
+                    df_disk_io_wait_node = disk_io_filtered[['timestamp', 'value']].copy()
+                    df_disk_io_wait_node.columns = ['timestamp', 'disk_io_wait']
+            
+            # Always extract NET_TX_BW if available (will be excluded if it's the target)
+            if 'NET_TX_BW' in io_net_dataframes:
+                net_tx_filtered = io_net_dataframes['NET_TX_BW'][io_net_dataframes['NET_TX_BW'][entity_col_io].apply(canonical_identity) == entity]
+                if not net_tx_filtered.empty:
+                    df_net_tx_bw_node = net_tx_filtered[['timestamp', 'value']].copy()
+                    df_net_tx_bw_node.columns = ['timestamp', 'net_tx_bw']
+        
         key = f"{build_io_net_key(entity, res['name'])}_ensemble"
-        log_verbose(f"  Running ensemble forecast for {node} | {res['name']} ({len(train_df)} points)...")
+        log_debug(f"  Running ensemble forecast for {node} | {res['name']} ({len(train_df)} points)...", level=2)
         
         # ———— RETRAIN MATCHING LOGIC ————
         # Check if retraining is needed - match against entity, key, or any aliases
@@ -7195,7 +9059,7 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
         retrained_node = None
         if needs_retrain:
             retrained_node = f"{node} ({entity})"
-            log_verbose(f"   Retraining requested for {node} | {res['name']} (entity: {entity})")
+            log_debug(f"   Retraining requested for {node} | {res['name']} (entity: {entity})", level=2)
         
         # ———— MODEL CACHING AND TRAINING ————
         forecast_result = None
@@ -7204,7 +9068,7 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
         if not needs_retrain and key in manifest_snapshot:
             forecast_result = manifest_snapshot[key].get('model')
             if forecast_result is not None:
-                log_verbose(f"   Loaded ENSEMBLE model from manifest: {key}")
+                log_debug(f"   Loaded ENSEMBLE model from manifest: {key}", level=2)
                 # MINIMAL UPDATE: Use recent data only (last 7 days) for forecast mode only
                 if forecast_mode:
                     train_df_sorted = train_df.sort_values('timestamp')
@@ -7223,13 +9087,19 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
                         context={'node': node, 'signal': res['name']},
                         save_forecast_plot=should_save_forecast,
                         save_backtest_plot=should_save_backtest,
-                        print_backtest_metrics=show_backtest,  # Print backtest metrics when show_backtest
+                        print_backtest_metrics=False,  # Suppress immediate printing - will be grouped at end
                         dump_csv_dir=dump_csv_dir,
-                        enable_plots=should_save_forecast or should_save_backtest
+                        enable_plots=should_save_forecast or should_save_backtest,
+                        df_host_cpu=df_host_cpu_node,
+                        df_host_mem=df_host_mem_node,
+                        df_pod_cpu=df_pod_cpu_node,
+                        df_pod_mem=df_pod_mem_node,
+                        df_disk_io_wait=df_disk_io_wait_node,
+                        df_net_tx_bw=df_net_tx_bw_node
                     )
                     if forecast_result is not None:
                         manifest_key_updated = True
-                        log_verbose(f"   Minimal update applied (recent 7 days): {key}")
+                        log_debug(f"   Minimal update applied (recent 7 days): {key}", level=2)
                 # If show_backtest is true, compute metrics even for cached models
                 if show_backtest:
                     has_metrics = isinstance(forecast_result, tuple) and len(forecast_result) >= 3
@@ -7246,7 +9116,7 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
                             context={'node': node, 'signal': res['name']},
                             save_forecast_plot=should_save_forecast,
                             save_backtest_plot=should_save_backtest,
-                            print_backtest_metrics=show_backtest,  # Print backtest metrics when show_backtest
+                            print_backtest_metrics=False,  # Suppress immediate printing - will be grouped at end
                             save_model=False,
                             dump_csv_dir=dump_csv_dir,
                             enable_plots=should_save_forecast or should_save_backtest
@@ -7256,7 +9126,7 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
         
         if needs_retrain or key not in manifest_snapshot:
             if key in manifest_snapshot:
-                log_verbose(f"   Retraining cached model → MINIMAL UPDATE (recent 7 days)...")
+                log_debug(f"   Retraining cached model → MINIMAL UPDATE (recent 7 days)...", level=2)
                 train_df_sorted = train_df.sort_values('timestamp')
                 cutoff_time = train_df_sorted['timestamp'].max() - pd.Timedelta(days=7)
                 recent_train_df = train_df_sorted[train_df_sorted['timestamp'] >= cutoff_time]
@@ -7273,12 +9143,12 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
                     context={'node': node, 'signal': res['name']},
                     save_forecast_plot=should_save_forecast,
                     save_backtest_plot=should_save_backtest,
-                    print_backtest_metrics=show_backtest,  # Print backtest metrics when show_backtest
+                    print_backtest_metrics=False,  # Suppress immediate printing - will be grouped at end
                     dump_csv_dir=dump_csv_dir,
                     enable_plots=should_save_forecast or should_save_backtest
                 )
             else:
-                log_verbose(f"   No cached model → FULL TRAINING...")
+                log_debug(f"   No cached model → FULL TRAINING...", level=2)
                 # Determine plot flags based on enable_forecast_plots and enable_backtest_plots
                 should_save_forecast = enable_forecast_plots if enable_forecast_plots is not None else enable_plots
                 should_save_backtest = enable_backtest_plots if enable_backtest_plots is not None else (enable_plots and show_backtest)
@@ -7291,12 +9161,12 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
                     save_forecast_plot=should_save_forecast,
                     save_backtest_plot=should_save_backtest,
                     enable_plots=should_save_forecast or should_save_backtest,
-                    print_backtest_metrics=show_backtest,  # Print backtest metrics when show_backtest
+                    print_backtest_metrics=False,  # Suppress immediate printing - will be grouped at end
                     dump_csv_dir=dump_csv_dir
                 )
             if forecast_result is not None:
                 manifest_key_updated = True
-                log_verbose(f"   Saved ENSEMBLE to manifest → {key}")
+                log_debug(f"   Saved ENSEMBLE to manifest → {key}", level=2)
         
         if forecast_result is None:
             return None
@@ -7312,6 +9182,25 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
             log_verbose(f"   Warning: unexpected forecast_result type for {key}, skipping")
             return None
         
+        # Ensure features_used is in metrics (extract from available feature dataframes)
+        # Exclude the target metric from features (we're predicting it, not using it as a feature)
+        if 'features_used' not in metrics or not metrics.get('features_used'):
+            features_list = []
+            if df_host_cpu_node is not None:
+                features_list.append('host_cpu')
+            if df_host_mem_node is not None:
+                features_list.append('host_mem')
+            if df_pod_cpu_node is not None:
+                features_list.append('pod_cpu')
+            if df_pod_mem_node is not None:
+                features_list.append('pod_mem')
+            # Only include I/O/Network metrics if they're NOT the target we're predicting
+            if df_disk_io_wait_node is not None and res['name'] != 'DISK_IO_WAIT':
+                features_list.append('disk_io_wait')
+            if df_net_tx_bw_node is not None and res['name'] != 'NET_TX_BW':
+                features_list.append('net_tx_bw')
+            metrics['features_used'] = features_list
+        
         # ———— CRISIS DETECTION ————
         future_threshold = forecast_df[forecast_df['yhat'] >= res["threshold"]]
         eta_days = 9999.0
@@ -7319,7 +9208,7 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
             eta_days_calc = (future_threshold.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400
             eta_days = max(0.0, eta_days_calc)
         
-        log_verbose(f"  Done → ETA: {eta_days:.1f} days | MAE: {metrics['mae_ensemble']:.6f}")
+        log_debug(f"  Done → ETA: {eta_days:.1f} days | MAE: {metrics['mae_ensemble']:.6f}", level=2)
         
         crisis_result = None
         if eta_days < 30:
@@ -7437,11 +9326,29 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
                         "description": description
                     }
                     
-                    log_verbose(f"   ⚠️  Anomaly detected: {node} | {res['name']} (score: {anomaly_score:.3f}, deviation: {current_deviation_pct*100:.1f}%)")
+                    log_debug(f"   ⚠️  Anomaly detected: {node} | {res['name']} (score: {anomaly_score:.3f}, deviation: {current_deviation_pct*100:.1f}%)", level=2)
         
         # ———— COLLECT BACKTEST METRICS ————
         backtest_metrics = None
         if (show_backtest or (needs_retrain and not forecast_mode)) and metrics:
+            # Ensure features_used is always populated (even for cached models)
+            if 'features_used' not in metrics or not metrics.get('features_used'):
+                features_list = []
+                if df_host_cpu_node is not None:
+                    features_list.append('host_cpu')
+                if df_host_mem_node is not None:
+                    features_list.append('host_mem')
+                if df_pod_cpu_node is not None:
+                    features_list.append('pod_cpu')
+                if df_pod_mem_node is not None:
+                    features_list.append('pod_mem')
+                # Only include I/O/Network metrics if they're NOT the target we're predicting
+                if df_disk_io_wait_node is not None and res['name'] != 'DISK_IO_WAIT':
+                    features_list.append('disk_io_wait')
+                if df_net_tx_bw_node is not None and res['name'] != 'NET_TX_BW':
+                    features_list.append('net_tx_bw')
+                metrics['features_used'] = features_list
+            
             backtest_metrics = {
                 'node': node,
                 'signal': res['name'],
@@ -7461,10 +9368,756 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
         log_verbose(f"  Error processing {instance}: {e}")
         return None
 
+def _process_single_node_unified_correlated_model(entity, df_host_cpu_node, df_host_mem_node, df_pod_cpu_node, 
+                                                  df_pod_mem_node, df_disk_io_wait_node, df_net_tx_bw_node,
+                                                  test_days, horizon_days, force_retrain, retrain_targets_set,
+                                                  retrain_all, retrain_targets_canon, manifest_snapshot, forecast_mode,
+                                                  dump_csv_dir, plot_dir, enable_plots, show_backtest,
+                                                  enable_forecast_plots=None, enable_backtest_plots=None):
+    """
+    Process a single node with ONE unified correlated ensemble model using ALL 6 metrics as features.
+    
+    This creates a single model that learns cross-correlations between all metrics:
+    - host_cpu, host_mem, pod_cpu, pod_mem, disk_io_wait, net_tx_bw
+    
+    The model predicts a composite system performance metric using all metric relationships.
+    """
+    import warnings
+    import logging
+    warnings.simplefilter("ignore")
+    try:
+        logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+        logging.getLogger("prophet").setLevel(logging.WARNING)
+    except:
+        pass
+    
+    try:
+        # Get node label for display
+        node = canonical_node_label(entity, with_ip=True)
+        
+        # Create composite target metric: weighted combination of all metrics
+        # Normalize each metric to 0-1 scale, then combine
+        # First, verify that dataframes have the expected structure
+        all_dataframes = {}
+        if df_host_cpu_node is not None and not df_host_cpu_node.empty and 'timestamp' in df_host_cpu_node.columns and 'value' in df_host_cpu_node.columns:
+            all_dataframes['host_cpu'] = df_host_cpu_node
+        if df_host_mem_node is not None and not df_host_mem_node.empty and 'timestamp' in df_host_mem_node.columns and 'value' in df_host_mem_node.columns:
+            all_dataframes['host_mem'] = df_host_mem_node
+        if df_pod_cpu_node is not None and not df_pod_cpu_node.empty and 'timestamp' in df_pod_cpu_node.columns and 'value' in df_pod_cpu_node.columns:
+            all_dataframes['pod_cpu'] = df_pod_cpu_node
+        if df_pod_mem_node is not None and not df_pod_mem_node.empty and 'timestamp' in df_pod_mem_node.columns and 'value' in df_pod_mem_node.columns:
+            all_dataframes['pod_mem'] = df_pod_mem_node
+        if df_disk_io_wait_node is not None and not df_disk_io_wait_node.empty and 'timestamp' in df_disk_io_wait_node.columns and 'value' in df_disk_io_wait_node.columns:
+            all_dataframes['disk_io_wait'] = df_disk_io_wait_node
+        if df_net_tx_bw_node is not None and not df_net_tx_bw_node.empty and 'timestamp' in df_net_tx_bw_node.columns and 'value' in df_net_tx_bw_node.columns:
+            all_dataframes['net_tx_bw'] = df_net_tx_bw_node
+        
+        # Find common timestamps across all available metrics
+        # Only include dataframes that have both 'timestamp' and 'value' columns
+        available_dfs = {}
+        for k, v in all_dataframes.items():
+            try:
+                if v is not None and not v.empty and 'timestamp' in v.columns and 'value' in v.columns:
+                    available_dfs[k] = v
+            except (KeyError, AttributeError) as e:
+                log_verbose(f"  Warning: Error checking dataframe {k} for {node}: {e}")
+                continue
+        
+        if len(available_dfs) < 2:
+            log_verbose(f"  Skipping {node}: insufficient metrics ({len(available_dfs)} available, need 2+)")
+            return None
+        
+        # Log which metrics we're using
+        log_debug(f"  Processing {node} with metrics: {list(available_dfs.keys())}", level=2)
+        
+        # Get all timestamps
+        all_timestamps = set()
+        for df in available_dfs.values():
+            if 'timestamp' in df.columns:
+                all_timestamps.update(df['timestamp'].unique())
+        
+        if len(all_timestamps) < 200:
+            log_verbose(f"  Skipping {node}: insufficient data points ({len(all_timestamps)}, need 200+)")
+            return None
+        
+        # Create unified dataframe with all metrics
+        try:
+            unified_df = pd.DataFrame({'timestamp': sorted(all_timestamps)})
+        except Exception as e:
+            log_verbose(f"  Error creating unified_df for {node}: {e}")
+            return None
+        
+        # Merge all metrics
+        successfully_merged = []
+        for metric_name, df in available_dfs.items():
+            try:
+                if df is None or df.empty:
+                    continue
+                if 'timestamp' not in df.columns or 'value' not in df.columns:
+                    log_verbose(f"  Warning: {metric_name} missing required columns for {node} (has: {list(df.columns)})")
+                    continue
+                
+                # Safely extract columns
+                try:
+                    df_metric = df[['timestamp', 'value']].copy()
+                except KeyError as ke:
+                    log_verbose(f"  KeyError extracting columns from {metric_name} for {node}: {ke} (available: {list(df.columns)})")
+                    continue
+                # Ensure timestamp is datetime type for proper merging
+                if not pd.api.types.is_datetime64_any_dtype(df_metric['timestamp']):
+                    df_metric['timestamp'] = pd.to_datetime(df_metric['timestamp'])
+                if not pd.api.types.is_datetime64_any_dtype(unified_df['timestamp']):
+                    unified_df['timestamp'] = pd.to_datetime(unified_df['timestamp'])
+                
+                df_metric.columns = ['timestamp', metric_name]
+                unified_df_before_cols = list(unified_df.columns)
+                unified_df = pd.merge(unified_df, df_metric, on='timestamp', how='left')
+                unified_df_after_cols = list(unified_df.columns)
+                
+                # Verify the column was actually added before tracking it
+                if metric_name in unified_df.columns:
+                    successfully_merged.append(metric_name)
+                    log_debug(f"  Successfully merged {metric_name} for {node}", level=2)
+                else:
+                    log_verbose(f"  Warning: Column {metric_name} not found after merge for {node} (before: {unified_df_before_cols}, after: {unified_df_after_cols})")
+            except KeyError as e:
+                log_verbose(f"  KeyError merging {metric_name} for {node}: {e} (df columns: {list(df.columns) if df is not None else 'None'})")
+                continue
+            except Exception as e:
+                import traceback
+                log_verbose(f"  Warning: Failed to merge {metric_name} for {node}: {e}")
+                log_verbose(f"  Traceback: {traceback.format_exc()}", level=2)
+                continue
+        
+        # Verify we have at least 2 metrics successfully merged
+        if len(successfully_merged) < 2:
+            log_verbose(f"  Skipping {node}: only {len(successfully_merged)} metrics successfully merged (need 2+)")
+            return None
+        
+        # Fill missing values forward then backward
+        # Only fill columns that were successfully merged
+        for col in successfully_merged:
+            if col != 'timestamp' and col in unified_df.columns:
+                try:
+                    unified_df[col] = unified_df[col].ffill().bfill().fillna(0)
+                except KeyError:
+                    log_verbose(f"  Warning: Column {col} not found when filling missing values for {node}")
+                    continue
+        
+        # Create composite target: weighted average of normalized metrics
+        # Normalize each metric to 0-1 scale
+        # Only use columns that were successfully merged
+        metric_cols = [col for col in successfully_merged if col in unified_df.columns]
+        if not metric_cols:
+            log_verbose(f"  Skipping {node}: no metric columns found after merge")
+            return None
+        
+        # Store original (unnormalized) values for later analysis - BEFORE normalization
+        original_values = {}
+        for col in metric_cols:
+            if col in unified_df.columns:
+                original_values[col] = unified_df[col].copy()
+        
+        for col in metric_cols:
+            try:
+                if col in unified_df.columns:
+                    # Check for NaN values and fill them
+                    if unified_df[col].isna().any():
+                        unified_df[col] = unified_df[col].ffill().bfill().fillna(0)
+                    
+                    # Use improved min-max normalization with outlier handling
+                    col_values = unified_df[col].dropna()
+                    if len(col_values) > 0:
+                        col_min = col_values.min()
+                        col_max = col_values.max()
+                        
+                        # Handle edge cases
+                        if pd.isna(col_min) or pd.isna(col_max):
+                            unified_df[col] = 0.0
+                        elif col_max > col_min:
+                            # Standard min-max normalization
+                            unified_df[col] = (unified_df[col] - col_min) / (col_max - col_min)
+                            # Clip to [0, 1] to handle any extreme values
+                            unified_df[col] = unified_df[col].clip(0, 1)
+                        else:
+                            # Constant or near-constant column
+                            unified_df[col] = 0.0
+                    else:
+                        unified_df[col] = 0.0
+            except KeyError as e:
+                log_verbose(f"  Warning: Column {col} not found in unified_df for {node}: {e}")
+                continue
+            except Exception as e:
+                log_verbose(f"  Warning: Failed to normalize {col} for {node}: {e}")
+                continue
+        
+        # Composite target: weighted average (I/O wait and network get higher weight as they're more critical)
+        weights = {
+            'host_cpu': 0.15,
+            'host_mem': 0.15,
+            'pod_cpu': 0.15,
+            'pod_mem': 0.15,
+            'disk_io_wait': 0.20,  # Higher weight - critical for user experience
+            'net_tx_bw': 0.20      # Higher weight - critical for user experience
+        }
+        
+        unified_df['composite_target'] = 0.0
+        total_weight = 0.0
+        for col in metric_cols:
+            try:
+                if col in weights and col in unified_df.columns:
+                    unified_df['composite_target'] += unified_df[col] * weights[col]
+                    total_weight += weights[col]
+            except KeyError as e:
+                log_verbose(f"  Warning: Column {col} not found in unified_df for {node}: {e}")
+                continue
+            except Exception as e:
+                log_verbose(f"  Warning: Failed to add {col} to composite target for {node}: {e}")
+                continue
+        
+        if total_weight > 0:
+            unified_df['composite_target'] /= total_weight
+        else:
+            # Fallback: simple average - only use columns that actually exist
+            existing_cols = [col for col in metric_cols if col in unified_df.columns]
+            if existing_cols:
+                unified_df['composite_target'] = unified_df[existing_cols].mean(axis=1)
+            else:
+                log_verbose(f"  Skipping {node}: no valid columns for composite target")
+                return None
+        
+        # Prepare data for model training
+        unified_df = unified_df.sort_values('timestamp')
+        ts = unified_df.set_index('timestamp')['composite_target'].sort_index()
+        
+        # Log composite target statistics for debugging performance differences
+        target_mean = ts.mean()
+        target_std = ts.std()
+        target_min = ts.min()
+        target_max = ts.max()
+        log_debug(f"  Composite target stats for {node}: mean={target_mean:.6f}, std={target_std:.6f}, min={target_min:.6f}, max={target_max:.6f}", level=2)
+        
+        if len(ts) < 200:
+            log_verbose(f"  Skipping {node}: insufficient data ({len(ts)} points, need 200+)")
+            return None
+        
+        cutoff = ts.index[-1] - pd.Timedelta(days=test_days)
+        train_raw = ts[ts.index <= cutoff]
+        test_raw = ts[ts.index > cutoff]
+        
+        # Log composite target statistics for debugging performance differences
+        if len(train_raw) > 0:
+            train_mean = train_raw.mean()
+            train_std = train_raw.std()
+            train_min = train_raw.min()
+            train_max = train_raw.max()
+            log_debug(f"  Composite target (train) for {node}: mean={train_mean:.6f}, std={train_std:.6f}, min={train_min:.6f}, max={train_max:.6f}", level=2)
+        if len(test_raw) > 0:
+            test_mean = test_raw.mean()
+            test_std = test_raw.std()
+            log_debug(f"  Composite target (test) for {node}: mean={test_mean:.6f}, std={test_std:.6f}", level=2)
+        
+        if len(train_raw) < 100:
+            log_verbose(f"  Skipping {node}: insufficient training data ({len(train_raw)} points, need 100+)")
+            return None
+        
+        # Create training dataframe with target
+        train_df = train_raw.reset_index()
+        train_df.columns = ['timestamp', 'value']
+        
+        # Prepare feature dataframes (all available metrics as features)
+        # Use train_df timestamps to ensure exact alignment
+        # Convert train_df timestamps to the same type as unified_df
+        train_timestamps = pd.to_datetime(train_df['timestamp']).unique()
+        unified_df_train = unified_df[unified_df['timestamp'].isin(train_timestamps)].copy()
+        
+        # Ensure unified_df_train timestamps match train_df exactly (merge to get exact alignment)
+        train_df_for_merge = train_df[['timestamp']].copy()
+        train_df_for_merge['timestamp'] = pd.to_datetime(train_df_for_merge['timestamp'])
+        
+        feature_dfs = {}
+        for metric_name in metric_cols:
+            try:
+                if metric_name in unified_df_train.columns:
+                    # Create feature dataframe with metric values
+                    feature_df = unified_df_train[['timestamp', metric_name]].copy()
+                    feature_df.columns = ['timestamp', 'value']
+                    feature_df['timestamp'] = pd.to_datetime(feature_df['timestamp'])
+                    
+                    # Merge with train_df to ensure exact timestamp alignment
+                    feature_df = pd.merge(train_df_for_merge, feature_df, on='timestamp', how='left')
+                    feature_df = feature_df.sort_values('timestamp')
+                    
+                    # Fill any missing values (shouldn't happen, but just in case)
+                    feature_df['value'] = feature_df['value'].ffill().bfill().fillna(0)
+                    
+                    # Verify we have data for the training period
+                    if len(feature_df) > 0 and not feature_df['value'].isna().all():
+                        feature_dfs[metric_name] = feature_df[['timestamp', 'value']]
+                        log_debug(f"  Created feature dataframe for {metric_name}: {len(feature_df)} points", level=2)
+                    else:
+                        log_verbose(f"  Warning: {metric_name} feature dataframe is empty or all NaN after alignment", level=2)
+            except KeyError as e:
+                log_verbose(f"  Warning: Column {metric_name} not found in unified_df for {node}: {e}")
+                continue
+            except Exception as e:
+                log_verbose(f"  Warning: Failed to create feature dataframe for {metric_name} for {node}: {e}")
+                continue
+        
+        # Map to expected parameter names (only use metrics that are actually available)
+        df_host_cpu_feat = feature_dfs.get('host_cpu')
+        df_host_mem_feat = feature_dfs.get('host_mem')
+        df_pod_cpu_feat = feature_dfs.get('pod_cpu')
+        df_pod_mem_feat = feature_dfs.get('pod_mem')
+        df_disk_io_wait_feat = feature_dfs.get('disk_io_wait')
+        df_net_tx_bw_feat = feature_dfs.get('net_tx_bw')
+        
+        # Log which features are available for debugging
+        available_feature_names = [name for name, df in feature_dfs.items() if df is not None and not df.empty]
+        log_debug(f"  Available features for {node}: {available_feature_names} ({len(available_feature_names)} total)", level=2)
+        
+        # Model key for unified correlated model
+        canonical_entity = canonical_identity(entity)
+        key = f"unified_correlated_{canonical_entity}_ensemble"
+        
+        # Create proper model path for unified correlated models
+        # Use canonical identity (hostname only) for filename, not the display label with IP
+        # This avoids redundant "host01 (192.168.10.81)" -> "host01__192_168_10_81" in filename
+        canonical_entity = canonical_identity(entity)
+        safe_node_name = canonical_entity.replace('.', '_').replace(' ', '_').replace('/', '_')
+        model_path = os.path.join(MODEL_DIR, f"unified_correlated_{safe_node_name}_forecast.pkl")
+        
+        # Check if retraining is needed
+        needs_retrain = force_retrain or retrain_all
+        if not needs_retrain:
+            entity_match = entity in retrain_targets_set
+            key_match = key in retrain_targets_set
+            needs_retrain = entity_match or key_match
+        
+        # Train or load model
+        if not needs_retrain and key in manifest_snapshot:
+            forecast_result = manifest_snapshot[key].get('model')
+            if forecast_result is not None:
+                log_debug(f"   Loaded unified correlated model from manifest: {key}", level=2)
+                # For cached models, still need to compute metrics if show_backtest
+                if show_backtest:
+                    forecast_result = build_ensemble_forecast_model(
+                        df_cpu=train_df,
+                        df_mem=None,
+                        horizon_min=int(horizon_days * 24 * 60),
+                        model_path=model_path,
+                        context={'node': node, 'signal': 'UNIFIED_CORRELATED'},
+                        save_forecast_plot=False,
+                        save_backtest_plot=enable_backtest_plots if enable_backtest_plots is not None else False,
+                        print_backtest_metrics=False,
+                        save_model=False,
+                        dump_csv_dir=dump_csv_dir,
+                        enable_plots=enable_plots,
+                        df_host_cpu=df_host_cpu_feat,
+                        df_host_mem=df_host_mem_feat,
+                        df_pod_cpu=df_pod_cpu_feat,
+                        df_pod_mem=df_pod_mem_feat,
+                        df_disk_io_wait=df_disk_io_wait_feat,
+                        df_net_tx_bw=df_net_tx_bw_feat
+                    )
+            else:
+                needs_retrain = True
+        else:
+            forecast_result = None
+        
+        if needs_retrain or forecast_result is None:
+            log_debug(f"   Training unified correlated model for {node}...", level=2)
+            should_save_forecast = enable_forecast_plots if enable_forecast_plots is not None else enable_plots
+            should_save_backtest = enable_backtest_plots if enable_backtest_plots is not None else (enable_plots and show_backtest)
+            forecast_result = build_ensemble_forecast_model(
+                df_cpu=train_df,
+                df_mem=None,
+                horizon_min=int(horizon_days * 24 * 60),
+                model_path=model_path,
+                context={'node': node, 'signal': 'UNIFIED_CORRELATED'},
+                save_forecast_plot=should_save_forecast,
+                save_backtest_plot=should_save_backtest,
+                print_backtest_metrics=False,
+                save_model=True,
+                dump_csv_dir=dump_csv_dir,
+                enable_plots=should_save_forecast or should_save_backtest,
+                df_host_cpu=df_host_cpu_feat,
+                df_host_mem=df_host_mem_feat,
+                df_pod_cpu=df_pod_cpu_feat,
+                df_pod_mem=df_pod_mem_feat,
+                df_disk_io_wait=df_disk_io_wait_feat,
+                df_net_tx_bw=df_net_tx_bw_feat
+            )
+        
+        if forecast_result is None:
+            return None
+        
+        # Save complete ensemble model if we just trained it
+        if needs_retrain and model_path:
+            try:
+                joblib.dump(forecast_result, model_path)
+                log_debug(f"Saved unified correlated ensemble model → {model_path}", level=2)
+                # Also save metadata
+                if isinstance(forecast_result, tuple) and len(forecast_result) >= 3:
+                    metrics = forecast_result[2] if len(forecast_result) == 3 else {}
+                    split_info = metrics.get('split_info') if isinstance(metrics, dict) else None
+                    if split_info:
+                        persist_model_metadata(model_path, split_info)
+            except Exception as e:
+                log_verbose(f"Warning: Failed to save unified correlated ensemble model: {e}", level=1)
+        
+        # Unpack results
+        if isinstance(forecast_result, tuple):
+            if len(forecast_result) == 3:
+                _, forecast_df, metrics = forecast_result
+            else:
+                _, forecast_df = forecast_result
+                metrics = {"mae_ensemble": 0.0}
+        else:
+            return None
+        
+        # Ensure features_used is populated
+        if 'features_used' not in metrics or not metrics.get('features_used'):
+            features_list = list(metric_cols)  # All metrics used as features
+            metrics['features_used'] = features_list
+        
+        # ———— CRISIS DETECTION (ETA to threshold) ————
+        # For unified correlated model, composite metric is normalized (0-1)
+        # Use threshold of 0.8 (80% of normalized composite) for crisis detection
+        crisis_result = None
+        if forecast_df is not None and not forecast_df.empty:
+            # Get current composite value from training data
+            current = train_df['value'].iloc[-1] if not train_df.empty else 0.0
+            threshold = 0.8  # 80% of normalized composite metric
+            
+            # Calculate ETA to threshold using ensemble forecast
+            forecast_df_sorted = forecast_df.sort_values('ds')
+            future_threshold = forecast_df_sorted[forecast_df_sorted['yhat'] >= threshold]
+            
+            if not future_threshold.empty:
+                eta_days_calc = (future_threshold.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400
+                eta_days = max(0.0, eta_days_calc)
+            else:
+                # Forecast never reaches threshold
+                eta_days = 9999.0
+            
+            if eta_days < 30:
+                severity = "CRITICAL" if eta_days < 3 else "WARNING" if eta_days < 7 else "SOON"
+                
+                # Analyze which metrics are contributing most to the composite value
+                # Get latest normalized values and their contributions
+                # Use the latest timestamp from unified_df (which has all metrics)
+                latest_timestamp = unified_df['timestamp'].iloc[-1] if not unified_df.empty and 'timestamp' in unified_df.columns else None
+                metric_contributions = {}
+                metric_current_values = {}
+                weights = {
+                    'host_cpu': 0.15, 'host_mem': 0.15, 'pod_cpu': 0.15, 'pod_mem': 0.15,
+                    'disk_io_wait': 0.20, 'net_tx_bw': 0.20
+                }
+                
+                if latest_timestamp is not None and not unified_df.empty:
+                    # Get the latest row from unified_df
+                    latest_row = unified_df.iloc[-1] if len(unified_df) > 0 else None
+                    if latest_row is not None:
+                        for col in metric_cols:
+                            if col in weights and col in latest_row.index:
+                                normalized_val = latest_row[col]
+                                contribution = normalized_val * weights[col]
+                                metric_contributions[col] = contribution
+                                
+                                # Get original (unnormalized) value for display
+                                # original_values is a dict of Series, get the latest value
+                                if col in original_values:
+                                    orig_series = original_values[col]
+                                    if len(orig_series) > 0:
+                                        # Match by timestamp if possible, otherwise use last value
+                                        if isinstance(orig_series, pd.Series) and orig_series.index.name == 'timestamp':
+                                            # Try to get value at latest_timestamp
+                                            if latest_timestamp in orig_series.index:
+                                                orig_val = orig_series.loc[latest_timestamp]
+                                            else:
+                                                orig_val = orig_series.iloc[-1]
+                                        else:
+                                            orig_val = orig_series.iloc[-1] if len(orig_series) > 0 else None
+                                        
+                                        if orig_val is not None and not pd.isna(orig_val):
+                                            # Format based on metric type
+                                            if 'cpu' in col or 'mem' in col:
+                                                metric_current_values[col] = f"{orig_val*100:.1f}%"
+                                            elif 'disk_io_wait' in col:
+                                                metric_current_values[col] = f"{orig_val:.3f}"
+                                            elif 'net_tx_bw' in col:
+                                                metric_current_values[col] = f"{orig_val/1e6:.1f} MB/s"
+                                            else:
+                                                metric_current_values[col] = f"{orig_val:.2f}"
+                
+                # Sort by contribution (highest first) to identify primary contributors
+                sorted_contributions = sorted(metric_contributions.items(), key=lambda x: x[1], reverse=True)
+                top_contributors = [f"{col.replace('_', ' ').title()}: {metric_current_values.get(col, 'N/A')} (contribution: {contrib*100:.1f}%)" 
+                                   for col, contrib in sorted_contributions[:3]]  # Top 3 contributors
+                
+                # Calculate correlations between metrics (for last 24 hours)
+                correlation_insights = []
+                if latest_timestamp is not None:
+                    recent_window = pd.Timedelta(hours=24)
+                    recent_start = latest_timestamp - recent_window
+                    recent_df = unified_df[unified_df['timestamp'] >= recent_start]
+                    
+                    if len(recent_df) > 10:  # Need enough data for correlation
+                        for col1 in metric_cols:
+                            for col2 in metric_cols:
+                                if col1 < col2 and col1 in recent_df.columns and col2 in recent_df.columns:
+                                    try:
+                                        corr = recent_df[col1].corr(recent_df[col2])
+                                        if not pd.isna(corr) and abs(corr) > 0.7:  # Strong correlation
+                                            direction = "increases together" if corr > 0 else "opposite trends"
+                                            correlation_insights.append(f"{col1.replace('_', ' ').title()} ↔ {col2.replace('_', ' ').title()}: {corr:.2f} ({direction})")
+                                    except:
+                                        pass
+                
+                primary_metric = sorted_contributions[0][0] if sorted_contributions else "unknown"
+                primary_metric_name = primary_metric.replace('_', ' ').title()
+                
+                crisis_result = {
+                    "node": node,
+                    "signal": f"{primary_metric_name} Crisis (Multi-Metric)",
+                    "current": f"{current*100:.2f}%",
+                    "mae_ensemble": round(metrics.get('mae_ensemble', 0.0), 6),
+                    "hybrid_eta_days": round(max(0.0, eta_days), 1),
+                    "severity": severity,
+                    "top_contributors": top_contributors,
+                    "metric_values": metric_current_values,
+                    "correlations": correlation_insights[:5],  # Top 5 correlations
+                    "primary_metric": primary_metric_name
+                }
+                log_debug(f"   ⚠️  Crisis detected: {node} | {primary_metric_name} (ETA: {eta_days:.1f} days, severity: {severity})", level=2)
+        
+        # ———— ANOMALY DETECTION (statistical deviation) ————
+        anomaly_result = None
+        if forecast_df is not None and not forecast_df.empty:
+            mae_ensemble = metrics.get('mae_ensemble', 0.0)
+            current = train_df['value'].iloc[-1] if not train_df.empty else 0.0
+            
+            # Get recent actual values (last 24 hours)
+            recent_window = pd.Timedelta(hours=24)
+            now = pd.Timestamp.now()
+            recent_start = now - recent_window
+            train_ts = train_df.set_index('timestamp')['value'].sort_index()
+            recent_actual = train_ts[train_ts.index >= recent_start]
+            
+            if len(recent_actual) >= 6:
+                forecast_df_sorted = forecast_df.sort_values('ds')
+                if not forecast_df_sorted.empty:
+                    past_forecasts = forecast_df_sorted[forecast_df_sorted['ds'] <= now]
+                    if not past_forecasts.empty:
+                        baseline_forecast = past_forecasts.iloc[-1]['yhat']
+                    else:
+                        baseline_forecast = forecast_df_sorted.iloc[0]['yhat']
+                    
+                    recent_mean = recent_actual.mean()
+                    recent_std = recent_actual.std()
+                    recent_max = recent_actual.max()
+                    recent_min = recent_actual.min()
+                    
+                    current_deviation_abs = abs(current - baseline_forecast)
+                    current_deviation_pct = abs((current - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (current_deviation_abs if current != 0 else 0)
+                    mean_deviation_abs = abs(recent_mean - baseline_forecast)
+                    mean_deviation_pct = abs((recent_mean - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (mean_deviation_abs if recent_mean != 0 else 0)
+                    
+                    # For normalized composite metric (0-1), use appropriate thresholds
+                    min_abs_threshold = 0.05  # 5% absolute deviation
+                    mae_threshold = 0.10  # 10% MAE threshold
+                    concerning_threshold = 0.70  # 70% composite value is concerning
+                    baseline_too_small = baseline_forecast < 0.05
+                    
+                    mae_confidence_factor = 1.0 if mae_ensemble < 0.02 else (0.7 if mae_ensemble < 0.05 else 0.3)
+                    
+                    is_concerning_value = current >= concerning_threshold
+                    has_significant_abs_diff = current_deviation_abs >= min_abs_threshold or mean_deviation_abs >= min_abs_threshold
+                    
+                    if baseline_too_small:
+                        is_anomaly = has_significant_abs_diff and is_concerning_value
+                    else:
+                        has_significant_pct_diff = current_deviation_pct > 0.50 or mean_deviation_pct > 0.30
+                        is_anomaly = (
+                            has_significant_abs_diff and
+                            has_significant_pct_diff and
+                            (is_concerning_value or mae_confidence_factor < 0.5 or mae_ensemble > mae_threshold)
+                        )
+                    
+                    if is_anomaly:
+                        anomaly_score = min(1.0, max(
+                            current_deviation_pct,
+                            mean_deviation_pct,
+                            min(1.0, mae_ensemble / mae_threshold) if mae_threshold > 0 else 0
+                        ))
+                        
+                        if anomaly_score > 0.8:
+                            severity = "CRITICAL"
+                        elif anomaly_score > 0.5:
+                            severity = "WARNING"
+                        else:
+                            severity = "INFO"
+                        
+                        # Analyze which metrics are contributing most to the anomaly
+                        # Get latest normalized values and their contributions
+                        latest_timestamp = unified_df['timestamp'].iloc[-1] if not unified_df.empty else None
+                        metric_contributions = {}
+                        metric_current_values = {}
+                        metric_deviations = {}
+                        weights = {
+                            'host_cpu': 0.15, 'host_mem': 0.15, 'pod_cpu': 0.15, 'pod_mem': 0.15,
+                            'disk_io_wait': 0.20, 'net_tx_bw': 0.20
+                        }
+                        
+                        if latest_timestamp is not None and not unified_df.empty:
+                            # Get the latest row from unified_df (most recent data)
+                            latest_row = unified_df.iloc[-1] if len(unified_df) > 0 else None
+                            if latest_row is not None:
+                                # Get recent mean for each metric to calculate deviation
+                                recent_window = pd.Timedelta(hours=24)
+                                recent_start = latest_timestamp - recent_window
+                                recent_df = unified_df[unified_df['timestamp'] >= recent_start]
+                                
+                                for col in metric_cols:
+                                    if col in weights and col in latest_row.index:
+                                        normalized_val = latest_row[col]
+                                        contribution = normalized_val * weights[col]
+                                        metric_contributions[col] = contribution
+                                        
+                                        # Calculate deviation from recent mean
+                                        if col in recent_df.columns and len(recent_df) > 0:
+                                            recent_mean = recent_df[col].mean()
+                                            deviation = abs(normalized_val - recent_mean)
+                                            metric_deviations[col] = deviation
+                                        
+                                        # Get original (unnormalized) value for display
+                                        # original_values[col] is a Series with integer index matching unified_df
+                                        if col in original_values:
+                                            orig_series = original_values[col]
+                                            if len(orig_series) > 0:
+                                                # Get the latest value (corresponds to unified_df.iloc[-1])
+                                                orig_val = orig_series.iloc[-1] if len(orig_series) > 0 else None
+                                                if orig_val is not None and not pd.isna(orig_val):
+                                                    # Format based on metric type
+                                                    if 'cpu' in col or 'mem' in col:
+                                                        metric_current_values[col] = f"{orig_val*100:.1f}%"
+                                                    elif 'disk_io_wait' in col:
+                                                        metric_current_values[col] = f"{orig_val:.3f}"
+                                                    elif 'net_tx_bw' in col:
+                                                        metric_current_values[col] = f"{orig_val/1e6:.1f} MB/s"
+                                                    else:
+                                                        metric_current_values[col] = f"{orig_val:.2f}"
+                                
+                                # Calculate correlations between metrics
+                                correlation_insights = []
+                                if len(recent_df) > 10:
+                                    for col1 in metric_cols:
+                                        for col2 in metric_cols:
+                                            if col1 < col2 and col1 in recent_df.columns and col2 in recent_df.columns:
+                                                try:
+                                                    corr = recent_df[col1].corr(recent_df[col2])
+                                                    if not pd.isna(corr) and abs(corr) > 0.7:  # Strong correlation
+                                                        direction = "increases together" if corr > 0 else "opposite trends"
+                                                        correlation_insights.append(f"{col1.replace('_', ' ').title()} ↔ {col2.replace('_', ' ').title()}: {corr:.2f} ({direction})")
+                                                except:
+                                                    pass
+                        
+                        # Identify top contributors and top deviators
+                        sorted_contributions = sorted(metric_contributions.items(), key=lambda x: x[1], reverse=True)
+                        top_contributors = [f"{col.replace('_', ' ').title()}: {metric_current_values.get(col, 'N/A')} (contribution: {contrib*100:.1f}%)" 
+                                           for col, contrib in sorted_contributions[:3]]
+                        
+                        sorted_deviations = sorted(metric_deviations.items(), key=lambda x: x[1], reverse=True) if metric_deviations else []
+                        top_deviators = [f"{col.replace('_', ' ').title()}: {metric_current_values.get(col, 'N/A')} (deviation: {dev*100:.1f}%)" 
+                                        for col, dev in sorted_deviations[:3]]
+                        
+                        current_str = f"{current*100:.2f}%"
+                        
+                        # Create detailed description with specific metrics
+                        primary_metric = sorted_contributions[0][0] if sorted_contributions else "unknown"
+                        primary_metric_name = primary_metric.replace('_', ' ').title()
+                        primary_value = metric_current_values.get(primary_metric, "N/A")
+                        
+                        description = f"⚠️  ANOMALY DETECTED: {node} | {primary_metric_name} Anomaly\n\n"
+                        description += f"Current system performance is {current_str}, which is {current_deviation_pct*100:.1f}% higher than forecasted baseline.\n"
+                        description += f"Primary contributing metric: {primary_metric_name} at {primary_value}\n\n"
+                        description += f"Top contributing metrics:\n"
+                        for contrib in top_contributors:
+                            description += f"  • {contrib}\n"
+                        if top_deviators:
+                            description += f"\nMetrics showing largest deviations:\n"
+                            for dev in top_deviators:
+                                description += f"  • {dev}\n"
+                        if correlation_insights:
+                            description += f"\nStrong correlations detected:\n"
+                            for corr in correlation_insights[:3]:
+                                description += f"  • {corr}\n"
+                        description += f"\nModel confidence: MAE {mae_ensemble:.6f} | Anomaly score: {anomaly_score:.3f}"
+                        
+                        anomaly_result = {
+                            "node": node,
+                            "signal": f"{primary_metric_name} Anomaly (Multi-Metric)",
+                            "current": current_str,
+                            "mae_ensemble": round(mae_ensemble, 6),
+                            "score": round(anomaly_score, 3),
+                            "severity": severity,
+                            "deviation_pct": round(current_deviation_pct * 100, 1),
+                            "description": description,
+                            "top_contributors": top_contributors,
+                            "top_deviators": top_deviators,
+                            "metric_values": metric_current_values,
+                            "correlations": correlation_insights[:5],
+                            "primary_metric": primary_metric_name
+                        }
+                        
+                        log_debug(f"   ⚠️  Anomaly detected: {node} | {primary_metric_name} (score: {anomaly_score:.3f}, deviation: {current_deviation_pct*100:.1f}%)", level=2)
+        
+        # Collect backtest metrics
+        backtest_metrics = None
+        if (show_backtest or (needs_retrain and not forecast_mode)) and metrics:
+            backtest_metrics = {
+                'node': node,
+                'signal': 'UNIFIED_CORRELATED',
+                'metrics': metrics
+            }
+        
+        return {
+            'crisis_result': crisis_result,
+            'anomaly_result': anomaly_result,
+            'backtest_metrics': backtest_metrics,
+            'retrained_node': node if needs_retrain else None,
+            'key': key,
+            'model': forecast_result if needs_retrain else None,
+            'needs_retrain': needs_retrain
+        }
+        
+    except KeyError as e:
+        # KeyError is likely from accessing a column that doesn't exist
+        log_verbose(f"  Error processing {entity}: KeyError - {e}")
+        log_verbose(f"  Available columns in dataframes:", level=2)
+        for name, df in [('host_cpu', df_host_cpu_node), ('host_mem', df_host_mem_node), 
+                         ('pod_cpu', df_pod_cpu_node), ('pod_mem', df_pod_mem_node),
+                         ('disk_io_wait', df_disk_io_wait_node), ('net_tx_bw', df_net_tx_bw_node)]:
+            if df is not None and not df.empty:
+                log_verbose(f"    {name}: columns = {list(df.columns)}", level=2)
+        return None
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        log_verbose(f"  Error processing {entity}: {e}")
+        log_verbose(f"  Traceback: {error_details}", level=2)
+        return None
+
 def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forecast_plots", force_retrain: bool | None = None,
                                     manifest: dict | None = None, retrain_targets: set | None = None, show_backtest: bool = False,
                                     forecast_mode: bool = False, dump_csv_dir: str | None = None, enable_plots: bool = True,
-                                    enable_forecast_plots: bool = None, enable_backtest_plots: bool = None):
+                                    enable_forecast_plots: bool = None, enable_backtest_plots: bool = None,
+                                    prefetched_data: dict | None = None,
+                                    df_host_cpu: pd.DataFrame | None = None,
+                                    df_host_mem: pd.DataFrame | None = None,
+                                    df_pod_cpu: pd.DataFrame | None = None,
+                                    df_pod_mem: pd.DataFrame | None = None):
     """
     Disk I/O and Network ensemble forecasting using Prophet, ARIMA, and LSTM models.
     
@@ -7512,709 +10165,546 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
         }
     ]
 
-    # Collect all unique nodes across all signals for summary
-    all_unique_nodes = set()
-    all_unique_entities = set()
-    
     # Collect backtest metrics when show_backtest is true
     backtest_metrics_list = []
     
-    if retrain_targets:
-        print(f"\nScanning all signals for available nodes...")
-
+    # ========== STEP 1: Fetch ALL metrics first ==========
+    # Store all dataframes for unified model training
+    io_net_dataframes = {}
+    
+    # Log Host/Pod metrics status (these are prefetched from calling function)
+    host_cpu_count = len(df_host_cpu) if df_host_cpu is not None and not df_host_cpu.empty else 0
+    host_mem_count = len(df_host_mem) if df_host_mem is not None and not df_host_mem.empty else 0
+    pod_cpu_count = len(df_pod_cpu) if df_pod_cpu is not None and not df_pod_cpu.empty else 0
+    pod_mem_count = len(df_pod_mem) if df_pod_mem is not None and not df_pod_mem.empty else 0
+    
+    if host_cpu_count > 0:
+        log_debug(f"  Using prefetched data for Host CPU ({host_cpu_count:,} data points)...", level=2)
+    else:
+        log_debug("  ⚠ Host CPU data not available (will be skipped as feature)", level=2)
+    
+    if host_mem_count > 0:
+        log_debug(f"  Using prefetched data for Host Memory ({host_mem_count:,} data points)...", level=2)
+    else:
+        log_debug("  ⚠ Host Memory data not available (will be skipped as feature)", level=2)
+    
+    if pod_cpu_count > 0:
+        log_debug(f"  Using prefetched data for Pod CPU ({pod_cpu_count:,} data points)...", level=2)
+    else:
+        log_debug("  ⚠ Pod CPU data not available (will be skipped as feature)", level=2)
+    
+    if pod_mem_count > 0:
+        log_debug(f"  Using prefetched data for Pod Memory ({pod_mem_count:,} data points)...", level=2)
+    else:
+        log_debug("  ⚠ Pod Memory data not available (will be skipped as feature)", level=2)
+    
     for res in resources:
-        log_verbose(f"\nFetching {res['name']}...")
-        df_raw = fetch_victoriametrics_metrics(
-            query=res["query"],
-            start=int((pd.Timestamp.now() - pd.Timedelta(days=35)).timestamp()),
-            end=int(pd.Timestamp.now().timestamp()),
-            step="10m"
-        )
-        if df_raw.empty:
-            continue
+        # Use prefetched data if available, otherwise fetch
+        if prefetched_data and res['name'] in prefetched_data:
+            df = prefetched_data[res['name']].copy()
+            data_count = len(df) if not df.empty else 0
+            log_debug(f"  Using prefetched data for {res['name']} ({data_count:,} data points)...", level=2)
+        else:
+            log_debug(f"  Fetching {res['name']}...", level=2)
+            df_raw = fetch_victoriametrics_metrics(
+                query=res["query"],
+                start=int((pd.Timestamp.now() - pd.Timedelta(days=35)).timestamp()),
+                end=int(pd.Timestamp.now().timestamp()),
+                step="10m"
+            )
+            if df_raw.empty:
+                print(f"  ⚠ {res['name']} query returned no data (will be skipped)")
+                continue
 
-        df = df_raw.copy()
-        df['timestamp'] = pd.to_datetime(df['ts'], unit='s')
+            df = df_raw.copy()
+            df['timestamp'] = pd.to_datetime(df['ts'], unit='s')
+            data_count = len(df)
+            print(f"  ✓ Fetched {res['name']} ({data_count:,} data points)...")
+            
+            # Apply alias resolution and canonicalization to match nodes correctly
+            # This ensures nodes with IP addresses (e.g., 192.168.10.81) are matched with DNS names (e.g., host01)
+            if 'instance' in df.columns:
+                # Add entity column with canonical identities for proper matching
+                df['entity'] = df['instance'].map(lambda x: canonical_identity(str(x)))
+                # Apply alias resolution: if entity has an alias, use the alias target
+                df['entity'] = df['entity'].map(lambda e: INSTANCE_ALIAS_MAP.get(e, e))
+                # Re-canonicalize after alias resolution
+                df['entity'] = df['entity'].map(lambda e: canonical_identity(str(e)) if isinstance(e, str) else e)
         
-        # Apply alias resolution and canonicalization to match nodes correctly
-        # This ensures nodes with IP addresses (e.g., 192.168.10.81) are matched with DNS names (e.g., host01)
-        if 'instance' in df.columns:
-            # Add entity column with canonical identities for proper matching
-            df['entity'] = df['instance'].map(lambda x: canonical_identity(str(x)))
-            # Apply alias resolution: if entity has an alias, use the alias target
-            df['entity'] = df['entity'].map(lambda e: INSTANCE_ALIAS_MAP.get(e, e))
-            # Re-canonicalize after alias resolution
-            df['entity'] = df['entity'].map(lambda e: canonical_identity(str(e)) if isinstance(e, str) else e)
-        
-        # Collect nodes for summary (use entity if available, otherwise instance)
+        # Store dataframe for cross-feature usage
+        io_net_dataframes[res['name']] = df
+    
+    # ========== STEP 2: Collect all unique nodes across all metrics ==========
+    all_unique_entities = set()
+    for res_name, df in io_net_dataframes.items():
         group_col = 'entity' if 'entity' in df.columns else 'instance'
         all_instances = df[group_col].unique()
         for inst in all_instances:
-            # For display, try to get the original instance name if available
-            original_inst = df[df[group_col] == inst]['instance'].iloc[0] if 'instance' in df.columns and not df[df[group_col] == inst].empty else inst
-            node = canonical_node_label(original_inst, with_ip=True) if isinstance(original_inst, str) else canonical_node_label(str(inst), with_ip=True)
             entity = canonical_identity(str(inst))
-            all_unique_nodes.add(node)
-            all_unique_entities.add(f"{entity} ({original_inst})")
-        
-        # Verbose logging: display all nodes found in signal data for retrain target matching
-        if retrain_targets:
-            all_nodes = [canonical_node_label(df[df[group_col] == inst]['instance'].iloc[0] if 'instance' in df.columns and not df[df[group_col] == inst].empty else inst, with_ip=True) for inst in all_instances]
-            all_entities = [canonical_identity(str(inst)) for inst in all_instances]
-            log_verbose(f"  Found {len(all_instances)} nodes in {res['name']} data: {', '.join(all_nodes)}")
-            log_verbose(f"  Entity names: {', '.join(all_entities)}")
-
-        # Prepare for parallelization
-        # Group by entity (canonical identity) instead of instance to handle IP vs DNS name differences
-        node_groups = list(df.groupby(group_col))
-        total_nodes = len(node_groups)
-        # If --parallel flag is set, bypass threshold and use parallel processing
-        # Otherwise, only parallelize if we have enough nodes to justify the overhead
-        use_parallel = (CLI_PARALLEL_OVERRIDE is not None) or (total_nodes > 10 and MAX_WORKER_THREADS > 1)
-        n_workers = min(total_nodes, MAX_WORKER_THREADS) if use_parallel else 1
-        
-        # Pre-compute retrain matching logic
-        retrain_targets_set = set(retrain_targets) if retrain_targets else set()
-        retrain_all = '__RETRAIN_ALL__' in retrain_targets_set if retrain_targets_set else False
-        retrain_targets_canon = {}
-        if retrain_targets_set and not retrain_all:
-            for target in retrain_targets_set:
-                if '|' not in target and '_' not in target:
-                    retrain_targets_canon[target] = canonical_identity(target)
-        
-        if total_nodes > 5:
-            if use_parallel:
-                print(f"  Processing {total_nodes} nodes for {res['name']} ensemble in PARALLEL mode:")
-                print(f"    ├─ Available workers: {MAX_WORKER_THREADS}")
-                print(f"    ├─ Workers used: {n_workers} (min({total_nodes}, {MAX_WORKER_THREADS}))")
-                print(f"    └─ Expected speedup: ~{n_workers}x (vs sequential)")
-            else:
-                print(f"  Processing {total_nodes} nodes for {res['name']} ensemble in SEQUENTIAL mode:")
-                print(f"    ├─ Available workers: {MAX_WORKER_THREADS}")
-                if CLI_PARALLEL_OVERRIDE is None:
-                    reason = 'Too few items (<10)' if total_nodes <= 10 else 'Single worker only'
-                else:
-                    reason = 'Single worker only (MAX_WORKER_THREADS=1)'
-                print(f"    ├─ Reason: {reason}")
-                print(f"    └─ Workers used: 1")
-        
+            all_unique_entities.add(entity)
+    
+    if not all_unique_entities:
+        print("  ⚠ No nodes found in I/O and Network data")
+        return pd.DataFrame(), pd.DataFrame(), manifest, False
+    
+    print(f"  Found {len(all_unique_entities)} unique nodes")
+    print(f"  Training unified correlated ensemble models:")
+    print(f"    • One model per node using all available metrics as features")
+    print(f"    • Learns cross-correlations between all metrics")
+    print(f"    • Predicts composite system performance metric")
+    
+    # ========== STEP 3: For each node, train ONE unified ensemble model using ALL 6 metrics ==========
+    # Group by node (entity) and process each node with all metrics together
+    total_nodes = len(all_unique_entities)
+    # Pre-compute retrain matching logic
+    retrain_targets_set = set(retrain_targets) if retrain_targets else set()
+    retrain_all = '__RETRAIN_ALL__' in retrain_targets_set if retrain_targets_set else False
+    retrain_targets_canon = {}
+    if retrain_targets_set and not retrain_all:
+        for target in retrain_targets_set:
+            if '|' not in target and '_' not in target:
+                retrain_targets_canon[target] = canonical_identity(target)
+    
+    # Determine parallelization
+    use_parallel = (CLI_PARALLEL_OVERRIDE is not None) or (total_nodes > 10 and MAX_WORKER_THREADS > 1)
+    n_workers = min(total_nodes, MAX_WORKER_THREADS) if use_parallel else 1
+    
+    if total_nodes > 5:
         if use_parallel:
-            # Parallel processing
-            print(f"    → Starting parallel execution with {n_workers} workers...")
-            manifest_snapshot = manifest.copy()  # Snapshot for parallel workers
-            processed_results = Parallel(n_jobs=n_workers, verbose=0)(
-                delayed(_process_single_node_io_ensemble)(
-                    # If grouping by entity, instance is the entity; get original instance from group if available
-                    group['instance'].iloc[0] if 'instance' in group.columns else instance,
-                    group, res, test_days, horizon_days, force_retrain,
-                    retrain_targets_set, retrain_all, retrain_targets_canon, manifest_snapshot,
-                    forecast_mode, dump_csv_dir, plot_dir, enable_plots, show_backtest,
-                    enable_forecast_plots, enable_backtest_plots
-                )
-                for instance, group in node_groups
+            print(f"  Processing {total_nodes} nodes with unified ensemble model (all 6 metrics) in PARALLEL mode:")
+            print(f"    ├─ Available workers: {MAX_WORKER_THREADS}")
+            print(f"    ├─ Workers used: {n_workers} (min({total_nodes}, {MAX_WORKER_THREADS}))")
+            print(f"    └─ Expected speedup: ~{n_workers}x (vs sequential)")
+        else:
+            print(f"  Processing {total_nodes} nodes with unified ensemble model (all 6 metrics) in SEQUENTIAL mode:")
+            print(f"    ├─ Available workers: {MAX_WORKER_THREADS}")
+            if CLI_PARALLEL_OVERRIDE is None:
+                reason = 'Too few items (<10)' if total_nodes <= 10 else 'Single worker only'
+            else:
+                reason = 'Single worker only (MAX_WORKER_THREADS=1)'
+            print(f"    ├─ Reason: {reason}")
+            print(f"    └─ Workers used: 1")
+    
+    if use_parallel:
+        # Parallel processing - iterate over nodes first, then process both metrics for each node
+        print(f"    → Starting parallel execution with {n_workers} workers...")
+        manifest_snapshot = manifest.copy()  # Snapshot for parallel workers
+        # Create snapshots of Host/Pod dataframes for parallel workers
+        df_hcpu_snapshot = df_host_cpu.copy() if df_host_cpu is not None else None
+        df_hmem_snapshot = df_host_mem.copy() if df_host_mem is not None else None
+        df_pcpu_snapshot = df_pod_cpu.copy() if df_pod_cpu is not None else None
+        df_pmem_snapshot = df_pod_mem.copy() if df_pod_mem is not None else None
+        
+        # Create tasks: for each node, create ONE unified correlated model using all 6 metrics
+        tasks = []
+        for entity in all_unique_entities:
+            # Extract all metrics for this node
+            entity_col_h = 'entity' if df_hcpu_snapshot is not None and 'entity' in df_hcpu_snapshot.columns else 'instance'
+            entity_col_p = 'entity' if df_pcpu_snapshot is not None and 'entity' in df_pcpu_snapshot.columns else 'instance'
+            entity_col_io = 'entity' if io_net_dataframes and 'entity' in list(io_net_dataframes.values())[0].columns else 'instance'
+            
+            df_host_cpu_node = None
+            df_host_mem_node = None
+            df_pod_cpu_node = None
+            df_pod_mem_node = None
+            df_disk_io_wait_node = None
+            df_net_tx_bw_node = None
+            
+            if df_hcpu_snapshot is not None:
+                host_cpu_filtered = df_hcpu_snapshot[df_hcpu_snapshot[entity_col_h].apply(canonical_identity) == entity]
+                if not host_cpu_filtered.empty and 'timestamp' in host_cpu_filtered.columns and 'value' in host_cpu_filtered.columns:
+                    df_host_cpu_node = host_cpu_filtered[['timestamp', 'value']].copy()
+            
+            if df_hmem_snapshot is not None:
+                host_mem_filtered = df_hmem_snapshot[df_hmem_snapshot[entity_col_h].apply(canonical_identity) == entity]
+                if not host_mem_filtered.empty and 'timestamp' in host_mem_filtered.columns and 'value' in host_mem_filtered.columns:
+                    df_host_mem_node = host_mem_filtered[['timestamp', 'value']].copy()
+            
+            if df_pcpu_snapshot is not None:
+                pod_cpu_filtered = df_pcpu_snapshot[df_pcpu_snapshot[entity_col_p].apply(canonical_identity) == entity]
+                if not pod_cpu_filtered.empty and 'timestamp' in pod_cpu_filtered.columns and 'value' in pod_cpu_filtered.columns:
+                    df_pod_cpu_node = pod_cpu_filtered[['timestamp', 'value']].copy()
+            
+            if df_pmem_snapshot is not None:
+                pod_mem_filtered = df_pmem_snapshot[df_pmem_snapshot[entity_col_p].apply(canonical_identity) == entity]
+                if not pod_mem_filtered.empty and 'timestamp' in pod_mem_filtered.columns and 'value' in pod_mem_filtered.columns:
+                    df_pod_mem_node = pod_mem_filtered[['timestamp', 'value']].copy()
+            
+            if io_net_dataframes:
+                if 'DISK_IO_WAIT' in io_net_dataframes:
+                    disk_io_filtered = io_net_dataframes['DISK_IO_WAIT'][io_net_dataframes['DISK_IO_WAIT'][entity_col_io].apply(canonical_identity) == entity]
+                    if not disk_io_filtered.empty and 'timestamp' in disk_io_filtered.columns and 'value' in disk_io_filtered.columns:
+                        df_disk_io_wait_node = disk_io_filtered[['timestamp', 'value']].copy()
+                
+                if 'NET_TX_BW' in io_net_dataframes:
+                    net_tx_filtered = io_net_dataframes['NET_TX_BW'][io_net_dataframes['NET_TX_BW'][entity_col_io].apply(canonical_identity) == entity]
+                    if not net_tx_filtered.empty and 'timestamp' in net_tx_filtered.columns and 'value' in net_tx_filtered.columns:
+                        df_net_tx_bw_node = net_tx_filtered[['timestamp', 'value']].copy()
+            
+            # Only add task if we have at least 2 metrics
+            available_count = sum(1 for df in [df_host_cpu_node, df_host_mem_node, df_pod_cpu_node, 
+                                                df_pod_mem_node, df_disk_io_wait_node, df_net_tx_bw_node] if df is not None)
+            if available_count >= 2:
+                tasks.append((
+                    entity,
+                    df_host_cpu_node,
+                    df_host_mem_node,
+                    df_pod_cpu_node,
+                    df_pod_mem_node,
+                    df_disk_io_wait_node,
+                    df_net_tx_bw_node
+                ))
+        
+        # Process all tasks in parallel - ONE unified model per node
+        processed_results = Parallel(n_jobs=n_workers, verbose=0)(
+            delayed(_process_single_node_unified_correlated_model)(
+                entity,
+                df_host_cpu_node, df_host_mem_node, df_pod_cpu_node,
+                df_pod_mem_node, df_disk_io_wait_node, df_net_tx_bw_node,
+                test_days, horizon_days, force_retrain,
+                retrain_targets_set, retrain_all, retrain_targets_canon, manifest_snapshot,
+                forecast_mode, dump_csv_dir, plot_dir, enable_plots, show_backtest,
+                enable_forecast_plots, enable_backtest_plots
+            )
+            for entity, df_host_cpu_node, df_host_mem_node, df_pod_cpu_node,
+                df_pod_mem_node, df_disk_io_wait_node, df_net_tx_bw_node in tasks
+        )
+        
+        # Process results and aggregate
+        for proc_result in processed_results:
+            if proc_result is None:
+                continue
+            
+            # Update manifest with new/updated models
+            if proc_result['model'] is not None:
+                manifest[proc_result['key']] = {'model': proc_result['model']}
+                manifest_changed = True
+            
+            # Collect crisis results
+            if proc_result['crisis_result']:
+                crisis_results.append(proc_result['crisis_result'])
+            
+            # Collect anomaly results
+            if proc_result['anomaly_result']:
+                anomaly_results.append(proc_result['anomaly_result'])
+            
+            # Collect backtest metrics
+            if proc_result['backtest_metrics']:
+                backtest_metrics_list.append(proc_result['backtest_metrics'])
+            
+            # Track retrained nodes
+            if proc_result['retrained_node']:
+                retrained_nodes.add(proc_result['retrained_node'])
+        
+        print()  # New line after progress indicator
+        successful_nodes = len([r for r in processed_results if r is not None])
+        total_tasks = len(tasks)
+        skipped_nodes = total_tasks - successful_nodes
+        if skipped_nodes > 0:
+            print(f"    ⚠ Note: {skipped_nodes} node(s) skipped due to insufficient data (use -v for details)")
+        print(f"    ✓ Completed: {successful_nodes}/{total_tasks} unified models processed successfully")
+    else:
+        # Sequential processing - ONE unified model per node using all 6 metrics
+        skipped_count = 0
+        for entity in all_unique_entities:
+            # Extract all metrics for this node
+            entity_col_h = 'entity' if df_host_cpu is not None and 'entity' in df_host_cpu.columns else 'instance'
+            entity_col_p = 'entity' if df_pod_cpu is not None and 'entity' in df_pod_cpu.columns else 'instance'
+            entity_col_io = 'entity' if io_net_dataframes and 'entity' in list(io_net_dataframes.values())[0].columns else 'instance'
+            
+            df_host_cpu_node = None
+            df_host_mem_node = None
+            df_pod_cpu_node = None
+            df_pod_mem_node = None
+            df_disk_io_wait_node = None
+            df_net_tx_bw_node = None
+            
+            if df_host_cpu is not None:
+                host_cpu_filtered = df_host_cpu[df_host_cpu[entity_col_h].apply(canonical_identity) == entity]
+                if not host_cpu_filtered.empty:
+                    df_host_cpu_node = host_cpu_filtered[['timestamp', 'value']].copy()
+            
+            if df_host_mem is not None:
+                host_mem_filtered = df_host_mem[df_host_mem[entity_col_h].apply(canonical_identity) == entity]
+                if not host_mem_filtered.empty:
+                    df_host_mem_node = host_mem_filtered[['timestamp', 'value']].copy()
+            
+            if df_pod_cpu is not None:
+                pod_cpu_filtered = df_pod_cpu[df_pod_cpu[entity_col_p].apply(canonical_identity) == entity]
+                if not pod_cpu_filtered.empty:
+                    df_pod_cpu_node = pod_cpu_filtered[['timestamp', 'value']].copy()
+            
+            if df_pod_mem is not None:
+                pod_mem_filtered = df_pod_mem[df_pod_mem[entity_col_p].apply(canonical_identity) == entity]
+                if not pod_mem_filtered.empty:
+                    df_pod_mem_node = pod_mem_filtered[['timestamp', 'value']].copy()
+            
+            if io_net_dataframes:
+                if 'DISK_IO_WAIT' in io_net_dataframes:
+                    disk_io_filtered = io_net_dataframes['DISK_IO_WAIT'][io_net_dataframes['DISK_IO_WAIT'][entity_col_io].apply(canonical_identity) == entity]
+                    if not disk_io_filtered.empty:
+                        df_disk_io_wait_node = disk_io_filtered[['timestamp', 'value']].copy()
+                
+                if 'NET_TX_BW' in io_net_dataframes:
+                    net_tx_filtered = io_net_dataframes['NET_TX_BW'][io_net_dataframes['NET_TX_BW'][entity_col_io].apply(canonical_identity) == entity]
+                    if not net_tx_filtered.empty:
+                        df_net_tx_bw_node = net_tx_filtered[['timestamp', 'value']].copy()
+            
+            # Only process if we have at least 2 metrics
+            available_count = sum(1 for df in [df_host_cpu_node, df_host_mem_node, df_pod_cpu_node, 
+                                                df_pod_mem_node, df_disk_io_wait_node, df_net_tx_bw_node] if df is not None)
+            if available_count < 2:
+                skipped_count += 1
+                continue
+            
+            # Call the unified correlated model function
+            proc_result = _process_single_node_unified_correlated_model(
+                entity,
+                df_host_cpu_node, df_host_mem_node, df_pod_cpu_node,
+                df_pod_mem_node, df_disk_io_wait_node, df_net_tx_bw_node,
+                test_days, horizon_days, force_retrain,
+                retrain_targets_set, retrain_all, retrain_targets_canon, manifest,
+                forecast_mode, dump_csv_dir, plot_dir, enable_plots, show_backtest,
+                enable_forecast_plots, enable_backtest_plots
             )
             
-            # Process results and aggregate
-            for proc_result in processed_results:
-                if proc_result is None:
-                    continue
-                
-                # Update manifest with new/updated models
-                if proc_result['model'] is not None:
-                    manifest[proc_result['key']] = {'model': proc_result['model']}
-                    manifest_changed = True
-                
-                # Collect crisis results
-                if proc_result['crisis_result']:
-                    crisis_results.append(proc_result['crisis_result'])
-                
-                # Collect anomaly results
-                if proc_result['anomaly_result']:
-                    anomaly_results.append(proc_result['anomaly_result'])
-                
-                # Collect backtest metrics
-                if proc_result['backtest_metrics']:
-                    backtest_metrics_list.append(proc_result['backtest_metrics'])
-                
-                # Track retrained nodes
-                if proc_result['retrained_node']:
-                    retrained_nodes.add(proc_result['retrained_node'])
+            if proc_result is None:
+                skipped_count += 1
+                continue
             
-            print()  # New line after progress indicator
-            successful_nodes = len([r for r in processed_results if r is not None])
-            skipped_nodes = total_nodes - successful_nodes
-            if skipped_nodes > 0:
-                print(f"    ⚠ Note: {skipped_nodes} node(s) skipped due to insufficient data (use -v for details)")
-            print(f"    ✓ Parallel execution complete: {successful_nodes}/{total_nodes} nodes processed successfully")
-        else:
-            # Sequential processing (original code)
-            skipped_count = 0
-            for instance, group in node_groups:
-                # If grouping by entity, get original instance from group if available
-                original_inst = group['instance'].iloc[0] if 'instance' in group.columns else instance
-                node = canonical_node_label(original_inst, with_ip=True)
-                entity = canonical_identity(instance)  # instance is now the entity (canonical identity)
-                ts = group.set_index('timestamp')['value'].sort_index()
-                if len(ts) < 200:
-                    skipped_count += 1
-                    log_verbose(f"  Skipping {node} | {res['name']}: insufficient data ({len(ts)} points, need 200+)")
-                    continue
-
-                cutoff = ts.index[-1] - pd.Timedelta(days=test_days)
-                train_raw = ts[ts.index <= cutoff]
-                if len(train_raw) < 100:
-                    skipped_count += 1
-                    log_verbose(f"  Skipping {node} | {res['name']}: insufficient training data ({len(train_raw)} points, need 100+)")
-                    continue
-
-                current = ts.iloc[-1]
-                train_df = train_raw.reset_index()
-                train_df.columns = ['timestamp', 'value']
-
-                key = f"{build_io_net_key(entity, res['name'])}_ensemble"
-                log_verbose(f"  Running ensemble forecast for {node} | {res['name']} ({len(train_df)} points)...")
-
-                # ———— MODEL CACHING ————
-                # Check if retraining is needed - match against entity, key, or any aliases
-                # Check for "all" flag first
-                needs_retrain = force_retrain or ('__RETRAIN_ALL__' in retrain_targets if retrain_targets else False)
-                if needs_retrain:
-                    entity_match = key_match = instance_match = node_match = alias_match = False
-                else:
-                    entity_match = entity in retrain_targets
-                    key_match = key in retrain_targets
-                    # Also check if instance (raw) matches after canonicalization
-                    instance_canon = canonical_identity(instance)
-                    instance_match = instance_canon in retrain_targets
-                    # Check if node display name (without IP) matches
-                    node_base = node.split('(')[0].strip() if '(' in node else node
-                    node_base_canon = canonical_identity(node_base)
-                    node_match = node_base_canon in retrain_targets
-                    
-                    # Check if any retrain target is an alias that maps to this entity
-                    alias_match = False
-                    for target in retrain_targets:
-                        if '|' in target or '_' in target:
-                            continue  # Skip keys, only check node names
-                        target_canon = canonical_identity(target)
-                        # Direct match already checked above
-                        if target_canon == entity:
-                            alias_match = True
-                            break
-                        # Check if target maps to this entity via alias map
-                        if target_canon in INSTANCE_ALIAS_MAP:
-                            alias_value = INSTANCE_ALIAS_MAP[target_canon]
-                            if canonical_identity(alias_value) == entity:
-                                alias_match = True
-                                break
-                        # Check reverse: if entity is in alias map, does target match the key?
-                        for k, v in INSTANCE_ALIAS_MAP.items():
-                            if canonical_identity(v) == entity and canonical_identity(k) == target_canon:
-                                alias_match = True
-                                break
-                        if alias_match:
-                            break
-                        # Check if both resolve to same IP in source registry
-                        target_ip = SOURCE_REGISTRY.get(target_canon) or CANON_SOURCE_MAP.get(target_canon)
-                        entity_ip = SOURCE_REGISTRY.get(entity) or CANON_SOURCE_MAP.get(entity)
-                        if target_ip and entity_ip and target_ip == entity_ip:
-                            alias_match = True
-                            break
-                        # Extract IP from node display string and check if target resolves to it
-                        # Only attempt DNS if target looks like a hostname
-                        if looks_like_hostname(target) and '(' in node and ')' in node:
-                            node_ip = node.split('(')[1].split(')')[0].strip()
-                            # Try to resolve target to IP (try with and without domain suffixes)
-                            target_variants = [target] + [f"{target}{d}" for d in DNS_DOMAIN_SUFFIXES if d and not target.endswith(d)]
-                            for target_var in target_variants:
-                                try:
-                                    target_resolved = socket.gethostbyname(target_var)
-                                    if target_resolved == node_ip:
-                                        alias_match = True
-                                        log_verbose(f"   DNS match: {target_var} → {target_resolved} == {node_ip}")
-                                        break
-                                except Exception as e:
-                                    log_verbose(f"   DNS resolution failed for {target_var}: {e}")
-                            if alias_match:
-                                break
-                    
-                    needs_retrain = entity_match or key_match or instance_match or node_match or alias_match
-                
-                if needs_retrain:
-                    retrained_nodes.add(f"{node} ({entity})")
-                    print(f"   ✓ Retraining {node} | {res['name']} (matched via: {'entity' if entity_match else ''} {'key' if key_match else ''} {'instance' if instance_match else ''} {'node' if node_match else ''} {'alias' if alias_match else ''})")
-                    log_verbose(f"   Retraining requested for {node} | {res['name']} (entity: {entity}, matches: entity={entity_match}, key={key_match}, instance={instance_match}, node={node_match}, alias={alias_match})")
-                elif retrain_targets:
-                    # Show why this node didn't match any retrain targets
-                    node_targets = {t for t in retrain_targets if '|' not in t and '_' not in t}
-                    if node_targets:
-                        log_verbose(f"   Skipping {node} | {res['name']} (entity: {entity})")
-                        for target in node_targets:
-                            target_canon = canonical_identity(target)
-                            log_verbose(f"      Checking target '{target}' (canon: {target_canon}) vs entity '{entity}': match={target_canon == entity}")
-                            # Attempt DNS resolution for alias resolution
-                            if '(' in node and ')' in node:
-                                node_ip = node.split('(')[1].split(')')[0].strip()
-                                target_variants = [target] + [f"{target}{d}" for d in DNS_DOMAIN_SUFFIXES if d and not target.endswith(d)]
-                                for target_var in target_variants:
-                                    try:
-                                        target_resolved = socket.gethostbyname(target_var)
-                                        log_verbose(f"         DNS: {target_var} → {target_resolved}, node IP: {node_ip}, match={target_resolved == node_ip}")
-                                    except Exception as e:
-                                        log_verbose(f"         DNS: {target_var} → failed: {e}")
-                
-                if not needs_retrain and key in manifest:
-                    forecast_result = manifest[key].get('model')
-                    if forecast_result is not None:
-                        log_verbose(f"   Loaded ENSEMBLE model from manifest: {key}")
-                        # MINIMAL UPDATE: Use recent data only (last 7 days) for forecast mode only
-                        if forecast_mode:
-                            # This incorporates latest trends while preserving learned patterns
-                            # train_df is DataFrame with 'timestamp' column, sort and get last 7 days
-                            train_df_sorted = train_df.sort_values('timestamp')
-                            cutoff_time = train_df_sorted['timestamp'].max() - pd.Timedelta(days=7)
-                            recent_train_df = train_df_sorted[train_df_sorted['timestamp'] >= cutoff_time]
-                            if len(recent_train_df) < 50:
-                                recent_train_df = train_df_sorted.tail(min(len(train_df_sorted), 7*24*6))  # Fallback: last N rows
-                        else:
-                            # Not in forecast mode, use full train_df
-                            recent_train_df = train_df
-                        # Determine plot flags based on enable_forecast_plots and enable_backtest_plots
-                        should_save_forecast = enable_forecast_plots if enable_forecast_plots is not None else (enable_plots if forecast_mode else False)
-                        should_save_backtest = enable_backtest_plots if enable_backtest_plots is not None else False
-                        forecast_result = build_ensemble_forecast_model(
-                            df_cpu=recent_train_df,
-                            df_mem=None,
-                            horizon_min=int(horizon_days * 24 * 60),
-                            model_path=None,
-                            context={'node': node, 'signal': res['name']},
-                            save_forecast_plot=should_save_forecast,
-                            save_backtest_plot=should_save_backtest,
-                            print_backtest_metrics=False,  # Don't print backtest metrics in forecast mode
-                            dump_csv_dir=dump_csv_dir,
-                            enable_plots=should_save_forecast or should_save_backtest
-                        )
-                        if forecast_result is not None:
-                            manifest[key] = {'model': forecast_result}
-                            manifest_changed = True
-                            log_verbose(f"   Minimal update applied (recent 7 days): {key}")
-                        # If show_backtest is true, compute metrics even for cached models
-                        # BUT don't update manifest - only generate plots
-                        if show_backtest:
-                            # Check if cached model has metrics
-                            has_metrics = isinstance(forecast_result, tuple) and len(forecast_result) >= 3
-                            if not has_metrics:
-                                # Compute metrics for cached model (for display only, don't save to manifest)
-                                log_verbose(f"   Computing backtest metrics for cached model (display only, not saving)...")
-                                forecast_result = build_ensemble_forecast_model(
-                                    df_cpu=train_df,
-                                    df_mem=None,
-                                    horizon_min=int(horizon_days * 24 * 60),
-                                    model_path=None,
-                                    context={'node': node, 'signal': res['name']},
-                                    save_forecast_plot=False,  # Don't save forecast plots when computing metrics for cached models
-                                    save_backtest_plot=False,  # Don't save backtest plots when computing metrics for cached models
-                                    print_backtest_metrics=False,  # Don't print backtest metrics when computing for cached models
-                                    save_model=False,  # Don't save model files in show_backtest mode
-                                    dump_csv_dir=dump_csv_dir,
-                                    enable_plots=enable_plots
-                                )
-                                # Don't update manifest in show_backtest mode - only use for display
-                                # manifest[key] = {'model': forecast_result}
-                                # manifest_changed = True
-                    else:
-                        needs_retrain = True
-                
-                if needs_retrain or key not in manifest:
-                    if key in manifest:
-                        log_verbose(f"   Retraining cached model → MINIMAL UPDATE (recent 7 days)...")
-                        # Minimal update: use recent data (last 7 days) to incorporate latest trends
-                        train_df_sorted = train_df.sort_values('timestamp')
-                        cutoff_time = train_df_sorted['timestamp'].max() - pd.Timedelta(days=7)
-                        recent_train_df = train_df_sorted[train_df_sorted['timestamp'] >= cutoff_time]
-                        if len(recent_train_df) < 50:
-                            recent_train_df = train_df_sorted.tail(min(len(train_df_sorted), 7*24*6))  # Fallback: last N rows
-                        # Determine plot flags based on enable_forecast_plots and enable_backtest_plots
-                        should_save_forecast = enable_forecast_plots if enable_forecast_plots is not None else enable_plots
-                        should_save_backtest = enable_backtest_plots if enable_backtest_plots is not None else (enable_plots and show_backtest)
-                        forecast_result = build_ensemble_forecast_model(
-                            df_cpu=recent_train_df,
-                            df_mem=None,
-                            horizon_min=int(horizon_days * 24 * 60),
-                            model_path=None,  # Don't save to individual file
-                            context={'node': node, 'signal': res['name']},
-                            save_forecast_plot=should_save_forecast,
-                            save_backtest_plot=should_save_backtest,
-                            print_backtest_metrics=show_backtest,  # Print backtest metrics when show_backtest
-                            dump_csv_dir=dump_csv_dir,
-                            enable_plots=should_save_forecast or should_save_backtest
-                        )
-                    else:
-                        log_verbose(f"   No cached model → FULL TRAINING...")
-                        # First-time training: use all data to learn patterns
-                        # Determine plot flags based on enable_forecast_plots and enable_backtest_plots
-                        should_save_forecast = enable_forecast_plots if enable_forecast_plots is not None else enable_plots
-                        should_save_backtest = enable_backtest_plots if enable_backtest_plots is not None else (enable_plots and show_backtest)
-                        forecast_result = build_ensemble_forecast_model(
-                            df_cpu=train_df,
-                            df_mem=None,
-                            horizon_min=int(horizon_days * 24 * 60),
-                            model_path=None,  # Don't save to individual file
-                            context={'node': node, 'signal': res['name']},
-                            save_forecast_plot=should_save_forecast,
-                            save_backtest_plot=should_save_backtest,
-                            enable_plots=should_save_forecast or should_save_backtest,
-                            print_backtest_metrics=show_backtest,  # Print backtest metrics when show_backtest
-                            dump_csv_dir=dump_csv_dir
-                        )
-                    if forecast_result is not None:
-                        manifest[key] = {'model': forecast_result}
-                        manifest_changed = True
-                        log_verbose(f"   Saved ENSEMBLE to manifest → {key}")
-
-                if forecast_result is None:
-                    continue
-
-                # ———— SAFE UNPACK (handles old and new cache) ————
-                # forecast_result should be a tuple from build_ensemble_forecast_model
-                if isinstance(forecast_result, tuple):
-                    if len(forecast_result) == 3:
-                        _, forecast_df, metrics = forecast_result
-                    else:  # old cache with only 2 items
-                        _, forecast_df = forecast_result
-                        metrics = {"mae_ensemble": 0.0}
-                else:
-                    # Unexpected type - skip this node
-                    log_verbose(f"   Warning: unexpected forecast_result type for {key}, skipping")
-                    continue
-
-                future_threshold = forecast_df[forecast_df['yhat'] >= res["threshold"]]
-                eta_days = 9999.0
-                if not future_threshold.empty:
-                    eta_days_calc = (future_threshold.iloc[0]['ds'] - pd.Timestamp.now()).total_seconds() / 86400
-                    # Ensure non-negative
-                    eta_days = max(0.0, eta_days_calc)
-
-                log_verbose(f"  Done → ETA: {eta_days:.1f} days | MAE: {metrics['mae_ensemble']:.6f}")
-                
-                # Collect metrics for display when show_backtest is true or when retraining (but not in forecast mode)
-                if (show_backtest or (needs_retrain and not forecast_mode)) and metrics:
-                    backtest_metrics_list.append({
-                        'node': node,
-                        'signal': res['name'],
-                        'metrics': metrics
-                    })
-
-                # ———— CRISIS ALERT ————
-                if eta_days < 30:
-                    severity = "CRITICAL" if eta_days < 3 else "WARNING" if eta_days < 7 else "SOON"
-                    crisis_results.append({
-                        "node": node,
-                        "signal": res["name"].replace("_", " "),
-                        "current": f"{current*100:.2f}%" if res["unit"] == "ratio" else f"{current/1e6:.1f} MB/s",
-                        "mae_ensemble": round(metrics.get('mae_ensemble', 0.0), 6),
-                        "hybrid_eta_days": round(max(0.0, eta_days), 1),
-                        "severity": severity
-                    })
-
-                # ———— ANOMALY DETECTION (TEMPORAL-AWARE) ————
-                # Compare actual values vs ensemble forecast to detect statistical deviations
-                # Method: Check deviation of recent actual values from predicted patterns
-                # 
-                # TEMPORAL-AWARE IMPROVEMENTS:
-                # - Compares current values to same-time historical patterns (hour, day-of-week)
-                # - Accounts for seasonality (e.g., weekend batch jobs, Monday morning spikes)
-                # - Uses BOTH absolute and percentage thresholds (avoids flagging tiny differences)
-                # - Only flags if value is ACTUALLY concerning (e.g., I/O wait > 5%, not just different)
-                # - Accounts for model confidence (low MAE = trust model more, be conservative)
-                # - For very small baselines (< 1% I/O, < 5MB/s network), uses absolute thresholds only
-                #   (percentage deviations are misleading when baseline is near zero)
-                #
-                mae_ensemble = metrics.get('mae_ensemble', 0.0)
-                
-                # Get recent actual values (last 24 hours) for anomaly detection
-                recent_window = pd.Timedelta(hours=24)
-                now = pd.Timestamp.now()
-                recent_start = now - recent_window
-                recent_actual = ts[ts.index >= recent_start]
-                
-                if len(recent_actual) >= 6:  # Need at least 6 data points (1 hour at 10min intervals)
-                    # TEMPORAL-AWARE BASELINE: Compare to same-time historical patterns
-                    # Instead of just using forecast baseline, compare to same hour + same day-of-week patterns
-                    current_hour = now.hour
-                    current_dow = now.dayofweek  # 0=Monday, 6=Sunday
-                    current_is_weekend = 1 if current_dow >= 5 else 0
-                    
-                    # Get historical data for temporal comparison (need at least 2 weeks for patterns)
-                    historical_window = pd.Timedelta(days=90)  # 3 months for reliable patterns
-                    historical_start = now - historical_window
-                    historical_ts = ts[ts.index >= historical_start]
-                    
-                    # Calculate temporal-aware baseline
-                    baseline_forecast = None
-                    temporal_baseline = None
-                    
-                    if len(historical_ts) >= 14 * 24:  # At least 2 weeks of data for temporal patterns
-                        # Same hour of day, same day of week (best match)
-                        same_time_mask = (
-                            (pd.to_datetime(historical_ts.index).hour == current_hour) &
-                            (pd.to_datetime(historical_ts.index).dayofweek == current_dow)
-                        )
-                        same_time_values = historical_ts[same_time_mask]
-                        
-                        # Same hour of day (daily pattern)
-                        same_hour_mask = pd.to_datetime(historical_ts.index).hour == current_hour
-                        same_hour_values = historical_ts[same_hour_mask]
-                        
-                        # Same day of week (weekly pattern)
-                        same_dow_mask = pd.to_datetime(historical_ts.index).dayofweek == current_dow
-                        same_dow_values = historical_ts[same_dow_mask]
-                        
-                        # Weekend vs weekday
-                        if current_is_weekend:
-                            weekend_mask = pd.to_datetime(historical_ts.index).dayofweek >= 5
-                            weekend_values = historical_ts[weekend_mask]
-                            temporal_baseline = weekend_values.mean() if len(weekend_values) > 0 else None
-                        else:
-                            weekday_mask = pd.to_datetime(historical_ts.index).dayofweek < 5
-                            weekday_values = historical_ts[weekday_mask]
-                            temporal_baseline = weekday_values.mean() if len(weekday_values) > 0 else None
-                        
-                        # Prefer same-time pattern, fallback to same-hour, then same-dow, then weekend/weekday
-                        if len(same_time_values) >= 3:
-                            temporal_baseline = same_time_values.mean()
-                        elif len(same_hour_values) >= 7:
-                            temporal_baseline = same_hour_values.mean()
-                        elif len(same_dow_values) >= 4:
-                            temporal_baseline = same_dow_values.mean()
-                    
-                    # Find the forecast value closest to now (or most recent forecast)
-                    forecast_df_sorted = forecast_df.sort_values('ds')
-                    if not forecast_df_sorted.empty:
-                        # Get the forecast value at or just before now
-                        past_forecasts = forecast_df_sorted[forecast_df_sorted['ds'] <= now]
-                        if not past_forecasts.empty:
-                            # Use the most recent past forecast as baseline
-                            baseline_forecast = past_forecasts.iloc[-1]['yhat']
-                        else:
-                            # If no past forecasts, use the earliest future forecast as proxy
-                            baseline_forecast = forecast_df_sorted.iloc[0]['yhat']
-                    
-                    # Use temporal baseline if available (more accurate for seasonality), otherwise use forecast baseline
-                    if temporal_baseline is not None and not pd.isna(temporal_baseline):
-                        baseline_forecast = temporal_baseline
-                        
-                        # Calculate statistics on recent actual values
-                        recent_mean = recent_actual.mean()
-                        recent_std = recent_actual.std()
-                        recent_max = recent_actual.max()
-                        recent_min = recent_actual.min()
-                        
-                        # Calculate deviation metrics
-                        # 1. Current value deviation from baseline forecast (both absolute and percentage)
-                        current_deviation_abs = abs(current - baseline_forecast)
-                        current_deviation_pct = abs((current - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (current_deviation_abs if current != 0 else 0)
-                        
-                        # 2. Recent mean deviation from baseline
-                        mean_deviation_abs = abs(recent_mean - baseline_forecast)
-                        mean_deviation_pct = abs((recent_mean - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (mean_deviation_abs if recent_mean != 0 else 0)
-                        
-                        # 3. Check for sudden spikes/drops (recent max/min vs baseline)
-                        spike_deviation_abs = abs(recent_max - baseline_forecast)
-                        spike_deviation = abs((recent_max - baseline_forecast) / baseline_forecast) if baseline_forecast != 0 else (spike_deviation_abs if recent_max != 0 else 0)
-                        drop_deviation_abs = abs(baseline_forecast - recent_min)
-                        drop_deviation = abs((baseline_forecast - recent_min) / baseline_forecast) if baseline_forecast != 0 else (drop_deviation_abs if recent_min != 0 else 0)
-                        
-                        # 4. Define meaningful thresholds to avoid false positives
-                        # For I/O wait (ratio): values < 1% are usually fine, > 5% is concerning
-                        # For network (bytes/sec): use percentage of threshold
-                        if res["unit"] == "ratio":
-                            min_abs_threshold = 0.01  # 1% - minimum absolute difference to care about
-                            mae_threshold = 0.05  # 5% for ratio signals
-                            concerning_threshold = 0.05  # 5% I/O wait is actually concerning
-                            baseline_too_small = baseline_forecast < 0.01  # If baseline < 1%, use absolute only
-                        else:
-                            min_abs_threshold = 5_000_000  # 5 MB/s - minimum absolute difference
-                            mae_threshold = res["threshold"] * 0.10  # 10% of threshold
-                            concerning_threshold = res["threshold"] * 0.30  # 30% of threshold is concerning
-                            baseline_too_small = baseline_forecast < 5_000_000  # If baseline < 5MB/s, use absolute only
-                        
-                        # 5. Model confidence check - if MAE is very low, model is accurate, be more conservative
-                        # If MAE is high, model is struggling, be more lenient (don't trust it as much)
-                        if res["unit"] == "ratio":
-                            mae_confidence_factor = 1.0 if mae_ensemble < 0.005 else (0.7 if mae_ensemble < 0.01 else 0.3)
-                        else:
-                            mae_confidence_factor = 1.0 if mae_ensemble < mae_threshold * 0.1 else (0.7 if mae_ensemble < mae_threshold * 0.3 else 0.3)
-                        
-                        # Anomaly detection logic - be conservative to avoid false positives
-                        # Strategy: Only flag if the value is ACTUALLY concerning, not just different
-                        
-                        # Check if current value is concerning (regardless of deviation)
-                        is_concerning_value = (
-                            (res["unit"] == "ratio" and current >= concerning_threshold) or
-                            (res["unit"] != "ratio" and current >= concerning_threshold)
-                        )
-                        
-                        # Check for significant absolute deviation
-                        has_significant_abs_diff = (
-                            current_deviation_abs >= min_abs_threshold or
-                            mean_deviation_abs >= min_abs_threshold
-                        )
-                        
-                        # For small baselines, only use absolute thresholds (percentage is misleading)
-                        # For larger baselines, use both absolute and percentage
-                        if baseline_too_small:
-                            # Small baseline: only check absolute difference AND if value is concerning
-                            is_anomaly = has_significant_abs_diff and is_concerning_value
-                        else:
-                            # Larger baseline: check both absolute and percentage deviation
-                            has_significant_pct_diff = (
-                                current_deviation_pct > 0.50 or  # 50% relative deviation
-                                mean_deviation_pct > 0.30        # 30% mean deviation
-                            )
-                            # Anomaly if: (significant absolute + significant percentage) AND (concerning value OR low model confidence)
-                            is_anomaly = (
-                                has_significant_abs_diff and
-                                has_significant_pct_diff and
-                                (is_concerning_value or mae_confidence_factor < 0.5 or mae_ensemble > mae_threshold)
-                            )
-                        
-                        if is_anomaly:
-                            # Calculate anomaly score (0-1 scale)
-                            anomaly_score = min(1.0, max(
-                                current_deviation_pct,
-                                mean_deviation_pct,
-                                spike_deviation / 2.0,
-                                drop_deviation / 2.0,
-                                min(1.0, mae_ensemble / mae_threshold) if mae_threshold > 0 else 0
-                            ))
-                            
-                            # Determine severity based on score
-                            if anomaly_score > 0.8:
-                                severity = "CRITICAL"
-                            elif anomaly_score > 0.5:
-                                severity = "WARNING"
-                            else:
-                                severity = "INFO"
-                            
-                            signal_display = res["name"].replace("_", " ")
-                            current_str = f"{current*100:.2f}%" if res["unit"] == "ratio" else f"{current/1e6:.1f} MB/s"
-                            
-                            # Create human-readable description
-                            description = format_anomaly_description(
-                                node, signal_display, current, current_str, mae_ensemble, 
-                                anomaly_score, severity, current_deviation_pct * 100, res["unit"]
-                            )
-                            
-                            anomaly_results.append({
-                                "node": node,
-                                "signal": signal_display,
-                                "current": current_str,
-                                "mae_ensemble": round(mae_ensemble, 6),
-                                "score": round(anomaly_score, 3),
-                                "severity": severity,
-                                "deviation_pct": round(current_deviation_pct * 100, 1),
-                                "description": description
-                            })
-                            
-                            log_verbose(f"   ⚠️  Anomaly detected: {node} | {res['name']} (score: {anomaly_score:.3f}, deviation: {current_deviation_pct*100:.1f}%)")
+            # Update manifest with new/updated models
+            if proc_result['model'] is not None:
+                manifest[proc_result['key']] = {'model': proc_result['model']}
+                manifest_changed = True
             
-            # Print skipped count warning after sequential processing completes (outside the loop)
-            if skipped_count > 0:
-                print(f"    ⚠ Note: {skipped_count} node(s) skipped due to insufficient data (use -v for details)")
+            # Collect backtest metrics
+            if proc_result['backtest_metrics']:
+                backtest_metrics_list.append(proc_result['backtest_metrics'])
+            
+            # Track retrained nodes
+            if proc_result['retrained_node']:
+                retrained_nodes.add(proc_result['retrained_node'])
+        
+        # Print skipped count warning after sequential processing completes
+        if skipped_count > 0:
+            print(f"    ⚠ Note: {skipped_count} node(s) skipped due to insufficient data (use -v for details)")
 
-    crisis_df = pd.DataFrame(crisis_results)
-    anomaly_df = pd.DataFrame(anomaly_results)
-    print(f"Ensemble forecasts complete: {len(crisis_results)} crises, {len(anomaly_results)} anomalies flagged.")
+    crisis_df = pd.DataFrame(crisis_results) if crisis_results else pd.DataFrame()
+    anomaly_df = pd.DataFrame(anomaly_results) if anomaly_results else pd.DataFrame()
+    print(f"\nEnsemble forecasts complete: {len(crisis_results)} crises, {len(anomaly_results)} anomalies flagged.")
+    
+    # Display healthy status if no crises or anomalies
+    if crisis_df.empty and anomaly_df.empty:
+        print("\n" + "="*80)
+        print("✅ UNIFIED CORRELATED MODEL — SYSTEM HEALTH STATUS")
+        print("="*80)
+        print("All nodes are operating within normal parameters.")
+        print("No crises predicted in the next 30 days.")
+        print("No anomalies detected in system performance metrics.")
+        print("\nSystem is healthy and stable across all monitored metrics:")
+        print("  • Host CPU, Host Memory, Pod CPU, Pod Memory")
+        print("  • Disk I/O Wait, Network Transmit Bandwidth")
+        print("  • All cross-correlations are within expected ranges")
+        print("="*80)
+    
+    # Display crisis results if any
+    if not crisis_df.empty:
+        print(f"\n{len(crisis_df)} UNIFIED CORRELATED MODEL CRISES DETECTED — ACTION REQUIRED:")
+        print("="*80)
+        print("System performance predicted to exceed 80% threshold (weighted combination of all metrics)")
+        print("="*80)
+        
+        for idx, row in crisis_df.sort_values('hybrid_eta_days').iterrows():
+            print(f"\n  Node: {row['node']}")
+            print(f"  {'─'*76}")
+            print(f"  Signal: {row.get('signal', 'System Performance')}")
+            print(f"  Current: {row['current']} | ETA: {row['hybrid_eta_days']:.1f} days | Severity: {row['severity']}")
+            
+            # Show primary metric and top contributors
+            if 'primary_metric' in row and pd.notna(row['primary_metric']):
+                print(f"  Primary contributing metric: {row['primary_metric']}")
+            
+            if 'top_contributors' in row and row['top_contributors']:
+                print(f"  Top contributing metrics:")
+                for contrib in row['top_contributors']:
+                    print(f"    • {contrib}")
+            
+            if 'metric_values' in row and row['metric_values']:
+                print(f"  Current metric values:")
+                for metric, value in row['metric_values'].items():
+                    print(f"    • {metric.replace('_', ' ').title()}: {value}")
+            
+            if 'correlations' in row and row['correlations']:
+                print(f"  Strong correlations detected:")
+                for corr in row['correlations']:
+                    print(f"    • {corr}")
+        
+        print("\nSeverity Guide:")
+        print("  • CRITICAL: System performance will exceed 80% within 3 days")
+        print("  • WARNING:  System performance will exceed 80% within 7 days")
+        print("  • SOON:     System performance will exceed 80% within 30 days")
+    
+    # Display anomaly results if any
+    if not anomaly_df.empty:
+        print(f"\n{len(anomaly_df)} UNIFIED CORRELATED MODEL ANOMALIES DETECTED:")
+        print("="*80)
+        print("System performance showing unusual patterns (multi-metric analysis)")
+        print("="*80)
+        
+        # Print detailed descriptions with specific metrics
+        for idx, row in anomaly_df.iterrows():
+            if 'description' in row and pd.notna(row['description']):
+                print(f"\n{row['description']}")
+            else:
+                # Fallback: construct description from available data
+                print(f"\n  Node: {row['node']}")
+                print(f"  {'─'*76}")
+                print(f"  Signal: {row.get('signal', 'System Performance Anomaly')}")
+                print(f"  Current: {row['current']} | Deviation: {row.get('deviation_pct', 0):.1f}% | Severity: {row['severity']}")
+                
+                if 'primary_metric' in row and pd.notna(row['primary_metric']):
+                    print(f"  Primary contributing metric: {row['primary_metric']}")
+                
+                if 'top_contributors' in row and row['top_contributors']:
+                    print(f"  Top contributing metrics:")
+                    for contrib in row['top_contributors']:
+                        print(f"    • {contrib}")
+                
+                if 'top_deviators' in row and row['top_deviators']:
+                    print(f"  Metrics showing largest deviations:")
+                    for dev in row['top_deviators']:
+                        print(f"    • {dev}")
+                
+                if 'metric_values' in row and row['metric_values']:
+                    print(f"  Current metric values:")
+                    for metric, value in row['metric_values'].items():
+                        print(f"    • {metric.replace('_', ' ').title()}: {value}")
+                
+                if 'correlations' in row and row['correlations']:
+                    print(f"  Strong correlations detected:")
+                    for corr in row['correlations']:
+                        print(f"    • {corr}")
+            
+            print("-" * 80)
+        
+        # Also show technical summary table for reference
+        if len(anomaly_df) > 0:
+            print("\n" + "="*80)
+            print("TECHNICAL SUMMARY (for detailed analysis):")
+            tech_cols = ['node', 'signal', 'current', 'mae_ensemble', 'score', 'severity', 'deviation_pct']
+            tech_cols = [c for c in tech_cols if c in anomaly_df.columns]
+            print(anomaly_df[tech_cols].to_string(index=False))
     
     # Display backtest metrics when show_backtest is true or when models were retrained (but not in forecast mode)
     # In training mode (not forecast_mode), always show backtest metrics if available
     if (show_backtest or (retrained_nodes and not forecast_mode) or not forecast_mode) and backtest_metrics_list:
         print("\n" + "="*80)
-        if retrained_nodes:
-            print("DISK I/O + NETWORK — BACKTEST METRICS (retrained models only)")
-        else:
-            print("DISK I/O + NETWORK — BACKTEST METRICS (cached models)")
+        print("UNIFIED CORRELATED ENSEMBLE MODEL — BACKTEST RESULTS")
+        print("\nSingle unified model per node:")
+        print("  • Uses ALL available metrics as features (host_cpu, host_mem, pod_cpu, pod_mem, disk_io_wait, net_tx_bw)")
+        print("  • Learns cross-correlations between all metrics")
+        print("  • Predicts composite system performance metric")
         print("="*80)
-        for item in sorted(backtest_metrics_list, key=lambda x: (x['node'], x['signal'])):
+        
+        # Process each node (now only one model per node)
+        for item in sorted(backtest_metrics_list, key=lambda x: x['node']):
             node = item['node']
-            signal = item['signal']
             metrics = item['metrics']
-            print(f"\nBacktest Metrics → {node} | {signal}:")
-            if metrics.get('mae_ensemble') is not None and not pd.isna(metrics['mae_ensemble']):
-                mae_val = metrics['mae_ensemble']
-                mape_val = metrics.get('mape_ensemble')
-                if mape_val is not None and not pd.isna(mape_val):
-                    mape_note = ""
-                    if mape_val > 50 and mae_val < 0.01:
-                        mape_note = " (MAPE inflated by small actual values)"
-                    print(f"  • mae_ensemble: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
-                else:
-                    print(f"  • mae_ensemble: {mae_val:.6f}")
-            if metrics.get('mae_prophet') is not None and not pd.isna(metrics['mae_prophet']):
-                mae_val = metrics['mae_prophet']
-                mape_val = metrics.get('mape_prophet')
-                if mape_val is not None and not pd.isna(mape_val):
-                    mape_note = ""
-                    if mape_val > 50 and mae_val < 0.01:
-                        mape_note = " (MAPE inflated by small actual values)"
-                    print(f"  • mae_prophet: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
-                else:
-                    print(f"  • mae_prophet: {mae_val:.6f}")
-            if metrics.get('mae_arima') is not None and not pd.isna(metrics['mae_arima']):
-                mae_val = metrics['mae_arima']
-                mape_val = metrics.get('mape_arima')
-                if mape_val is not None and not pd.isna(mape_val):
-                    mape_note = ""
-                    if mape_val > 50 and mae_val < 0.01:
-                        mape_note = " (MAPE inflated by small actual values)"
-                    print(f"  • mae_arima: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
-                else:
-                    print(f"  • mae_arima: {mae_val:.6f}")
-            if metrics.get('mae_lstm') is not None and not pd.isna(metrics['mae_lstm']):
-                mae_val = metrics['mae_lstm']
-                mape_val = metrics.get('mape_lstm')
-                if mape_val is not None and not pd.isna(mape_val):
-                    mape_note = ""
-                    if mape_val > 50 and mae_val < 0.01:
-                        mape_note = " (MAPE inflated by small actual values)"
-                    print(f"  • mae_lstm: {mae_val:.6f} (MAPE: {mape_val:.2f}%{mape_note})")
-                else:
-                    print(f"  • mae_lstm: {mae_val:.6f}")
             
-            # Print Expected Error Rate and Confidence Level
-            print(f"  • Expected Error Rate (%):")
-            if metrics.get('mape_ensemble') is not None and not pd.isna(metrics['mape_ensemble']):
-                print(f"    - Ensemble: {metrics['mape_ensemble']:.2f}%")
-            if metrics.get('mape_prophet') is not None and not pd.isna(metrics['mape_prophet']):
-                print(f"    - Prophet: {metrics['mape_prophet']:.2f}%")
-            if metrics.get('mape_arima') is not None and not pd.isna(metrics['mape_arima']):
-                print(f"    - ARIMA: {metrics['mape_arima']:.2f}%")
-            if metrics.get('mape_lstm') is not None and not pd.isna(metrics['mape_lstm']):
-                print(f"    - LSTM: {metrics['mape_lstm']:.2f}%")
+            print(f"\n  Node: {node}")
+            print(f"  {'─'*76}")
             
-            print(f"  • Confidence Level (1=highest, 10=lowest):")
-            if metrics.get('confidence_ensemble') is not None:
-                print(f"    - Ensemble: {metrics['confidence_ensemble']}/10")
-            if metrics.get('confidence_prophet') is not None:
-                print(f"    - Prophet: {metrics['confidence_prophet']}/10")
-            if metrics.get('confidence_arima') is not None:
-                print(f"    - ARIMA: {metrics['confidence_arima']}/10")
-            if metrics.get('confidence_lstm') is not None:
-                print(f"    - LSTM: {metrics['confidence_lstm']}/10")
+            # Features used (always show if available, or indicate if missing)
+            if metrics.get('features_used'):
+                features = metrics['features_used']
+                if features:
+                    features_str = ', '.join(features)
+                    print(f"  Features Used: {features_str}")
+                else:
+                    print(f"  Features Used: (none - model loaded from cache without feature info)")
+            else:
+                print(f"  Features Used: (not available - model may be from cache)")
             
+            # Model performance metrics - only show active models
+            model_perf = []
+            for model in ['ensemble', 'prophet', 'arima', 'lstm', 'lightgbm']:
+                mae_key = f'mae_{model}'
+                mape_key = f'mape_{model}'
+                conf_key = f'confidence_{model}'
+                
+                # Skip LSTM if not available (TensorFlow missing)
+                if model == 'lstm' and not LSTM_AVAILABLE:
+                    continue  # Don't show LSTM if TensorFlow is not available
+                
+                # Skip LightGBM if not enabled
+                if model == 'lightgbm' and not LIGHTGBM_ENABLED:
+                    continue  # Don't show LightGBM if disabled
+                
+                # Only show models that have valid metrics
+                if metrics.get(mae_key) is not None and not pd.isna(metrics[mae_key]):
+                    # For LightGBM, check if it's actually active (not skipped/disabled)
+                    if model == 'lightgbm':
+                        # Check if LightGBM was actually used (not skipped due to insufficient features)
+                        # If metrics exist but are identical to ARIMA, it's likely a fallback
+                        mae_arima = metrics.get('mae_arima')
+                        # If LightGBM MAE is identical to ARIMA MAE, it's likely a fallback - skip it
+                        if mae_arima is not None and not pd.isna(mae_arima) and abs(metrics[mae_key] - mae_arima) < 1e-10:
+                            continue  # Skip LightGBM if it's identical to ARIMA (fallback)
+                    
+                    mae_val = metrics[mae_key]
+                    mape_val = metrics.get(mape_key)
+                    conf_val = metrics.get(conf_key)
+                    
+                    model_name = model.capitalize()
+                    perf_str = f"MAE: {mae_val:.6f}"
+                    
+                    if mape_val is not None and not pd.isna(mape_val):
+                        mape_note = " (inflated)" if (mape_val > 50 and mae_val < 0.01) else ""
+                        perf_str += f" | MAPE: {mape_val:.2f}%{mape_note}"
+                    
+                    if conf_val is not None:
+                        # Add confidence description: <=2 Excellent, <=4 Good, <=6 Moderate, <=8 Low, >8 Very Low
+                        conf_desc = "Excellent" if conf_val <= 2 else "Good" if conf_val <= 4 else "Moderate" if conf_val <= 6 else "Low" if conf_val <= 8 else "Very Low"
+                        perf_str += f" | Confidence: {conf_val}/10 ({conf_desc})"
+                    
+                    model_perf.append(f"    {model_name:12s} {perf_str}")
+            
+            if model_perf:
+                print("  Model Performance:")
+                print("\n".join(model_perf))
+            
+            # Train/Test split
             if metrics.get('split_info'):
                 split_info = metrics['split_info']
-                print(f"  • Train/Test Split:")
                 train_pct = round(split_info.get('train_fraction', 0.8) * 100)
                 test_pct = 100 - train_pct
-                print(f"    - Train fraction: {train_pct}%")
-                print(f"    - Train points: {split_info.get('train_points', 0):,}")
-                print(f"    - Test points: {split_info.get('test_points', 0):,}")
+                print(f"  Train/Test Split: {train_pct}% / {test_pct}%")
+                print(f"    Train: {split_info.get('train_points', 0):,} points", end="")
                 if split_info.get('train_start'):
-                    print(f"    - Train period: {split_info['train_start']} → {split_info['train_end']}")
+                    print(f" ({split_info['train_start']} → {split_info['train_end']})")
+                else:
+                    print()
+                print(f"    Test:  {split_info.get('test_points', 0):,} points", end="")
                 if split_info.get('test_start'):
-                    print(f"    - Test period: {split_info['test_start']} → {split_info['test_end']}")
+                    print(f" ({split_info['test_start']} → {split_info['test_end']})")
+                else:
+                    print()
+        
+        # Add summary showing correlation benefits
+        print("\n" + "─"*80)
+        print("UNIFIED CORRELATED MODEL SUMMARY:")
+        total_models = len(backtest_metrics_list)
+        models_with_features = sum(1 for item in backtest_metrics_list if item['metrics'].get('features_used') and len(item['metrics'].get('features_used', [])) > 0)
+        avg_features = sum(len(item['metrics'].get('features_used', [])) for item in backtest_metrics_list if item['metrics'].get('features_used')) / max(models_with_features, 1)
+        
+        print(f"  • {total_models} unified correlated ensemble models trained (one per node)")
+        print(f"  • {models_with_features}/{total_models} models using all 6 metrics as features (avg {avg_features:.1f} features per model)")
+        print(f"  • Single model per node learns all cross-correlations:")
+        print(f"    - CPU ↔ I/O wait: High CPU usage correlates with I/O bottlenecks")
+        print(f"    - Memory ↔ Network: Memory pressure affects network performance")
+        print(f"    - Pod ↔ Host: Pod resource usage impacts host resource availability")
+        print(f"    - I/O ↔ Network: Disk I/O and network bandwidth compete for system resources")
+        print(f"  • Unified model captures system-wide relationships for better prediction accuracy")
     
     # Summary of retraining
     if retrain_targets and all_unique_nodes:
@@ -8729,49 +11219,168 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
     if k8s_clusters:
         print("\n" + "="*80)
         print(f"KUBERNETES CLUSTER MODELS (Host + Pod data per cluster) — FORECAST")
-        print(f"Forecast horizon: {effective_horizon} minutes ({horizon_display})")
+        print(f"Forecasts CPU and memory usage per Kubernetes cluster ({horizon_display} lookahead)")
+        print("Monitors: Host CPU, Host Memory, Pod CPU, Pod Memory (combined per cluster)")
         print("="*80)
         
         entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
         entity_col_p = 'entity' if 'entity' in df_pcpu.columns else 'instance'
         
-        # Load and generate forecasts for each Kubernetes cluster
-        for cluster_id, cluster_entities in sorted(k8s_clusters.items()):
-            print(f"\n  Processing Cluster: {cluster_id} ({len(cluster_entities)} nodes)")
+        # Worker function for parallel cluster processing (forecast mode)
+        def _process_single_cluster_forecast(cluster_id, cluster_entities, df_hcpu_snapshot, df_hmem_snapshot, 
+                                             df_pcpu_snapshot, df_pmem_snapshot, entity_col_h, entity_col_p,
+                                             effective_horizon, csv_dump_dir, enable_plots, enable_forecast_plots, 
+                                             enable_backtest_plots):
+            """Process a single cluster for forecast mode (designed for parallel execution)."""
+            # Suppress warnings in parallel workers
+            import warnings
+            import logging
+            warnings.simplefilter("ignore")
+            try:
+                logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+                logging.getLogger("prophet").setLevel(logging.WARNING)
+            except:
+                pass
             
-            # Filter data to this cluster's nodes
-            # cluster_entities contains canonical identities, so we need to match entities via canonical_identity
-            df_hcpu_cluster = df_hcpu[df_hcpu[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
-            df_hmem_cluster = df_hmem[df_hmem[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
-            df_pcpu_cluster = df_pcpu[df_pcpu[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
-            df_pmem_cluster = df_pmem[df_pmem[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
-            
-            # Combine host + pod data for this cluster
-            df_combined_cpu = combine_host_pod(df_hcpu_cluster, df_pcpu_cluster, 'cpu')
-            df_combined_mem = combine_host_pod(df_hmem_cluster, df_pmem_cluster, 'mem')
-            
-            if not df_combined_cpu.empty and not df_combined_mem.empty:
+            try:
+                # Filter data to this cluster's nodes
+                df_hcpu_cluster = df_hcpu_snapshot[df_hcpu_snapshot[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
+                df_hmem_cluster = df_hmem_snapshot[df_hmem_snapshot[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
+                df_pcpu_cluster = df_pcpu_snapshot[df_pcpu_snapshot[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
+                df_pmem_cluster = df_pmem_snapshot[df_pmem_snapshot[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
+                
+                # Combine host + pod data for this cluster
+                host_agg_cpu = df_hcpu_cluster.groupby('timestamp')['value'].mean().reset_index(name='host')
+                pod_agg_cpu = df_pcpu_cluster.groupby('timestamp')['value'].mean().reset_index(name='pod')
+                combined_cpu = pd.merge(host_agg_cpu, pod_agg_cpu, on='timestamp', how='outer')
+                combined_cpu['value'] = (combined_cpu['host'].fillna(0) + combined_cpu['pod'].fillna(0)) / 2
+                combined_cpu.loc[combined_cpu['host'].isna(), 'value'] = combined_cpu.loc[combined_cpu['host'].isna(), 'pod']
+                combined_cpu.loc[combined_cpu['pod'].isna(), 'value'] = combined_cpu.loc[combined_cpu['pod'].isna(), 'host']
+                df_combined_cpu = combined_cpu[['timestamp', 'value']]
+                
+                host_agg_mem = df_hmem_cluster.groupby('timestamp')['value'].mean().reset_index(name='host')
+                pod_agg_mem = df_pmem_cluster.groupby('timestamp')['value'].mean().reset_index(name='pod')
+                combined_mem = pd.merge(host_agg_mem, pod_agg_mem, on='timestamp', how='outer')
+                combined_mem['value'] = (combined_mem['host'].fillna(0) + combined_mem['pod'].fillna(0)) / 2
+                combined_mem.loc[combined_mem['host'].isna(), 'value'] = combined_mem.loc[combined_mem['host'].isna(), 'pod']
+                combined_mem.loc[combined_mem['pod'].isna(), 'value'] = combined_mem.loc[combined_mem['pod'].isna(), 'host']
+                df_combined_mem = combined_mem[['timestamp', 'value']]
+                
+                if df_combined_cpu.empty or df_combined_mem.empty:
+                    return {'cluster_id': cluster_id, 'forecast': None, 'error': 'insufficient_data'}
+                
                 # Create cluster-specific model path
                 cluster_model_path = os.path.join(MODEL_DIR, f"k8s_cluster_{sanitize_label(cluster_id)}_forecast.pkl")
                 
                 if not os.path.exists(cluster_model_path):
-                    print(f"    ⚠ Warning: Cluster model not found at {cluster_model_path}")
-                    print("       Skipping this cluster. Run with --training flag first to train models.")
-                else:
-                    _, cluster_fc, _, _ = train_or_load_ensemble(
-                        df_combined_cpu,
-                        df_combined_mem,
-                        horizon_min=effective_horizon,
-                        model_path=cluster_model_path,
-                        force_retrain=False,
-                        generate_fresh_forecast=True,
-                        dump_csv_dir=csv_dump_dir,
-                        context={'node': 'k8s_cluster', 'cluster_id': cluster_id},
-                        enable_plots=enable_plots,
-                        enable_forecast_plots=enable_forecast_plots,
-                        enable_backtest_plots=enable_backtest_plots
-                    )
-                    k8s_cluster_forecasts[cluster_id] = cluster_fc
+                    return {'cluster_id': cluster_id, 'forecast': None, 'error': 'model_not_found'}
+                
+                _, cluster_fc, _, _ = train_or_load_ensemble(
+                    df_combined_cpu,
+                    df_combined_mem,
+                    horizon_min=effective_horizon,
+                    model_path=cluster_model_path,
+                    force_retrain=False,
+                    generate_fresh_forecast=True,
+                    dump_csv_dir=csv_dump_dir,
+                    context={'node': 'k8s_cluster', 'cluster_id': cluster_id},
+                    enable_plots=enable_plots,
+                    enable_forecast_plots=enable_forecast_plots,
+                    enable_backtest_plots=enable_backtest_plots
+                )
+                
+                return {'cluster_id': cluster_id, 'forecast': cluster_fc, 'error': None}
+            except Exception as e:
+                return {'cluster_id': cluster_id, 'forecast': None, 'error': str(e)}
+        
+        # Determine number of workers
+        n_workers = MAX_WORKER_THREADS if len(k8s_clusters) > 1 else 1
+        use_parallel = n_workers > 1 and len(k8s_clusters) > 1
+        
+        if use_parallel:
+            print(f"\n  [PARALLEL] Processing {len(k8s_clusters)} cluster(s) with {n_workers} worker(s)")
+            # Create snapshots of dataframes for parallel workers
+            df_hcpu_snapshot = df_hcpu.copy()
+            df_hmem_snapshot = df_hmem.copy()
+            df_pcpu_snapshot = df_pcpu.copy()
+            df_pmem_snapshot = df_pmem.copy()
+            
+            # Process clusters in parallel
+            processed_results = Parallel(n_jobs=n_workers, verbose=0)(
+                delayed(_process_single_cluster_forecast)(
+                    cluster_id, cluster_entities, df_hcpu_snapshot, df_hmem_snapshot,
+                    df_pcpu_snapshot, df_pmem_snapshot, entity_col_h, entity_col_p,
+                    effective_horizon, csv_dump_dir, enable_plots, enable_forecast_plots,
+                    enable_backtest_plots
+                )
+                for cluster_id, cluster_entities in sorted(k8s_clusters.items())
+            )
+            
+            # Process results with clean formatting
+            successful = []
+            warnings = []
+            errors = []
+            
+            for result in processed_results:
+                cluster_id = result['cluster_id']
+                if result['error'] == 'model_not_found':
+                    warnings.append(f"  ⚠ {cluster_id}: Model not found (run --training first)")
+                elif result['error'] == 'insufficient_data':
+                    warnings.append(f"  ⚠ {cluster_id}: Insufficient data")
+                elif result['error']:
+                    errors.append(f"  ✗ {cluster_id}: {result['error']}")
+                elif result['forecast'] is not None:
+                    k8s_cluster_forecasts[cluster_id] = result['forecast']
+                    successful.append(f"  ✓ {cluster_id}")
+            
+            # Print results in organized groups
+            if successful:
+                print(f"  Completed: {len(successful)}/{len(processed_results)}")
+                for msg in successful:
+                    print(msg)
+            if warnings:
+                for msg in warnings:
+                    print(msg)
+            if errors:
+                for msg in errors:
+                    print(msg)
+        else:
+            # Sequential processing (fallback for single cluster or single worker)
+            print(f"  [SEQUENTIAL] Processing {len(k8s_clusters)} cluster(s)")
+            for cluster_id, cluster_entities in sorted(k8s_clusters.items()):
+                print(f"  Cluster: {cluster_id} ({len(cluster_entities)} nodes)")
+                # Filter data to this cluster's nodes
+                df_hcpu_cluster = df_hcpu[df_hcpu[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
+                df_hmem_cluster = df_hmem[df_hmem[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
+                df_pcpu_cluster = df_pcpu[df_pcpu[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
+                df_pmem_cluster = df_pmem[df_pmem[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
+                
+                # Combine host + pod data for this cluster
+                df_combined_cpu = combine_host_pod(df_hcpu_cluster, df_pcpu_cluster, 'cpu')
+                df_combined_mem = combine_host_pod(df_hmem_cluster, df_pmem_cluster, 'mem')
+                
+                if not df_combined_cpu.empty and not df_combined_mem.empty:
+                    # Create cluster-specific model path
+                    cluster_model_path = os.path.join(MODEL_DIR, f"k8s_cluster_{sanitize_label(cluster_id)}_forecast.pkl")
+                    
+                    if not os.path.exists(cluster_model_path):
+                        print(f"    ⚠ Warning: Cluster model not found at {cluster_model_path}")
+                        print("       Skipping this cluster. Run with --training flag first to train models.")
+                    else:
+                        _, cluster_fc, _, _ = train_or_load_ensemble(
+                            df_combined_cpu,
+                            df_combined_mem,
+                            horizon_min=effective_horizon,
+                            model_path=cluster_model_path,
+                            force_retrain=False,
+                            generate_fresh_forecast=True,
+                            dump_csv_dir=csv_dump_dir,
+                            context={'node': 'k8s_cluster', 'cluster_id': cluster_id},
+                            enable_plots=enable_plots,
+                            enable_forecast_plots=enable_forecast_plots,
+                            enable_backtest_plots=enable_backtest_plots
+                        )
+                        k8s_cluster_forecasts[cluster_id] = cluster_fc
         
         # Also create combined host forecast for all K8s nodes (for divergence calculation)
         all_k8s_entities = set()
@@ -8797,80 +11406,258 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
                     enable_backtest_plots=enable_backtest_plots
                 )
     
-    # Handle unknown_cluster nodes (have pods but cluster can't be determined)
-    if unknown_cluster_entities:
-        print("\n" + "="*80)
-        print("KUBERNETES UNKNOWN CLUSTER MODEL (Host + Pod data - cluster unknown) — FORECAST")
-        print("="*80)
-        print(f"  Processing {len(unknown_cluster_entities)} nodes with pods but unknown cluster")
-        
-        entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
-        entity_col_p = 'entity' if 'entity' in df_pcpu.columns else 'instance'
-        
-        df_hcpu_unknown = df_hcpu[df_hcpu[entity_col_h].isin(unknown_cluster_entities)].copy()
-        df_hmem_unknown = df_hmem[df_hmem[entity_col_h].isin(unknown_cluster_entities)].copy()
-        df_pcpu_unknown = df_pcpu[df_pcpu[entity_col_p].isin(unknown_cluster_entities)].copy()
-        df_pmem_unknown = df_pmem[df_pmem[entity_col_p].isin(unknown_cluster_entities)].copy()
-        
-        df_combined_cpu = combine_host_pod(df_hcpu_unknown, df_pcpu_unknown, 'cpu')
-        df_combined_mem = combine_host_pod(df_hmem_unknown, df_pmem_unknown, 'mem')
-        
-        if not df_combined_cpu.empty and not df_combined_mem.empty:
-            unknown_model_path = os.path.join(MODEL_DIR, "k8s_unknown_cluster_forecast.pkl")
-            if os.path.exists(unknown_model_path):
-                _, unknown_fc, _, _ = train_or_load_ensemble(
-                    df_combined_cpu,
-                    df_combined_mem,
-                    horizon_min=effective_horizon,
-                    model_path=unknown_model_path,
-                    force_retrain=False,
-                    generate_fresh_forecast=True,
-                    dump_csv_dir=csv_dump_dir,
-                    context={'node': 'k8s_unknown_cluster'},
-                    enable_plots=enable_plots,
-                    enable_forecast_plots=enable_forecast_plots,
-                    enable_backtest_plots=enable_backtest_plots
-                )
-                k8s_cluster_forecasts['unknown_cluster'] = unknown_fc
-            else:
-                print(f"  ⚠ Warning: Unknown cluster model not found. Run with --training flag first.")
-    
-    # ====================== STANDALONE MODEL (Host only) — FORECAST ======================
+    # ====================== UNKNOWN CLUSTER & STANDALONE MODELS — FORECAST ======================
+    # These are independent operations and can run in parallel
+    unknown_fc = None
     standalone_fc = None
     
-    if standalone_entities:
-        print("\n" + "="*80)
-        print("STANDALONE MODEL (Host data only - no Kubernetes) — FORECAST")
-        print("="*80)
+    # Worker function for unknown cluster processing
+    def _process_unknown_cluster_forecast(unknown_cluster_entities, df_hcpu_snapshot, df_hmem_snapshot,
+                                          df_pcpu_snapshot, df_pmem_snapshot, entity_col_h, entity_col_p,
+                                          effective_horizon, csv_dump_dir, enable_plots, enable_forecast_plots,
+                                          enable_backtest_plots):
+        """Process unknown cluster for forecast mode (designed for parallel execution)."""
+        import warnings
+        import logging
+        warnings.simplefilter("ignore")
+        try:
+            logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+            logging.getLogger("prophet").setLevel(logging.WARNING)
+        except:
+            pass
         
-        # Filter host data to only standalone nodes
-        entity_col = 'entity' if 'entity' in df_hcpu.columns else 'instance'
-        df_hcpu_standalone = df_hcpu[df_hcpu[entity_col].isin(standalone_entities)].copy()
-        df_hmem_standalone = df_hmem[df_hmem[entity_col].isin(standalone_entities)].copy()
+        try:
+            df_hcpu_unknown = df_hcpu_snapshot[df_hcpu_snapshot[entity_col_h].isin(unknown_cluster_entities)].copy()
+            df_hmem_unknown = df_hmem_snapshot[df_hmem_snapshot[entity_col_h].isin(unknown_cluster_entities)].copy()
+            df_pcpu_unknown = df_pcpu_snapshot[df_pcpu_snapshot[entity_col_p].isin(unknown_cluster_entities)].copy()
+            df_pmem_unknown = df_pmem_snapshot[df_pmem_snapshot[entity_col_p].isin(unknown_cluster_entities)].copy()
+            
+            host_agg_cpu = df_hcpu_unknown.groupby('timestamp')['value'].mean().reset_index(name='host')
+            pod_agg_cpu = df_pcpu_unknown.groupby('timestamp')['value'].mean().reset_index(name='pod')
+            combined_cpu = pd.merge(host_agg_cpu, pod_agg_cpu, on='timestamp', how='outer')
+            combined_cpu['value'] = (combined_cpu['host'].fillna(0) + combined_cpu['pod'].fillna(0)) / 2
+            combined_cpu.loc[combined_cpu['host'].isna(), 'value'] = combined_cpu.loc[combined_cpu['host'].isna(), 'pod']
+            combined_cpu.loc[combined_cpu['pod'].isna(), 'value'] = combined_cpu.loc[combined_cpu['pod'].isna(), 'host']
+            df_combined_cpu = combined_cpu[['timestamp', 'value']]
+            
+            host_agg_mem = df_hmem_unknown.groupby('timestamp')['value'].mean().reset_index(name='host')
+            pod_agg_mem = df_pmem_unknown.groupby('timestamp')['value'].mean().reset_index(name='pod')
+            combined_mem = pd.merge(host_agg_mem, pod_agg_mem, on='timestamp', how='outer')
+            combined_mem['value'] = (combined_mem['host'].fillna(0) + combined_mem['pod'].fillna(0)) / 2
+            combined_mem.loc[combined_mem['host'].isna(), 'value'] = combined_mem.loc[combined_mem['host'].isna(), 'pod']
+            combined_mem.loc[combined_mem['pod'].isna(), 'value'] = combined_mem.loc[combined_mem['pod'].isna(), 'host']
+            df_combined_mem = combined_mem[['timestamp', 'value']]
+            
+            if df_combined_cpu.empty or df_combined_mem.empty:
+                return {'type': 'unknown_cluster', 'forecast': None, 'error': 'insufficient_data'}
+            
+            unknown_model_path = os.path.join(MODEL_DIR, "k8s_unknown_cluster_forecast.pkl")
+            if not os.path.exists(unknown_model_path):
+                return {'type': 'unknown_cluster', 'forecast': None, 'error': 'model_not_found'}
+            
+            _, unknown_fc, _, _ = train_or_load_ensemble(
+                df_combined_cpu,
+                df_combined_mem,
+                horizon_min=effective_horizon,
+                model_path=unknown_model_path,
+                force_retrain=False,
+                generate_fresh_forecast=True,
+                dump_csv_dir=csv_dump_dir,
+                context={'node': 'k8s_unknown_cluster'},
+                enable_plots=enable_plots,
+                enable_forecast_plots=enable_forecast_plots,
+                enable_backtest_plots=enable_backtest_plots
+            )
+            
+            return {'type': 'unknown_cluster', 'forecast': unknown_fc, 'error': None}
+        except Exception as e:
+            return {'type': 'unknown_cluster', 'forecast': None, 'error': str(e)}
+    
+    # Worker function for standalone processing
+    def _process_standalone_forecast(standalone_entities, df_hcpu_snapshot, df_hmem_snapshot, entity_col,
+                                      effective_horizon, csv_dump_dir, enable_plots, enable_forecast_plots,
+                                      enable_backtest_plots):
+        """Process standalone nodes for forecast mode (designed for parallel execution)."""
+        import warnings
+        import logging
+        warnings.simplefilter("ignore")
+        try:
+            logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+            logging.getLogger("prophet").setLevel(logging.WARNING)
+        except:
+            pass
         
-        if not df_hcpu_standalone.empty and not df_hmem_standalone.empty:
+        try:
+            df_hcpu_standalone = df_hcpu_snapshot[df_hcpu_snapshot[entity_col].isin(standalone_entities)].copy()
+            df_hmem_standalone = df_hmem_snapshot[df_hmem_snapshot[entity_col].isin(standalone_entities)].copy()
+            
+            if df_hcpu_standalone.empty or df_hmem_standalone.empty:
+                return {'type': 'standalone', 'forecast': None, 'error': 'insufficient_data'}
+            
             if not os.path.exists(STANDALONE_MODEL_PATH):
-                print(f"⚠ Warning: Standalone model not found at {STANDALONE_MODEL_PATH}")
-                print("   Skipping standalone forecast. Run with --training flag first to train models.")
-                standalone_fc = None
-            else:
-                _, standalone_fc, _, _ = train_or_load_ensemble(
-                    df_hcpu_standalone,
-                    df_hmem_standalone,
-                    horizon_min=effective_horizon,
-                    model_path=STANDALONE_MODEL_PATH,
-                    force_retrain=False,
-                    generate_fresh_forecast=True,
-                    dump_csv_dir=csv_dump_dir,
-                    context={'node': 'standalone'},
-                    enable_plots=enable_plots,
-                    enable_forecast_plots=enable_forecast_plots,
-                    enable_backtest_plots=enable_backtest_plots
-                )
+                return {'type': 'standalone', 'forecast': None, 'error': 'model_not_found'}
+            
+            _, standalone_fc, _, _ = train_or_load_ensemble(
+                df_hcpu_standalone,
+                df_hmem_standalone,
+                horizon_min=effective_horizon,
+                model_path=STANDALONE_MODEL_PATH,
+                force_retrain=False,
+                generate_fresh_forecast=True,
+                dump_csv_dir=csv_dump_dir,
+                context={'node': 'standalone'},
+                enable_plots=enable_plots,
+                enable_forecast_plots=enable_forecast_plots,
+                enable_backtest_plots=enable_backtest_plots
+            )
+            
+            return {'type': 'standalone', 'forecast': standalone_fc, 'error': None}
+        except Exception as e:
+            return {'type': 'standalone', 'forecast': None, 'error': str(e)}
+    
+    # Process unknown_cluster and standalone in parallel if both exist
+    tasks_to_run = []
+    if unknown_cluster_entities:
+        tasks_to_run.append(('unknown_cluster', unknown_cluster_entities))
+    if standalone_entities:
+        tasks_to_run.append(('standalone', standalone_entities))
+    
+    if tasks_to_run:
+        use_parallel_others = len(tasks_to_run) > 1 and MAX_WORKER_THREADS > 1
+        
+        if use_parallel_others:
+            entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
+            entity_col_p = 'entity' if 'entity' in df_pcpu.columns else 'instance'
+            entity_col = 'entity' if 'entity' in df_hcpu.columns else 'instance'
+            
+            # Create snapshots for parallel workers
+            df_hcpu_snapshot = df_hcpu.copy()
+            df_hmem_snapshot = df_hmem.copy()
+            df_pcpu_snapshot = df_pcpu.copy()
+            df_pmem_snapshot = df_pmem.copy()
+            
+            # Build parallel tasks
+            parallel_tasks = []
+            for task_type, entities in tasks_to_run:
+                if task_type == 'unknown_cluster':
+                    parallel_tasks.append(
+                        delayed(_process_unknown_cluster_forecast)(
+                            entities, df_hcpu_snapshot, df_hmem_snapshot, df_pcpu_snapshot, df_pmem_snapshot,
+                            entity_col_h, entity_col_p, effective_horizon, csv_dump_dir, enable_plots,
+                            enable_forecast_plots, enable_backtest_plots
+                        )
+                    )
+                elif task_type == 'standalone':
+                    parallel_tasks.append(
+                        delayed(_process_standalone_forecast)(
+                            entities, df_hcpu_snapshot, df_hmem_snapshot, entity_col,
+                            effective_horizon, csv_dump_dir, enable_plots, enable_forecast_plots,
+                            enable_backtest_plots
+                        )
+                    )
+            
+            print(f"\n  [PARALLEL] Processing {len(tasks_to_run)} independent model(s) with {min(len(parallel_tasks), MAX_WORKER_THREADS)} worker(s)")
+            
+            # Execute in parallel
+            results = Parallel(n_jobs=min(len(parallel_tasks), MAX_WORKER_THREADS), verbose=0)(parallel_tasks)
+            
+            # Process results
+            for result in results:
+                if result['type'] == 'unknown_cluster':
+                    if result['error'] == 'model_not_found':
+                        print(f"  ⚠ Warning: Unknown cluster model not found. Run with --training flag first.")
+                    elif result['error'] == 'insufficient_data':
+                        print(f"  ⚠ Warning: Insufficient data for unknown cluster model.")
+                    elif result['error']:
+                        print(f"  ⚠ Error processing unknown cluster: {result['error']}")
+                    elif result['forecast'] is not None:
+                        k8s_cluster_forecasts['unknown_cluster'] = result['forecast']
+                        print(f"  ✓ Unknown Cluster")
+                elif result['type'] == 'standalone':
+                    if result['error'] == 'model_not_found':
+                        print(f"  ⚠ Standalone: Model not found (run --training first)")
+                    elif result['error'] == 'insufficient_data':
+                        print(f"  ⚠ Standalone: Insufficient data")
+                    elif result['error']:
+                        print(f"  ✗ Standalone: {result['error']}")
+                    elif result['forecast'] is not None:
+                        standalone_fc = result['forecast']
+                        print(f"  ✓ Standalone")
         else:
-            print("⚠ Warning: Insufficient data for standalone model")
-    else:
-        print("\n⚠ Warning: No standalone nodes found (all nodes have pods)")
+            # Sequential processing (fallback)
+            if unknown_cluster_entities:
+                print("\n" + "="*80)
+                print("KUBERNETES UNKNOWN CLUSTER MODEL (Host + Pod data - cluster unknown) — FORECAST")
+                print(f"Forecasts CPU and memory usage for nodes with pods but unknown cluster ({horizon_display} lookahead)")
+                print("Monitors: Host CPU, Host Memory, Pod CPU, Pod Memory (combined)")
+                print("="*80)
+                print(f"  Processing {len(unknown_cluster_entities)} nodes with pods but unknown cluster")
+                
+                entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
+                entity_col_p = 'entity' if 'entity' in df_pcpu.columns else 'instance'
+                
+                df_hcpu_unknown = df_hcpu[df_hcpu[entity_col_h].isin(unknown_cluster_entities)].copy()
+                df_hmem_unknown = df_hmem[df_hmem[entity_col_h].isin(unknown_cluster_entities)].copy()
+                df_pcpu_unknown = df_pcpu[df_pcpu[entity_col_p].isin(unknown_cluster_entities)].copy()
+                df_pmem_unknown = df_pmem[df_pmem[entity_col_p].isin(unknown_cluster_entities)].copy()
+                
+                df_combined_cpu = combine_host_pod(df_hcpu_unknown, df_pcpu_unknown, 'cpu')
+                df_combined_mem = combine_host_pod(df_hmem_unknown, df_pmem_unknown, 'mem')
+                
+                if not df_combined_cpu.empty and not df_combined_mem.empty:
+                    unknown_model_path = os.path.join(MODEL_DIR, "k8s_unknown_cluster_forecast.pkl")
+                    if os.path.exists(unknown_model_path):
+                        _, unknown_fc, _, _ = train_or_load_ensemble(
+                            df_combined_cpu,
+                            df_combined_mem,
+                            horizon_min=effective_horizon,
+                            model_path=unknown_model_path,
+                            force_retrain=False,
+                            generate_fresh_forecast=True,
+                            dump_csv_dir=csv_dump_dir,
+                            context={'node': 'k8s_unknown_cluster'},
+                            enable_plots=enable_plots,
+                            enable_forecast_plots=enable_forecast_plots,
+                            enable_backtest_plots=enable_backtest_plots
+                        )
+                        k8s_cluster_forecasts['unknown_cluster'] = unknown_fc
+                    else:
+                        print(f"  ⚠ Warning: Unknown cluster model not found. Run with --training flag first.")
+            
+            if standalone_entities:
+                print("\n" + "="*80)
+                print("STANDALONE MODEL (Host data only - no Kubernetes) — FORECAST")
+                print(f"Forecasts CPU and memory usage for standalone nodes ({horizon_display} lookahead)")
+                print("Monitors: Host CPU, Host Memory (no Kubernetes workloads)")
+                print("="*80)
+                
+                entity_col = 'entity' if 'entity' in df_hcpu.columns else 'instance'
+                df_hcpu_standalone = df_hcpu[df_hcpu[entity_col].isin(standalone_entities)].copy()
+                df_hmem_standalone = df_hmem[df_hmem[entity_col].isin(standalone_entities)].copy()
+                
+                if not df_hcpu_standalone.empty and not df_hmem_standalone.empty:
+                    if not os.path.exists(STANDALONE_MODEL_PATH):
+                        print(f"⚠ Warning: Standalone model not found at {STANDALONE_MODEL_PATH}")
+                        print("   Skipping standalone forecast. Run with --training flag first to train models.")
+                        standalone_fc = None
+                    else:
+                        _, standalone_fc, _, _ = train_or_load_ensemble(
+                            df_hcpu_standalone,
+                            df_hmem_standalone,
+                            horizon_min=effective_horizon,
+                            model_path=STANDALONE_MODEL_PATH,
+                            force_retrain=False,
+                            generate_fresh_forecast=True,
+                            dump_csv_dir=csv_dump_dir,
+                            context={'node': 'standalone'},
+                            enable_plots=enable_plots,
+                            enable_forecast_plots=enable_forecast_plots,
+                            enable_backtest_plots=enable_backtest_plots
+                        )
+                else:
+                    print("⚠ Warning: Insufficient data for standalone model")
+            else:
+                print("\n⚠ Warning: No standalone nodes found (all nodes have pods)")
     
     # For backward compatibility, set host_fc and pod_fc
     # Use first available cluster forecast, or unknown_cluster, or standalone
@@ -8890,7 +11677,7 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
         host_mem = k8s_host_fc['yhat'].iloc[-1]
         combined_mem = pod_fc['yhat'].iloc[-1]
         div = abs(host_mem - combined_mem)
-        print(f"\nDivergence (K8s host vs combined host+pod memory): {div:.3f}")
+        log_verbose(f"\nDivergence (K8s host vs combined host+pod memory): {div:.3f}", level=2)
     elif host_fc is not None:
         node_type = 'Kubernetes' if pod_fc is not None else 'Standalone'
         print(f"\nForecast available for {node_type} nodes")
@@ -8912,7 +11699,8 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
     disk_horizon_days = 7  # Default for disk capacity planning
     print("\n" + "="*80)
     print(f"DISK FULL PREDICTION ({disk_horizon_days}-day horizon) — FORECAST")
-    print(f"Forecast horizon: {disk_horizon_days} days (capacity planning)")
+    print(f"Forecasts when disk usage will reach 90% threshold ({disk_horizon_days}-day lookahead)")
+    print("Monitors: Disk usage percentage per node/mountpoint")
     print("="*80)
     
     q_disk = '''
@@ -8989,8 +11777,13 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
     # ====================== I/O + NETWORK CRISIS PREDICTION ======================
     print("\n" + "="*80)
     io_net_crisis_horizon_days = 7  # Default for I/O crisis detection
+    
+    # Fetch I/O and Network data once for reuse in both sections
+    io_net_data = _fetch_io_network_data(days_back=35)
+    
     print("DISK I/O + NETWORK — CRISIS PREDICTION (FORECAST)")
-    print(f"Forecast horizon: {io_net_crisis_horizon_days} days (crisis detection)")
+    print(f"Predicts when I/O and network metrics will exceed thresholds ({io_net_crisis_horizon_days}-day lookahead)")
+    print("Monitors: Disk I/O wait time, Network transmit bandwidth")
     print("="*80)
     
     crisis_df, io_net_manifest, io_net_manifest_changed = predict_io_and_network_crisis_with_backtest(
@@ -9005,19 +11798,21 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
         dump_csv_dir=csv_dump_dir,
         enable_plots=enable_plots,
         enable_forecast_plots=enable_forecast_plots,
-        enable_backtest_plots=enable_backtest_plots
+        enable_backtest_plots=enable_backtest_plots,
+        prefetched_data=io_net_data
     )
     if io_net_manifest_changed:
         save_io_net_manifest(IO_NET_MODEL_MANIFEST_PATH, io_net_manifest)
     
     # ====================== I/O + NETWORK ENSEMBLE FORECAST ======================
     print("\n" + "="*80)
-    print("DISK I/O + NETWORK — FULL ENSEMBLE FORECAST & ANOMALY DETECTION (FORECAST)")
     effective_horizon = horizon_min if horizon_min is not None else HORIZON_MIN
     horizon_hours = effective_horizon // 60
     horizon_mins = effective_horizon % 60
     horizon_display = f"{horizon_hours}h {horizon_mins}m" if horizon_hours > 0 else f"{horizon_mins}m"
-    print(f"Forecast horizon: {effective_horizon} minutes ({horizon_display})")
+    print(f"ENSEMBLE FORECAST ({horizon_display})")
+    print("Short-term ensemble forecasting and anomaly detection")
+    print("Monitors: Host CPU, Host Memory, Pod CPU, Pod Memory, I/O wait, network transmit/receive bandwidth")
     print("="*80)
     
     # Convert horizon from minutes to days (as a float to support fractional days for short horizons)
@@ -9035,7 +11830,12 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
         dump_csv_dir=csv_dump_dir,
         enable_plots=enable_plots,
         enable_forecast_plots=enable_forecast_plots,
-        enable_backtest_plots=enable_backtest_plots
+        enable_backtest_plots=enable_backtest_plots,
+        prefetched_data=io_net_data,
+        df_host_cpu=df_hcpu,
+        df_host_mem=df_hmem,
+        df_pod_cpu=df_pcpu,
+        df_pod_mem=df_pmem
     )
     if io_net_manifest_changed:
         save_io_net_manifest(IO_NET_MODEL_MANIFEST_PATH, io_net_manifest)
@@ -9043,6 +11843,8 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
     # ====================== GOLDEN ANOMALY DETECTION ======================
     print("\n" + "="*80)
     print("GOLDEN ANOMALY DETECTION — AUTONOMOUS ROOT-CAUSE ENGINE (FORECAST)")
+    print("Identifies current root-cause signals and failure patterns (last 1 hour)")
+    print("Monitors: I/O wait, inodes, network drops/saturation, TCP retransmissions, OOM kills, fork bombs, FD leaks")
     print("="*80)
     
     anomalies_df = detect_golden_anomaly_signals(hours=1)
@@ -9085,7 +11887,7 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
     print("FORECAST MODE COMPLETE")
     print("="*80)
     if enable_plots:
-        print(f"All forecast plots saved → {FORECAST_PLOTS_DIR}")
+        log_verbose(f"Plots saved to: {FORECAST_PLOTS_DIR}", level=2)
     else:
         print("Plots skipped (use --plot flag to generate plots)")
     print(f"Forecast timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -9323,28 +12125,56 @@ if __name__ == "__main__":
         horizon_hours = HORIZON_MIN // 60
         horizon_mins = HORIZON_MIN % 60
         horizon_display = f"{horizon_hours}h {horizon_mins}m" if horizon_hours > 0 else f"{horizon_mins}m"
-        print(f"Forecast horizon: {HORIZON_MIN} minutes ({horizon_display})")
-        print("="*80)
+        print(f"Forecasts CPU and memory usage per Kubernetes cluster ({horizon_display} lookahead)")
+        print("Monitors: Host CPU, Host Memory, Pod CPU, Pod Memory (combined per cluster)")
+        print("="*80 + "\n")
         
         entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
         entity_col_p = 'entity' if 'entity' in df_pcpu.columns else 'instance'
         
-        # Train separate model for each Kubernetes cluster
-        for cluster_id, cluster_entities in sorted(k8s_clusters.items()):
-            print(f"\n  Processing Cluster: {cluster_id} ({len(cluster_entities)} nodes)")
+        # Worker function for parallel cluster processing (training mode)
+        def _process_single_cluster_training(cluster_id, cluster_entities, df_hcpu_snapshot, df_hmem_snapshot,
+                                              df_pcpu_snapshot, df_pmem_snapshot, entity_col_h, entity_col_p,
+                                              force_training, show_backtest, csv_dump_dir, enable_plots,
+                                              enable_forecast_plots, enable_backtest_plots):
+            """Process a single cluster for training mode (designed for parallel execution)."""
+            # Suppress warnings in parallel workers
+            import warnings
+            import logging
+            warnings.simplefilter("ignore")
+            try:
+                logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+                logging.getLogger("prophet").setLevel(logging.WARNING)
+            except:
+                pass
             
-            # Filter data to this cluster's nodes
-            # cluster_entities contains canonical identities, so we need to match entities via canonical_identity
-            df_hcpu_cluster = df_hcpu[df_hcpu[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
-            df_hmem_cluster = df_hmem[df_hmem[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
-            df_pcpu_cluster = df_pcpu[df_pcpu[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
-            df_pmem_cluster = df_pmem[df_pmem[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
-            
-            # Combine host + pod data for this cluster
-            df_combined_cpu = combine_host_pod(df_hcpu_cluster, df_pcpu_cluster, 'cpu')
-            df_combined_mem = combine_host_pod(df_hmem_cluster, df_pmem_cluster, 'mem')
-            
-            if not df_combined_cpu.empty and not df_combined_mem.empty:
+            try:
+                # Filter data to this cluster's nodes
+                df_hcpu_cluster = df_hcpu_snapshot[df_hcpu_snapshot[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
+                df_hmem_cluster = df_hmem_snapshot[df_hmem_snapshot[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
+                df_pcpu_cluster = df_pcpu_snapshot[df_pcpu_snapshot[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
+                df_pmem_cluster = df_pmem_snapshot[df_pmem_snapshot[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
+                
+                # Combine host + pod data for this cluster
+                host_agg_cpu = df_hcpu_cluster.groupby('timestamp')['value'].mean().reset_index(name='host')
+                pod_agg_cpu = df_pcpu_cluster.groupby('timestamp')['value'].mean().reset_index(name='pod')
+                combined_cpu = pd.merge(host_agg_cpu, pod_agg_cpu, on='timestamp', how='outer')
+                combined_cpu['value'] = (combined_cpu['host'].fillna(0) + combined_cpu['pod'].fillna(0)) / 2
+                combined_cpu.loc[combined_cpu['host'].isna(), 'value'] = combined_cpu.loc[combined_cpu['host'].isna(), 'pod']
+                combined_cpu.loc[combined_cpu['pod'].isna(), 'value'] = combined_cpu.loc[combined_cpu['pod'].isna(), 'host']
+                df_combined_cpu = combined_cpu[['timestamp', 'value']]
+                
+                host_agg_mem = df_hmem_cluster.groupby('timestamp')['value'].mean().reset_index(name='host')
+                pod_agg_mem = df_pmem_cluster.groupby('timestamp')['value'].mean().reset_index(name='pod')
+                combined_mem = pd.merge(host_agg_mem, pod_agg_mem, on='timestamp', how='outer')
+                combined_mem['value'] = (combined_mem['host'].fillna(0) + combined_mem['pod'].fillna(0)) / 2
+                combined_mem.loc[combined_mem['host'].isna(), 'value'] = combined_mem.loc[combined_mem['host'].isna(), 'pod']
+                combined_mem.loc[combined_mem['pod'].isna(), 'value'] = combined_mem.loc[combined_mem['pod'].isna(), 'host']
+                df_combined_mem = combined_mem[['timestamp', 'value']]
+                
+                if df_combined_cpu.empty or df_combined_mem.empty:
+                    return {'cluster_id': cluster_id, 'forecast': None, 'metrics': None, 'saved': False, 'error': 'insufficient_data'}
+                
                 # Create cluster-specific model path
                 cluster_model_path = os.path.join(MODEL_DIR, f"k8s_cluster_{sanitize_label(cluster_id)}_forecast.pkl")
                 
@@ -9362,22 +12192,122 @@ if __name__ == "__main__":
                     enable_backtest_plots=enable_backtest_plots
                 )
                 
-                k8s_cluster_forecasts[cluster_id] = cluster_fc
-                k8s_cluster_metrics[cluster_id] = cluster_metrics
-                k8s_cluster_saved[cluster_id] = cluster_saved
+                return {'cluster_id': cluster_id, 'forecast': cluster_fc, 'metrics': cluster_metrics, 
+                        'saved': cluster_saved, 'error': None}
+            except Exception as e:
+                return {'cluster_id': cluster_id, 'forecast': None, 'metrics': None, 'saved': False, 'error': str(e)}
+        
+        # Determine number of workers
+        n_workers = MAX_WORKER_THREADS if len(k8s_clusters) > 1 else 1
+        use_parallel = n_workers > 1 and len(k8s_clusters) > 1
+        
+        if use_parallel:
+            print(f"\n  [PARALLEL] Processing {len(k8s_clusters)} cluster(s) with {n_workers} worker(s)")
+            # Create snapshots of dataframes for parallel workers
+            df_hcpu_snapshot = df_hcpu.copy()
+            df_hmem_snapshot = df_hmem.copy()
+            df_pcpu_snapshot = df_pcpu.copy()
+            df_pmem_snapshot = df_pmem.copy()
+            
+            # Process clusters in parallel
+            processed_results = Parallel(n_jobs=n_workers, verbose=0)(
+                delayed(_process_single_cluster_training)(
+                    cluster_id, cluster_entities, df_hcpu_snapshot, df_hmem_snapshot,
+                    df_pcpu_snapshot, df_pmem_snapshot, entity_col_h, entity_col_p,
+                    force_training, show_backtest, csv_dump_dir, enable_plots,
+                    enable_forecast_plots, enable_backtest_plots
+                )
+                for cluster_id, cluster_entities in sorted(k8s_clusters.items())
+            )
+            
+            # Process results with clean formatting
+            successful = []
+            warnings = []
+            errors = []
+            metrics_to_show = []
+            
+            for result in processed_results:
+                cluster_id = result['cluster_id']
+                if result['error'] == 'insufficient_data':
+                    warnings.append(f"  ⚠ {cluster_id}: Insufficient data")
+                elif result['error']:
+                    errors.append(f"  ✗ {cluster_id}: {result['error']}")
+                else:
+                    k8s_cluster_forecasts[cluster_id] = result['forecast']
+                    k8s_cluster_metrics[cluster_id] = result['metrics']
+                    k8s_cluster_saved[cluster_id] = result['saved']
+                    successful.append(f"  ✓ {cluster_id}")
+                    
+                    if (force_training or show_backtest) and result['metrics']:
+                        metrics_to_show.append((cluster_id, result['metrics']))
+            
+            # Print results in organized groups
+            if successful:
+                print(f"  Completed: {len(successful)}/{len(processed_results)}")
+                for msg in successful:
+                    print(msg)
+            
+            # Show metrics if requested
+            if metrics_to_show:
+                print(f"\n  Model Metrics:")
+                for cluster_id, metrics in metrics_to_show:
+                    print(f"    {cluster_id}:")
+                    train_pct = round(metrics.get('split_info', {}).get('train_fraction', 0.8) * 100) if metrics.get('split_info') else 80
+                    test_pct = 100 - train_pct
+                    if metrics.get('split_info'):
+                        split_info = metrics['split_info']
+                        print(f"      Train/Test: {train_pct}% / {test_pct}% ({split_info.get('train_points', 0):,} / {split_info.get('test_points', 0):,} points)")
+                    # Show key metrics only
+                    for key in ['mae_ensemble', 'mae_prophet', 'mae_arima', 'mae_lstm', 'mae_lightgbm']:
+                        if metrics.get(key) is not None and not pd.isna(metrics[key]):
+                            print(f"      {key}: {metrics[key]:.6f}")
+            
+            if warnings:
+                for msg in warnings:
+                    print(msg)
+            if errors:
+                for msg in errors:
+                    print(msg)
+        else:
+            # Sequential processing (fallback for single cluster or single worker)
+            print(f"  [SEQUENTIAL] Processing {len(k8s_clusters)} cluster(s)")
+            for cluster_id, cluster_entities in sorted(k8s_clusters.items()):
+                print(f"  Cluster: {cluster_id} ({len(cluster_entities)} nodes)")
+                # Filter data to this cluster's nodes
+                df_hcpu_cluster = df_hcpu[df_hcpu[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
+                df_hmem_cluster = df_hmem[df_hmem[entity_col_h].apply(canonical_identity).isin(cluster_entities)].copy()
+                df_pcpu_cluster = df_pcpu[df_pcpu[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
+                df_pmem_cluster = df_pmem[df_pmem[entity_col_p].apply(canonical_identity).isin(cluster_entities)].copy()
                 
-                if (force_training or show_backtest) and cluster_metrics:
-                    print(f"    Cluster '{cluster_id}' Model Metrics:")
-                    for k, v in cluster_metrics.items():
-                        if k == 'split_info' and isinstance(v, dict):
-                            print(f"      • Train/Test Split:")
-                            print(f"        - Train fraction: {v.get('train_fraction', 0)*100:.0f}%")
-                            print(f"        - Train points: {v.get('train_points', 0):,}")
-                            print(f"        - Test points: {v.get('test_points', 0):,}")
-                        elif isinstance(v, (int, float)):
-                            print(f"      • {k}: {v:.6f}")
-            else:
-                print(f"    ⚠ Warning: Insufficient data for cluster '{cluster_id}'")
+                # Combine host + pod data for this cluster
+                df_combined_cpu = combine_host_pod(df_hcpu_cluster, df_pcpu_cluster, 'cpu')
+                df_combined_mem = combine_host_pod(df_hmem_cluster, df_pmem_cluster, 'mem')
+                
+                if not df_combined_cpu.empty and not df_combined_mem.empty:
+                    # Create cluster-specific model path
+                    cluster_model_path = os.path.join(MODEL_DIR, f"k8s_cluster_{sanitize_label(cluster_id)}_forecast.pkl")
+                    
+                    _, cluster_fc, cluster_metrics, cluster_saved = train_or_load_ensemble(
+                        df_combined_cpu,
+                        df_combined_mem,
+                        horizon_min=HORIZON_MIN,
+                        model_path=cluster_model_path,
+                        force_retrain=force_training,
+                        show_backtest=show_backtest,
+                        dump_csv_dir=csv_dump_dir,
+                        context={'node': 'k8s_cluster', 'cluster_id': cluster_id},
+                        enable_plots=enable_plots,
+                        enable_forecast_plots=enable_forecast_plots,
+                        enable_backtest_plots=enable_backtest_plots
+                    )
+                    
+                    k8s_cluster_forecasts[cluster_id] = cluster_fc
+                    k8s_cluster_metrics[cluster_id] = cluster_metrics
+                    k8s_cluster_saved[cluster_id] = cluster_saved
+                    
+                    # Metrics are shown in backtest metrics section, skip verbose output here
+                else:
+                    print(f"    ⚠ Warning: Insufficient data for cluster '{cluster_id}'")
         
         # Also create combined host forecast for all K8s nodes (for divergence calculation)
         all_k8s_entities = set()
@@ -9387,6 +12317,15 @@ if __name__ == "__main__":
         if all_k8s_entities:
             df_hcpu_all_k8s = df_hcpu[df_hcpu[entity_col_h].isin(all_k8s_entities)].copy()
             df_hmem_all_k8s = df_hmem[df_hmem[entity_col_h].isin(all_k8s_entities)].copy()
+            
+            # Diagnostic: Show data reduction at filtering step
+            log_debug(f"DEBUG k8s_host_all: After filtering to K8s entities:", level=2)
+            log_debug(f"  df_hcpu_all_k8s: {len(df_hcpu_all_k8s)} rows (from {len(df_hcpu)} raw rows)", level=2)
+            log_debug(f"  df_hmem_all_k8s: {len(df_hmem_all_k8s)} rows (from {len(df_hmem)} raw rows)", level=2)
+            log_debug(f"  K8s entities: {sorted(all_k8s_entities)}", level=2)
+            if len(df_hmem_all_k8s) < len(df_hcpu_all_k8s) * 0.5:
+                log_verbose(f"  ⚠️ Warning: Memory data has significantly fewer rows than CPU data ({len(df_hmem_all_k8s)} vs {len(df_hcpu_all_k8s)})", level=1)
+                log_verbose(f"  This suggests memory data has gaps or fewer entities reporting", level=1)
             
             _, k8s_host_fc, _, _ = train_or_load_ensemble(
                 df_hcpu_all_k8s,
@@ -9402,25 +12341,55 @@ if __name__ == "__main__":
                 enable_backtest_plots=enable_backtest_plots
             )
     
-    # Handle unknown_cluster nodes (have pods but cluster can't be determined)
-    if unknown_cluster_entities:
-        print("\n" + "="*80)
-        print("KUBERNETES UNKNOWN CLUSTER MODEL (Host + Pod data - cluster unknown)")
-        print("="*80)
-        print(f"  Processing {len(unknown_cluster_entities)} nodes with pods but unknown cluster")
+    # ====================== UNKNOWN CLUSTER & STANDALONE MODELS ======================
+    # These are independent operations and can run in parallel
+    unknown_fc = None
+    unknown_metrics = None
+    unknown_saved = False
+    standalone_fc = None
+    standalone_metrics = None
+    standalone_saved = False
+    
+    # Worker function for unknown cluster processing (training mode)
+    def _process_unknown_cluster_training(unknown_cluster_entities, df_hcpu_snapshot, df_hmem_snapshot,
+                                          df_pcpu_snapshot, df_pmem_snapshot, entity_col_h, entity_col_p,
+                                          force_training, show_backtest, csv_dump_dir, enable_plots,
+                                          enable_forecast_plots, enable_backtest_plots):
+        """Process unknown cluster for training mode (designed for parallel execution)."""
+        import warnings
+        import logging
+        warnings.simplefilter("ignore")
+        try:
+            logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+            logging.getLogger("prophet").setLevel(logging.WARNING)
+        except:
+            pass
         
-        entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
-        entity_col_p = 'entity' if 'entity' in df_pcpu.columns else 'instance'
-        
-        df_hcpu_unknown = df_hcpu[df_hcpu[entity_col_h].isin(unknown_cluster_entities)].copy()
-        df_hmem_unknown = df_hmem[df_hmem[entity_col_h].isin(unknown_cluster_entities)].copy()
-        df_pcpu_unknown = df_pcpu[df_pcpu[entity_col_p].isin(unknown_cluster_entities)].copy()
-        df_pmem_unknown = df_pmem[df_pmem[entity_col_p].isin(unknown_cluster_entities)].copy()
-        
-        df_combined_cpu = combine_host_pod(df_hcpu_unknown, df_pcpu_unknown, 'cpu')
-        df_combined_mem = combine_host_pod(df_hmem_unknown, df_pmem_unknown, 'mem')
-        
-        if not df_combined_cpu.empty and not df_combined_mem.empty:
+        try:
+            df_hcpu_unknown = df_hcpu_snapshot[df_hcpu_snapshot[entity_col_h].isin(unknown_cluster_entities)].copy()
+            df_hmem_unknown = df_hmem_snapshot[df_hmem_snapshot[entity_col_h].isin(unknown_cluster_entities)].copy()
+            df_pcpu_unknown = df_pcpu_snapshot[df_pcpu_snapshot[entity_col_p].isin(unknown_cluster_entities)].copy()
+            df_pmem_unknown = df_pmem_snapshot[df_pmem_snapshot[entity_col_p].isin(unknown_cluster_entities)].copy()
+            
+            host_agg_cpu = df_hcpu_unknown.groupby('timestamp')['value'].mean().reset_index(name='host')
+            pod_agg_cpu = df_pcpu_unknown.groupby('timestamp')['value'].mean().reset_index(name='pod')
+            combined_cpu = pd.merge(host_agg_cpu, pod_agg_cpu, on='timestamp', how='outer')
+            combined_cpu['value'] = (combined_cpu['host'].fillna(0) + combined_cpu['pod'].fillna(0)) / 2
+            combined_cpu.loc[combined_cpu['host'].isna(), 'value'] = combined_cpu.loc[combined_cpu['host'].isna(), 'pod']
+            combined_cpu.loc[combined_cpu['pod'].isna(), 'value'] = combined_cpu.loc[combined_cpu['pod'].isna(), 'host']
+            df_combined_cpu = combined_cpu[['timestamp', 'value']]
+            
+            host_agg_mem = df_hmem_unknown.groupby('timestamp')['value'].mean().reset_index(name='host')
+            pod_agg_mem = df_pmem_unknown.groupby('timestamp')['value'].mean().reset_index(name='pod')
+            combined_mem = pd.merge(host_agg_mem, pod_agg_mem, on='timestamp', how='outer')
+            combined_mem['value'] = (combined_mem['host'].fillna(0) + combined_mem['pod'].fillna(0)) / 2
+            combined_mem.loc[combined_mem['host'].isna(), 'value'] = combined_mem.loc[combined_mem['host'].isna(), 'pod']
+            combined_mem.loc[combined_mem['pod'].isna(), 'value'] = combined_mem.loc[combined_mem['pod'].isna(), 'host']
+            df_combined_mem = combined_mem[['timestamp', 'value']]
+            
+            if df_combined_cpu.empty or df_combined_mem.empty:
+                return {'type': 'unknown_cluster', 'forecast': None, 'metrics': None, 'saved': False, 'error': 'insufficient_data'}
+            
             unknown_model_path = os.path.join(MODEL_DIR, "k8s_unknown_cluster_forecast.pkl")
             _, unknown_fc, unknown_metrics, unknown_saved = train_or_load_ensemble(
                 df_combined_cpu,
@@ -9435,26 +12404,33 @@ if __name__ == "__main__":
                 enable_forecast_plots=enable_forecast_plots,
                 enable_backtest_plots=enable_backtest_plots
             )
-            k8s_cluster_forecasts['unknown_cluster'] = unknown_fc
-            k8s_cluster_metrics['unknown_cluster'] = unknown_metrics
-            k8s_cluster_saved['unknown_cluster'] = unknown_saved
+            
+            return {'type': 'unknown_cluster', 'forecast': unknown_fc, 'metrics': unknown_metrics,
+                    'saved': unknown_saved, 'error': None}
+        except Exception as e:
+            return {'type': 'unknown_cluster', 'forecast': None, 'metrics': None, 'saved': False, 'error': str(e)}
     
-    # ====================== STANDALONE MODEL (Host only) ======================
-    standalone_fc = None
-    standalone_metrics = None
-    standalone_saved = False
-    
-    if standalone_entities:
-        print("\n" + "="*80)
-        print("STANDALONE MODEL (Host data only - no Kubernetes)")
-        print("="*80)
+    # Worker function for standalone processing (training mode)
+    def _process_standalone_training(standalone_entities, df_hcpu_snapshot, df_hmem_snapshot, entity_col,
+                                      force_training, show_backtest, csv_dump_dir, enable_plots,
+                                      enable_forecast_plots, enable_backtest_plots):
+        """Process standalone nodes for training mode (designed for parallel execution)."""
+        import warnings
+        import logging
+        warnings.simplefilter("ignore")
+        try:
+            logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
+            logging.getLogger("prophet").setLevel(logging.WARNING)
+        except:
+            pass
         
-        # Filter host data to only standalone nodes
-        entity_col = 'entity' if 'entity' in df_hcpu.columns else 'instance'
-        df_hcpu_standalone = df_hcpu[df_hcpu[entity_col].isin(standalone_entities)].copy()
-        df_hmem_standalone = df_hmem[df_hmem[entity_col].isin(standalone_entities)].copy()
-        
-        if not df_hcpu_standalone.empty and not df_hmem_standalone.empty:
+        try:
+            df_hcpu_standalone = df_hcpu_snapshot[df_hcpu_snapshot[entity_col].isin(standalone_entities)].copy()
+            df_hmem_standalone = df_hmem_snapshot[df_hmem_snapshot[entity_col].isin(standalone_entities)].copy()
+            
+            if df_hcpu_standalone.empty or df_hmem_standalone.empty:
+                return {'type': 'standalone', 'forecast': None, 'metrics': None, 'saved': False, 'error': 'insufficient_data'}
+            
             _, standalone_fc, standalone_metrics, standalone_saved = train_or_load_ensemble(
                 df_hcpu_standalone,
                 df_hmem_standalone,
@@ -9469,26 +12445,183 @@ if __name__ == "__main__":
                 enable_backtest_plots=enable_backtest_plots
             )
             
-            if (force_training or show_backtest) and standalone_metrics:
-                print("Standalone Model Metrics:")
-                for k, v in standalone_metrics.items():
-                    if k == 'split_info' and isinstance(v, dict):
-                        print(f"  • Train/Test Split:")
-                        print(f"    - Train fraction: {v.get('train_fraction', 0)*100:.0f}%")
-                        print(f"    - Train points: {v.get('train_points', 0):,}")
-                        print(f"    - Test points: {v.get('test_points', 0):,}")
-                        if v.get('train_start'):
-                            print(f"    - Train period: {v['train_start']} → {v['train_end']}")
-                        if v.get('test_start'):
-                            print(f"    - Test period: {v['test_start']} → {v['test_end']}")
-                    elif isinstance(v, (int, float)):
-                        print(f"  • {k}: {v:.6f}")
+            return {'type': 'standalone', 'forecast': standalone_fc, 'metrics': standalone_metrics,
+                    'saved': standalone_saved, 'error': None}
+        except Exception as e:
+            return {'type': 'standalone', 'forecast': None, 'metrics': None, 'saved': False, 'error': str(e)}
+    
+    # Process unknown_cluster and standalone in parallel if both exist
+    tasks_to_run = []
+    if unknown_cluster_entities:
+        tasks_to_run.append(('unknown_cluster', unknown_cluster_entities))
+    if standalone_entities:
+        tasks_to_run.append(('standalone', standalone_entities))
+    
+    if tasks_to_run:
+        use_parallel_others = len(tasks_to_run) > 1 and MAX_WORKER_THREADS > 1
+        
+        if use_parallel_others:
+            entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
+            entity_col_p = 'entity' if 'entity' in df_pcpu.columns else 'instance'
+            entity_col = 'entity' if 'entity' in df_hcpu.columns else 'instance'
+            
+            # Create snapshots for parallel workers
+            df_hcpu_snapshot = df_hcpu.copy()
+            df_hmem_snapshot = df_hmem.copy()
+            df_pcpu_snapshot = df_pcpu.copy()
+            df_pmem_snapshot = df_pmem.copy()
+            
+            # Build parallel tasks
+            parallel_tasks = []
+            for task_type, entities in tasks_to_run:
+                if task_type == 'unknown_cluster':
+                    parallel_tasks.append(
+                        delayed(_process_unknown_cluster_training)(
+                            entities, df_hcpu_snapshot, df_hmem_snapshot, df_pcpu_snapshot, df_pmem_snapshot,
+                            entity_col_h, entity_col_p, force_training, show_backtest, csv_dump_dir, enable_plots,
+                            enable_forecast_plots, enable_backtest_plots
+                        )
+                    )
+                elif task_type == 'standalone':
+                    parallel_tasks.append(
+                        delayed(_process_standalone_training)(
+                            entities, df_hcpu_snapshot, df_hmem_snapshot, entity_col,
+                            force_training, show_backtest, csv_dump_dir, enable_plots, enable_forecast_plots,
+                            enable_backtest_plots
+                        )
+                    )
+            
+            print(f"\n  [PARALLEL] Processing {len(tasks_to_run)} independent model(s) with {min(len(parallel_tasks), MAX_WORKER_THREADS)} worker(s)")
+            
+            # Execute in parallel
+            results = Parallel(n_jobs=min(len(parallel_tasks), MAX_WORKER_THREADS), verbose=0)(parallel_tasks)
+            
+            # Process results
+            for result in results:
+                if result['type'] == 'unknown_cluster':
+                    if result['error'] == 'insufficient_data':
+                        print(f"  ⚠ Warning: Insufficient data for unknown cluster model.")
+                    elif result['error']:
+                        print(f"  ⚠ Error processing unknown cluster: {result['error']}")
                     else:
-                        print(f"  • {k}: {v}")
+                        k8s_cluster_forecasts['unknown_cluster'] = result['forecast']
+                        k8s_cluster_metrics['unknown_cluster'] = result['metrics']
+                        k8s_cluster_saved['unknown_cluster'] = result['saved']
+                        print(f"  ✓ Processed Unknown Cluster")
+                elif result['type'] == 'standalone':
+                    if result['error'] == 'insufficient_data':
+                        print(f"  ⚠ Warning: Insufficient data for standalone model.")
+                    elif result['error']:
+                        print(f"  ⚠ Error processing standalone: {result['error']}")
+                    else:
+                        standalone_fc = result['forecast']
+                        standalone_metrics = result['metrics']
+                        standalone_saved = result['saved']
+                        
+                        if (force_training or show_backtest) and standalone_metrics:
+                            print(f"\n  Standalone Model Metrics:")
+                            train_pct = round(standalone_metrics.get('split_info', {}).get('train_fraction', 0.8) * 100) if standalone_metrics.get('split_info') else 80
+                            test_pct = 100 - train_pct
+                            if standalone_metrics.get('split_info'):
+                                split_info = standalone_metrics['split_info']
+                                print(f"    Train/Test: {train_pct}% / {test_pct}% ({split_info.get('train_points', 0):,} / {split_info.get('test_points', 0):,} points)")
+                            # Show key metrics only
+                            for key in ['mae_ensemble', 'mae_prophet', 'mae_arima', 'mae_lstm']:
+                                if standalone_metrics.get(key) is not None and not pd.isna(standalone_metrics[key]):
+                                    print(f"    {key}: {standalone_metrics[key]:.6f}")
+                        print(f"  ✓ Standalone")
         else:
-            print("⚠ Warning: Insufficient data for standalone model")
-    else:
-        print("\n⚠ Warning: No standalone nodes found (all nodes have pods)")
+            # Sequential processing (fallback)
+            if unknown_cluster_entities:
+                print("\n" + "="*80)
+                print("KUBERNETES UNKNOWN CLUSTER MODEL (Host + Pod data - cluster unknown)")
+                horizon_hours = HORIZON_MIN // 60
+                horizon_mins = HORIZON_MIN % 60
+                horizon_display = f"{horizon_hours}h {horizon_mins}m" if horizon_hours > 0 else f"{horizon_mins}m"
+                print(f"Forecasts CPU and memory usage for nodes with pods but unknown cluster ({horizon_display} lookahead)")
+                print("Monitors: Host CPU, Host Memory, Pod CPU, Pod Memory (combined)")
+                print("="*80)
+                print(f"  Processing {len(unknown_cluster_entities)} nodes with pods but unknown cluster")
+                
+                entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
+                entity_col_p = 'entity' if 'entity' in df_pcpu.columns else 'instance'
+                
+                df_hcpu_unknown = df_hcpu[df_hcpu[entity_col_h].isin(unknown_cluster_entities)].copy()
+                df_hmem_unknown = df_hmem[df_hmem[entity_col_h].isin(unknown_cluster_entities)].copy()
+                df_pcpu_unknown = df_pcpu[df_pcpu[entity_col_p].isin(unknown_cluster_entities)].copy()
+                df_pmem_unknown = df_pmem[df_pmem[entity_col_p].isin(unknown_cluster_entities)].copy()
+                
+                df_combined_cpu = combine_host_pod(df_hcpu_unknown, df_pcpu_unknown, 'cpu')
+                df_combined_mem = combine_host_pod(df_hmem_unknown, df_pmem_unknown, 'mem')
+                
+                if not df_combined_cpu.empty and not df_combined_mem.empty:
+                    unknown_model_path = os.path.join(MODEL_DIR, "k8s_unknown_cluster_forecast.pkl")
+                    _, unknown_fc, unknown_metrics, unknown_saved = train_or_load_ensemble(
+                        df_combined_cpu,
+                        df_combined_mem,
+                        horizon_min=HORIZON_MIN,
+                        model_path=unknown_model_path,
+                        force_retrain=force_training,
+                        show_backtest=show_backtest,
+                        dump_csv_dir=csv_dump_dir,
+                        context={'node': 'k8s_unknown_cluster'},
+                        enable_plots=enable_plots,
+                        enable_forecast_plots=enable_forecast_plots,
+                        enable_backtest_plots=enable_backtest_plots
+                    )
+                    k8s_cluster_forecasts['unknown_cluster'] = unknown_fc
+                    k8s_cluster_metrics['unknown_cluster'] = unknown_metrics
+                    k8s_cluster_saved['unknown_cluster'] = unknown_saved
+            
+            if standalone_entities:
+                print("\n" + "="*80)
+                print("STANDALONE MODEL (Host data only - no Kubernetes)")
+                horizon_hours = HORIZON_MIN // 60
+                horizon_mins = HORIZON_MIN % 60
+                horizon_display = f"{horizon_hours}h {horizon_mins}m" if horizon_hours > 0 else f"{horizon_mins}m"
+                print(f"Forecasts CPU and memory usage for standalone nodes ({horizon_display} lookahead)")
+                print("Monitors: Host CPU, Host Memory (no Kubernetes workloads)")
+                print("="*80)
+                
+                entity_col = 'entity' if 'entity' in df_hcpu.columns else 'instance'
+                df_hcpu_standalone = df_hcpu[df_hcpu[entity_col].isin(standalone_entities)].copy()
+                df_hmem_standalone = df_hmem[df_hmem[entity_col].isin(standalone_entities)].copy()
+                
+                if not df_hcpu_standalone.empty and not df_hmem_standalone.empty:
+                    _, standalone_fc, standalone_metrics, standalone_saved = train_or_load_ensemble(
+                        df_hcpu_standalone,
+                        df_hmem_standalone,
+                        horizon_min=HORIZON_MIN,
+                        model_path=STANDALONE_MODEL_PATH,
+                        force_retrain=force_training,
+                        show_backtest=show_backtest,
+                        dump_csv_dir=csv_dump_dir,
+                        context={'node': 'standalone'},
+                        enable_plots=enable_plots,
+                        enable_forecast_plots=enable_forecast_plots,
+                        enable_backtest_plots=enable_backtest_plots
+                    )
+                    
+                    if (force_training or show_backtest) and standalone_metrics:
+                        print("Standalone Model Metrics:")
+                        for k, v in standalone_metrics.items():
+                            if k == 'split_info' and isinstance(v, dict):
+                                print(f"  • Train/Test Split:")
+                                print(f"    - Train fraction: {v.get('train_fraction', 0)*100:.0f}%")
+                                print(f"    - Train points: {v.get('train_points', 0):,}")
+                                print(f"    - Test points: {v.get('test_points', 0):,}")
+                                if v.get('train_start'):
+                                    print(f"    - Train period: {v['train_start']} → {v['train_end']}")
+                                if v.get('test_start'):
+                                    print(f"    - Test period: {v['test_start']} → {v['test_end']}")
+                            elif isinstance(v, (int, float)):
+                                print(f"  • {k}: {v:.6f}")
+                            else:
+                                print(f"  • {k}: {v}")
+                else:
+                    print("⚠ Warning: Insufficient data for standalone model")
+            else:
+                print("\n⚠ Warning: No standalone nodes found (all nodes have pods)")
     
     # For backward compatibility, set host_fc and pod_fc
     # Use first available cluster forecast, or unknown_cluster, or standalone
@@ -9508,7 +12641,7 @@ if __name__ == "__main__":
         host_mem = k8s_host_fc['yhat'].iloc[-1]
         combined_mem = pod_fc['yhat'].iloc[-1]
         div = abs(host_mem - combined_mem)
-        print(f"\nDivergence (K8s host vs combined host+pod memory): {div:.3f}")
+        log_verbose(f"\nDivergence (K8s host vs combined host+pod memory): {div:.3f}", level=2)
     elif host_fc is not None:
         node_type = 'Kubernetes' if pod_fc is not None else 'Standalone'
         print(f"\nForecast available for {node_type} nodes")
@@ -9628,80 +12761,75 @@ if __name__ == "__main__":
             print(f"  To retrain specific nodes, use: --disk-retrain host02,host03")
             print(f"  To retrain specific mounts, use: --disk-retrain host02:/,worker01:/home")
         elif (disk_retrained_nodes or show_backtest or (manifest_changed and disk_metrics)) and disk_metrics:
-            print("\n" + "="*80)
             # Distinguish between explicit retraining and first-time training
             is_first_training = disk_retrained_nodes and not disk_retrain_targets and manifest_changed
-            if disk_retrained_nodes and not is_first_training:
-                print("DISK FULL PREDICTION — BACKTEST METRICS (retrained models only)")
-            elif is_first_training or (manifest_changed and not disk_retrained_nodes):
-                print("DISK FULL PREDICTION — BACKTEST METRICS (newly trained models)")
-            else:
-                print("DISK FULL PREDICTION — BACKTEST METRICS (cached models)")
-            print("="*80)
             
-            # Show which nodes/mounts were retrained or all if show_backtest or first training
-            if disk_retrained_nodes and not is_first_training:
-                print("\nRetrained nodes/mounts:")
-                for retrained in sorted(disk_retrained_nodes):
-                    # Format: "node | mountpoint"
-                    if '|' in retrained:
-                        node_part, mount_part = retrained.split('|', 1)
-                        node_part = node_part.strip()
-                        mount_part = mount_part.strip()
-                        print(f"  ✓ {node_part} | {mount_part}")
-                    else:
-                        print(f"  ✓ {retrained}")
-            elif is_first_training:
-                print("\nAll nodes/mounts (newly trained models):")
-                for retrained in sorted(disk_retrained_nodes):
-                    # Format: "node | mountpoint"
-                    if '|' in retrained:
-                        node_part, mount_part = retrained.split('|', 1)
-                        node_part = node_part.strip()
-                        mount_part = mount_part.strip()
-                        print(f"  • {node_part} | {mount_part}")
-                    else:
-                        print(f"  • {retrained}")
-            elif show_backtest or (manifest_changed and not disk_retrained_nodes):
-                if manifest_changed:
-                    print("\nAll nodes/mounts (newly trained models):")
-                else:
-                    print("\nAll nodes/mounts (cached models):")
-                for (entity, mountpoint), _ in df_disk.groupby(['entity', df_disk.get('filesystem', 'mountpoint')]):
-                    entity_rows = df_disk[(df_disk['entity'] == entity) & (df_disk.get('filesystem', df_disk.get('mountpoint')) == mountpoint)]
-                    if 'raw_instance' in entity_rows.columns and not entity_rows['raw_instance'].dropna().empty:
-                        raw_label = entity_rows['raw_instance'].dropna().iloc[-1]
-                        display_name = canonical_node_label(entity, with_ip=True, raw_label=raw_label)
-                    else:
-                        display_name = entity
-                    print(f"  • {display_name} | {mountpoint}")
+            # Show aggregated metrics in standardized format
+            print(f"\n  Node: Aggregated | Signal: DISK_FULL")
+            print(f"  {'─'*76}")
             
-            # Show aggregated metrics
-            if disk_retrained_nodes and not is_first_training:
-                print("\nAggregated Backtest Metrics (across all retrained models):")
-            elif is_first_training or (manifest_changed and not disk_retrained_nodes):
-                print("\nAggregated Backtest Metrics (across all newly trained models):")
-            else:
-                print("\nAggregated Backtest Metrics (across all cached models):")
-            if disk_metrics.get('mae_ensemble'):
-                print(f"  • mae_ensemble: {disk_metrics['mae_ensemble']:.6f}")
-            if disk_metrics.get('mae_linear'):
-                print(f"  • mae_linear: {disk_metrics['mae_linear']:.6f}")
-            if disk_metrics.get('mae_prophet'):
-                print(f"  • mae_prophet: {disk_metrics['mae_prophet']:.6f}")
+            # Model performance metrics
+            model_perf = []
+            if disk_metrics.get('mae_ensemble') is not None:
+                mae_val = disk_metrics['mae_ensemble']
+                mape_val = disk_metrics.get('mape_ensemble')
+                conf_val = disk_metrics.get('confidence_ensemble')
+                perf_str = f"MAE: {mae_val:.6f}"
+                if mape_val is not None and not pd.isna(mape_val):
+                    mape_note = " (inflated)" if (mape_val > 50 and mae_val < 0.01) else ""
+                    perf_str += f" | MAPE: {mape_val:.2f}%{mape_note}"
+                if conf_val is not None:
+                    # Add confidence description: <=2 Excellent, <=4 Good, <=6 Moderate, <=8 Low, >8 Very Low
+                    conf_desc = "Excellent" if conf_val <= 2 else "Good" if conf_val <= 4 else "Moderate" if conf_val <= 6 else "Low" if conf_val <= 8 else "Very Low"
+                    perf_str += f" | Confidence: {conf_val}/10 ({conf_desc})"
+                model_perf.append(f"    {'Ensemble':12s} {perf_str}")
+            if disk_metrics.get('mae_linear') is not None:
+                mae_val = disk_metrics['mae_linear']
+                mape_val = disk_metrics.get('mape_linear')
+                conf_val = disk_metrics.get('confidence_linear')
+                perf_str = f"MAE: {mae_val:.6f}"
+                if mape_val is not None and not pd.isna(mape_val):
+                    mape_note = " (inflated)" if (mape_val > 50 and mae_val < 0.01) else ""
+                    perf_str += f" | MAPE: {mape_val:.2f}%{mape_note}"
+                if conf_val is not None:
+                    # Add confidence description: <=2 Excellent, <=4 Good, <=6 Moderate, <=8 Low, >8 Very Low
+                    conf_desc = "Excellent" if conf_val <= 2 else "Good" if conf_val <= 4 else "Moderate" if conf_val <= 6 else "Low" if conf_val <= 8 else "Very Low"
+                    perf_str += f" | Confidence: {conf_val}/10 ({conf_desc})"
+                model_perf.append(f"    {'Linear':12s} {perf_str}")
+            if disk_metrics.get('mae_prophet') is not None:
+                mae_val = disk_metrics['mae_prophet']
+                mape_val = disk_metrics.get('mape_prophet')
+                conf_val = disk_metrics.get('confidence_prophet')
+                perf_str = f"MAE: {mae_val:.6f}"
+                if mape_val is not None and not pd.isna(mape_val):
+                    mape_note = " (inflated)" if (mape_val > 50 and mae_val < 0.01) else ""
+                    perf_str += f" | MAPE: {mape_val:.2f}%{mape_note}"
+                if conf_val is not None:
+                    # Add confidence description: <=2 Excellent, <=4 Good, <=6 Moderate, <=8 Low, >8 Very Low
+                    conf_desc = "Excellent" if conf_val <= 2 else "Good" if conf_val <= 4 else "Moderate" if conf_val <= 6 else "Low" if conf_val <= 8 else "Very Low"
+                    perf_str += f" | Confidence: {conf_val}/10 ({conf_desc})"
+                model_perf.append(f"    {'Prophet':12s} {perf_str}")
             
+            if model_perf:
+                print("  Model Performance:")
+                print("\n".join(model_perf))
+            
+            # Train/Test split
             if disk_metrics.get('split_info'):
                 split_info = disk_metrics['split_info']
-                print(f"  • Train/Test Split:")
                 train_pct = round(split_info['train_fraction'] * 100)
                 test_pct = 100 - train_pct
-                print(f"    - Train fraction: {train_pct}%")
-                print(f"    - Train points: {split_info['train_points']:,}")
-                print(f"    - Test points: {split_info['test_points']:,}")
+                print(f"  Train/Test Split: {train_pct}% / {test_pct}%")
+                print(f"    Train: {split_info.get('train_points', 0):,} points", end="")
                 if split_info.get('train_start'):
-                    print(f"    - Train period: {split_info['train_start']} → {split_info['train_end']}")
+                    print(f" ({split_info['train_start']} → {split_info['train_end']})")
+                else:
+                    print()
+                print(f"    Test:  {split_info.get('test_points', 0):,} points", end="")
                 if split_info.get('test_start'):
-                    print(f"    - Test period: {split_info['test_start']} → {split_info['test_end']}")
+                    print(f" ({split_info['test_start']} → {split_info['test_end']})")
+                else:
+                    print()
             
             # Show retrain summary
             if disk_retrain_targets:
@@ -9737,6 +12865,8 @@ if __name__ == "__main__":
     # ====================== ROOT-CAUSE ANOMALY ENGINE ======================
     print("\n" + "="*80)
     print("GOLDEN ANOMALY DETECTION — AUTONOMOUS ROOT-CAUSE ENGINE")
+    print("Identifies current root-cause signals and failure patterns (last 1 hour)")
+    print("Monitors: I/O wait, inodes, network drops/saturation, TCP retransmissions, OOM kills, fork bombs, FD leaks")
     print("="*80)
 
     anomalies_df = detect_golden_anomaly_signals(hours=1)
@@ -9750,9 +12880,14 @@ if __name__ == "__main__":
 
     # ====================== I/O + NETWORK CRISIS PREDICTION ======================
     io_net_crisis_horizon_days = 7  # Default for I/O crisis detection
+    
+    # Fetch I/O and Network data once for reuse in both sections
+    io_net_data = _fetch_io_network_data(days_back=35)
+    
     print("\n" + "="*80)
-    print("DISK I/O + NETWORK CRISIS PREDICTION (user-visible slowness)")
-    print(f"Forecast horizon: {io_net_crisis_horizon_days} days (crisis detection)")
+    print(f"7-DAY CRISIS FORECAST (threshold detection)")
+    print("Predicts when metrics will exceed thresholds (7-day lookahead)")
+    print("Monitors: I/O wait, network transmit/receive bandwidth")
     print("="*80)
 
     crisis_df, io_net_manifest, io_net_manifest_changed = predict_io_and_network_crisis_with_backtest(
@@ -9767,7 +12902,8 @@ if __name__ == "__main__":
         dump_csv_dir=csv_dump_dir,
         enable_plots=enable_plots,
         enable_forecast_plots=enable_forecast_plots,
-        enable_backtest_plots=enable_backtest_plots
+        enable_backtest_plots=enable_backtest_plots,
+        prefetched_data=io_net_data
     )
     if io_net_manifest_changed:
         save_io_net_manifest(IO_NET_MODEL_MANIFEST_PATH, io_net_manifest)
@@ -9779,19 +12915,19 @@ if __name__ == "__main__":
         print(f"\n{len(crisis_df)} CRISES IMMINENT — ACTION REQUIRED:")
         print(crisis_df.sort_values("hybrid_eta_days")[['node', 'signal', 'current', 'hybrid_eta_days', 'severity']].to_string(index=False))
 
-    print(f"\nForecast plots + models → {FORECAST_PLOTS_DIR}/")
-    print("Your estate is now protected by real, validated, visualized AI.")
+    log_verbose(f"\nPlots and models saved to: {FORECAST_PLOTS_DIR}/", level=2)
     print("="*80)
 
     # ====================== I/O + NETWORK — FULL ENSEMBLE (CPU/MEM GRADE) ======================
     print("\n" + "="*80)
-    print("DISK I/O + NETWORK — FULL ENSEMBLE FORECAST & ANOMALY DETECTION")
     # Use horizon_override if set, otherwise use HORIZON_MIN
     effective_horizon_min = horizon_override if horizon_override is not None else HORIZON_MIN
     horizon_hours = effective_horizon_min // 60
     horizon_mins = effective_horizon_min % 60
     horizon_display = f"{horizon_hours}h {horizon_mins}m" if horizon_hours > 0 else f"{horizon_mins}m"
-    print(f"Forecast horizon: {effective_horizon_min} minutes ({horizon_display})")
+    print(f"ENSEMBLE FORECAST ({horizon_display})")
+    print("Short-term ensemble forecasting and anomaly detection")
+    print("Monitors: Host CPU, Host Memory, Pod CPU, Pod Memory, I/O wait, network transmit/receive bandwidth")
     print("="*80)
     
     # Convert horizon from minutes to days (as a float to support fractional days for short horizons)
@@ -9809,7 +12945,12 @@ if __name__ == "__main__":
         dump_csv_dir=csv_dump_dir,
         enable_plots=enable_plots,
         enable_forecast_plots=enable_forecast_plots,
-        enable_backtest_plots=enable_backtest_plots
+        enable_backtest_plots=enable_backtest_plots,
+        prefetched_data=io_net_data,
+        df_host_cpu=df_hcpu,
+        df_host_mem=df_hmem,
+        df_pod_cpu=df_pcpu,
+        df_pod_mem=df_pmem
     )
     if io_net_manifest_changed:
         save_io_net_manifest(IO_NET_MODEL_MANIFEST_PATH, io_net_manifest)
@@ -9850,7 +12991,7 @@ if __name__ == "__main__":
         print("\nI/O and Network layers are healthy, predictable, and anomaly-free")
         print("I/O and Network monitoring is operating within expected parameters.")
 
-    print(f"\nAll plots + models saved → {FORECAST_PLOTS_DIR}/")
+    log_verbose(f"\nPlots and models saved to: {FORECAST_PLOTS_DIR}/", level=2)
     print("Metrics AI — Unified forecasting and anomaly detection across CPU • Memory • Disk • I/O • Network")
     print("="*80)
 

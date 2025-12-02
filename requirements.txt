@@ -5,3 +5,4 @@ prophet
 scikit-learn
 statsmodels
 pyyaml
+lightgbm
