@@ -4,7 +4,7 @@ Dual-Layer + Classification AI for Kubernetes
 - Host layer (full node)
 - Pod layer (apps only)
 - Classification model (per-node IsolationForest)
-- FULL ENSEMBLE: Prophet + ARIMA + LSTM
+- Ensemble models: Prophet + ARIMA + LSTM + LightGBM
 - CPU-only LSTM (no GPU needed)
 - All config via environment variables
 """
@@ -30,17 +30,13 @@ from sklearn.metrics import classification_report, mean_absolute_error, mean_squ
 # --- Matplotlib (optional) ---
 try:
     import matplotlib
-    # Use non-interactive backend for headless/server environments (prevents display errors)
     import os
     if 'DISPLAY' not in os.environ and os.name != 'nt':
-        # No display available (headless/server) - use Agg backend
         matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    # Only use interactive mode if display is available
     try:
         plt.ion()
     except:
-        # Interactive mode failed (headless), but plotting will still work with Agg backend
         pass
     import matplotlib.dates as mdates
     MATPLOTLIB_AVAILABLE = True
@@ -73,11 +69,7 @@ from joblib import Parallel, delayed
 import warnings
 
 # Suppress expected warnings from third-party libraries
-# These warnings are expected and don't indicate actual problems
-# Set default action to ignore all warnings, then we can be selective if needed
 warnings.simplefilter("ignore")
-# But allow important warnings through (we can add specific ones later if needed)
-# The above will suppress: FutureWarning, UserWarning, ConvergenceWarning, ValueWarning, etc.
 
 # Suppress cmdstanpy INFO messages (very verbose in parallel mode)
 try:
@@ -117,7 +109,7 @@ except (ImportError, OSError) as e:
     print("  On macOS, if you get libomp.dylib error, run: brew install libomp")
     LIGHTGBM_AVAILABLE = False
 
-# Additional general warning suppression (catch-all for any remaining warnings)
+# Additional warning suppression
 warnings.filterwarnings("ignore")
 
 # ----------------------------------------------------------------------
@@ -1700,7 +1692,7 @@ def generate_forecast_from_cached_model(df_cpu, df_mem, cached_result, horizon_m
         try:
             # Prepare features for LightGBM (same as training)
             feature_cols = ['hour', 'is_weekend']
-            # Note: In cached model forecast, we may not have all features available
+            # Cached model forecast may not have all features available
             # Use what we have from pdf
             for col in pdf.columns:
                 if col not in ['ds', 'y'] and col not in feature_cols:
@@ -1962,7 +1954,7 @@ def train_or_load_ensemble(df_cpu, df_mem, horizon_min, model_path, force_retrai
                         print(f"✗ Fallback also failed: {e2}")
             # Generate backtest plots when show_backtest is True OR enable_backtest_plots is True (even with cached models)
             # In training mode, also generate forecast plots
-            # Note: should_generate_backtest is already set above if generate_fresh_forecast was True
+            # should_generate_backtest is already set above if generate_fresh_forecast was True
             if should_generate_backtest:
                 # Determine if we should generate forecast plots too (in training mode)
                 # Set defaults if not provided
@@ -2718,7 +2710,7 @@ def fetch_and_preprocess_data(query, start_hours_ago=START_HOURS_AGO, step=STEP)
     for col in ['mountpoint', 'filesystem']:
         if col in df.columns:
             group_cols.append(col)
-    # NOTE: Do NOT include cluster labels in group_cols - they can vary for the same entity
+    # Do not include cluster labels in group_cols - they can vary for the same entity
     # and would cause incorrect row reduction. Instead, preserve them via aggregation.
     cluster_label_cols = ['cluster', 'cluster_id', 'cluster_name', 'cluster_label', 
                          'kubernetes_cluster', 'k8s_cluster']
@@ -2774,7 +2766,7 @@ def _process_single_disk(entity, mountpoint, group, mount_col, horizon_days, thr
     """
     Process a single disk (node/mountpoint) for disk capacity forecasting.
     
-    This worker function is designed for parallel execution and handles:
+    Process:
     - Disk usage time series data processing
     - Linear trend analysis for capacity planning
     - Prophet-based forecasting for disk full prediction
@@ -3590,7 +3582,6 @@ def predict_disk_full_days(df_disk, horizon_days=7, threshold_pct=90.0,
                         test_starts.append(str(test_ts.index[0]))
                         test_ends.append(str(test_ts.index[-1]))
                     
-                    # Helper function to calculate MAPE
                     def calculate_mape(actual, predicted):
                         """Calculate MAPE (Mean Absolute Percentage Error)"""
                         if actual is None or predicted is None or len(actual) == 0 or len(predicted) == 0:
@@ -4393,7 +4384,7 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
     main_agg['is_weekend'] = (main_agg['timestamp'].dt.dayofweek>=5).astype(int)
     
     # Merge legacy df_mem if provided (for backward compatibility)
-    # Note: New feature merging logic below handles all features including host/pod metrics
+    # Feature merging logic handles all features including host/pod metrics
     if df_mem is not None:
         # Diagnostic: Log raw memory data statistics before aggregation
         if context and context.get('node') == 'k8s_host_all':
@@ -4462,7 +4453,7 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
         # For Host/Pod metrics, determine from node context and whether df_mem is provided
         elif 'host' in node.lower() or 'standalone' in node.lower():
             # If df_mem is provided, we're predicting memory; otherwise CPU
-            # Note: The column in main_agg is 'mem' (not 'host_mem') when df_mem is merged
+            # Column in main_agg is 'mem' (not 'host_mem') when df_mem is merged
             # The column is 'target' when df_cpu is aggregated
             if df_mem is not None:
                 # We're predicting memory - use 'mem' since that's what gets merged into main_agg
@@ -4472,7 +4463,7 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
                 target_metric_name = 'target'
         elif 'pod' in node.lower() or 'cluster' in node.lower():
             # For pod/cluster, if df_mem is provided, we're predicting pod memory; otherwise pod CPU
-            # Note: The actual column name is 'mem' (not 'pod_mem') when df_mem is merged, and 'target' (not 'pod_cpu') when df_cpu is aggregated
+            # Column name is 'mem' (not 'pod_mem') when df_mem is merged, and 'target' (not 'pod_cpu') when df_cpu is aggregated
             if df_mem is not None:
                 target_metric_name = 'mem'  # Column name is 'mem' after merge, not 'pod_mem'
             else:
@@ -4659,7 +4650,7 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
     feature_cols = ['timestamp', target, 'hour', 'is_weekend']
     available_features = []
     
-    # Log what columns we have in main_agg for debugging
+    # Log columns in main_agg for debugging
     log_debug(f"  main_agg columns after all merges: {list(main_agg.columns)}", level=2)
     
     for feat in ['mem', 'host_cpu', 'host_mem', 'pod_cpu', 'pod_mem', 'disk_io_wait', 'net_tx_bw']:
@@ -4729,11 +4720,8 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
         if len(pdf) > 0:
             log_debug(f"  pdf y stats: mean={pdf['y'].mean():.6f}, std={pdf['y'].std():.6f}, min={pdf['y'].min():.6f}, max={pdf['y'].max():.6f}", level=2)
 
-    # --- Train/Test Split (time-ordered, chronological) ---
-    # Time-ordered split ensures training data is always from the past and test data from the future
-    # This prevents data leakage and provides realistic backtest evaluation
-    # IMPORTANT: pdf should only contain rows with non-null y values after dropna
-    # If pdf still has many rows but only a few have actual y values, the split will be wrong
+    # Train/Test Split (time-ordered, chronological)
+    # pdf must only contain rows with non-null y values after dropna
     if len(pdf) == 0:
         raise ValueError(f"No valid data points after dropna for target '{target}'. Check data quality.")
     
@@ -4923,7 +4911,7 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
             # Train LightGBM with accuracy-focused parameters
             # Use early stopping for optimal performance - adapts to data complexity automatically
             # For large datasets, use more capacity but let early stopping prevent overfitting
-            # Note: If too few features (< 4), LightGBM may not be very useful - consider disabling
+            # LightGBM requires at least 4 features
             n_samples = len(X_train)
             n_features = len(feature_cols)
             
@@ -5069,7 +5057,7 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
     # Simple average of all active models
     ensemble = sum(active_models) / num_models
 
-    # --- ROBUST BACKTEST — WORKS WITH 1m, 5m, 10m, 1h DATA ---
+    # Backtest evaluation
     # Initialize backtest variables
     p_back = None
     a_pred = None
@@ -5453,7 +5441,7 @@ def build_ensemble_forecast_model(df_cpu, df_mem=None,
         if len(p_back_clean) > 0 and len(a_pred_clean) > 0:
             if p_back_clean.equals(a_pred_clean):
                 log_verbose(f"Warning: Prophet and ARIMA backtest predictions are identical - possible fallback issue", level=1)
-                # Log sample values to help debug
+                # Log sample values for debugging
                 if len(p_back_clean) > 10:
                     log_debug(f"  Sample Prophet values: {p_back_clean.head(5).tolist()}", level=2)
                     log_debug(f"  Sample ARIMA values: {a_pred_clean.head(5).tolist()}", level=2)
@@ -7774,7 +7762,7 @@ def _process_single_node_io_crisis(inst, group, name, thresholds, units, test_da
     """
     Process a single node for I/O and Network crisis prediction.
     
-    This worker function is designed for parallel execution and handles:
+    Process:
     - I/O wait time (DISK_IO_WAIT) and Network transmit bandwidth (NET_TX_BW) forecasting
     - Prophet-based crisis detection (predicts when metrics will exceed thresholds)
     - Hybrid ETA calculation (combines linear trend and Prophet predictions)
@@ -8069,7 +8057,15 @@ def _process_single_node_io_crisis(inst, group, name, thresholds, units, test_da
                 
                 # Filter out near-zero values (both actual and predicted)
                 # Use a threshold based on the data scale
-                data_scale = max(test_final.abs().mean(), pred_final.abs().mean(), 1e-10)
+                # Ensure series are not empty before calling mean()
+                test_mean = test_final.abs().mean() if len(test_final) > 0 else 1e-10
+                pred_mean = pred_final.abs().mean() if len(pred_final) > 0 else 1e-10
+                # Handle NaN from mean() if series contains only NaN values
+                if pd.isna(test_mean) or np.isinf(test_mean):
+                    test_mean = 1e-10
+                if pd.isna(pred_mean) or np.isinf(pred_mean):
+                    pred_mean = 1e-10
+                data_scale = max(test_mean, pred_mean, 1e-10)
                 threshold = max(1e-10, data_scale * 1e-6)  # Adaptive threshold
                 
                 valid_mask = (test_final.abs() > threshold) | (pred_final.abs() > threshold)
@@ -8118,7 +8114,15 @@ def _process_single_node_io_crisis(inst, group, name, thresholds, units, test_da
                         test_final = test_valid[final_valid]
                         pred_final = pred_valid[final_valid]
                         
-                        data_scale = max(test_final.abs().mean(), pred_final.abs().mean(), 1e-10)
+                        # Ensure series are not empty before calling mean()
+                        test_mean = test_final.abs().mean() if len(test_final) > 0 else 1e-10
+                        pred_mean = pred_final.abs().mean() if len(pred_final) > 0 else 1e-10
+                        # Handle NaN from mean() if series contains only NaN values
+                        if pd.isna(test_mean) or np.isinf(test_mean):
+                            test_mean = 1e-10
+                        if pd.isna(pred_mean) or np.isinf(pred_mean):
+                            pred_mean = 1e-10
+                        data_scale = max(test_mean, pred_mean, 1e-10)
                         threshold = max(1e-10, data_scale * 1e-6)
                         
                         valid_mask = (test_final.abs() > threshold) | (pred_final.abs() > threshold)
@@ -8909,7 +8913,7 @@ def _process_single_node_io_ensemble(instance, group, res, test_days, horizon_da
     """
     Process a single node for I/O and Network ensemble forecasting and anomaly detection.
     
-    This worker function is designed for parallel execution and handles:
+    Process:
     - Full ensemble forecasting (Prophet + ARIMA + LSTM) for DISK_IO_WAIT and NET_TX_BW
     - Crisis detection (predicts when metrics will exceed thresholds)
     - Anomaly detection (statistical deviation analysis)
@@ -10168,11 +10172,11 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
     # Collect backtest metrics when show_backtest is true
     backtest_metrics_list = []
     
-    # ========== STEP 1: Fetch ALL metrics first ==========
+    # Step 1: Fetch all metrics
     # Store all dataframes for unified model training
     io_net_dataframes = {}
     
-    # Log Host/Pod metrics status (these are prefetched from calling function)
+    # Log Host/Pod metrics status
     host_cpu_count = len(df_host_cpu) if df_host_cpu is not None and not df_host_cpu.empty else 0
     host_mem_count = len(df_host_mem) if df_host_mem is not None and not df_host_mem.empty else 0
     pod_cpu_count = len(df_pod_cpu) if df_pod_cpu is not None and not df_pod_cpu.empty else 0
@@ -10234,7 +10238,7 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
         # Store dataframe for cross-feature usage
         io_net_dataframes[res['name']] = df
     
-    # ========== STEP 2: Collect all unique nodes across all metrics ==========
+    # Step 2: Collect all unique nodes across all metrics
     all_unique_entities = set()
     for res_name, df in io_net_dataframes.items():
         group_col = 'entity' if 'entity' in df.columns else 'instance'
@@ -10253,7 +10257,7 @@ def predict_io_and_network_ensemble(horizon_days=7, test_days=7, plot_dir="forec
     print(f"    • Learns cross-correlations between all metrics")
     print(f"    • Predicts composite system performance metric")
     
-    # ========== STEP 3: For each node, train ONE unified ensemble model using ALL 6 metrics ==========
+    # Step 3: Train unified ensemble model per node using all 6 metrics
     # Group by node (entity) and process each node with all metrics together
     total_nodes = len(all_unique_entities)
     # Pre-compute retrain matching logic
@@ -11001,7 +11005,6 @@ def dispatch_alerts(disk_alerts, crisis_df, anomaly_df, anomalies_df, classifica
     if alert_webhook is None and pushgateway_url is None:
         return
     
-    # Verbose logging: display disk_alerts metadata structure for diagnostics
     if should_verbose():
         print(f"\n[VERBOSE] disk_alerts type: {type(disk_alerts)}")
     if disk_alerts is not None and hasattr(disk_alerts, 'empty'):
@@ -11188,7 +11191,6 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
         print(f"  • Kubernetes nodes (cluster unknown): {len(unknown_cluster_entities)}")
     print(f"  • Standalone nodes (no pods): {len(standalone_entities)}")
     
-    # Helper function to combine host + pod data
     def combine_host_pod(host_df, pod_df, metric_name):
         """Combine host and pod data by averaging them per timestamp"""
         if host_df.empty and pod_df.empty:
@@ -11226,12 +11228,11 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
         entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
         entity_col_p = 'entity' if 'entity' in df_pcpu.columns else 'instance'
         
-        # Worker function for parallel cluster processing (forecast mode)
         def _process_single_cluster_forecast(cluster_id, cluster_entities, df_hcpu_snapshot, df_hmem_snapshot, 
                                              df_pcpu_snapshot, df_pmem_snapshot, entity_col_h, entity_col_p,
                                              effective_horizon, csv_dump_dir, enable_plots, enable_forecast_plots, 
                                              enable_backtest_plots):
-            """Process a single cluster for forecast mode (designed for parallel execution)."""
+            """Process a single cluster for forecast mode."""
             # Suppress warnings in parallel workers
             import warnings
             import logging
@@ -11346,7 +11347,7 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
                     print(msg)
         else:
             # Sequential processing (fallback for single cluster or single worker)
-            print(f"  [SEQUENTIAL] Processing {len(k8s_clusters)} cluster(s)")
+            print(f"\n  [SEQUENTIAL] Processing {len(k8s_clusters)} cluster(s)\n")
             for cluster_id, cluster_entities in sorted(k8s_clusters.items()):
                 print(f"  Cluster: {cluster_id} ({len(cluster_entities)} nodes)")
                 # Filter data to this cluster's nodes
@@ -11411,12 +11412,11 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
     unknown_fc = None
     standalone_fc = None
     
-    # Worker function for unknown cluster processing
     def _process_unknown_cluster_forecast(unknown_cluster_entities, df_hcpu_snapshot, df_hmem_snapshot,
                                           df_pcpu_snapshot, df_pmem_snapshot, entity_col_h, entity_col_p,
                                           effective_horizon, csv_dump_dir, enable_plots, enable_forecast_plots,
                                           enable_backtest_plots):
-        """Process unknown cluster for forecast mode (designed for parallel execution)."""
+        """Process unknown cluster for forecast mode."""
         import warnings
         import logging
         warnings.simplefilter("ignore")
@@ -11473,11 +11473,10 @@ def run_forecast_mode(alert_webhook=None, pushgateway_url=None, csv_dump_dir=Non
         except Exception as e:
             return {'type': 'unknown_cluster', 'forecast': None, 'error': str(e)}
     
-    # Worker function for standalone processing
     def _process_standalone_forecast(standalone_entities, df_hcpu_snapshot, df_hmem_snapshot, entity_col,
                                       effective_horizon, csv_dump_dir, enable_plots, enable_forecast_plots,
                                       enable_backtest_plots):
-        """Process standalone nodes for forecast mode (designed for parallel execution)."""
+        """Process standalone nodes for forecast mode."""
         import warnings
         import logging
         warnings.simplefilter("ignore")
@@ -11904,7 +11903,7 @@ if __name__ == "__main__":
     csv_dump_dir = args.dump_csv
     
     # Override MAX_WORKER_THREADS if --parallel flag is provided
-    # Note: We're at module level, so we can modify module-level variables directly
+    # Module-level variable modification
     if args.parallel is not None:
         if args.parallel < 1:
             print(f"⚠️  Warning: --parallel value must be >= 1, got {args.parallel}. Using 1 worker.")
@@ -12095,7 +12094,6 @@ if __name__ == "__main__":
         print(f"  • Kubernetes nodes (cluster unknown): {len(unknown_cluster_entities)}")
     print(f"  • Standalone nodes (no pods): {len(standalone_entities)}")
     
-    # Helper function to combine host + pod data
     def combine_host_pod(host_df, pod_df, metric_name):
         """Combine host and pod data by averaging them per timestamp"""
         if host_df.empty and pod_df.empty:
@@ -12132,12 +12130,11 @@ if __name__ == "__main__":
         entity_col_h = 'entity' if 'entity' in df_hcpu.columns else 'instance'
         entity_col_p = 'entity' if 'entity' in df_pcpu.columns else 'instance'
         
-        # Worker function for parallel cluster processing (training mode)
         def _process_single_cluster_training(cluster_id, cluster_entities, df_hcpu_snapshot, df_hmem_snapshot,
                                               df_pcpu_snapshot, df_pmem_snapshot, entity_col_h, entity_col_p,
                                               force_training, show_backtest, csv_dump_dir, enable_plots,
                                               enable_forecast_plots, enable_backtest_plots):
-            """Process a single cluster for training mode (designed for parallel execution)."""
+            """Process a single cluster for training mode."""
             # Suppress warnings in parallel workers
             import warnings
             import logging
@@ -12270,7 +12267,7 @@ if __name__ == "__main__":
                     print(msg)
         else:
             # Sequential processing (fallback for single cluster or single worker)
-            print(f"  [SEQUENTIAL] Processing {len(k8s_clusters)} cluster(s)")
+            print(f"\n  [SEQUENTIAL] Processing {len(k8s_clusters)} cluster(s)\n")
             for cluster_id, cluster_entities in sorted(k8s_clusters.items()):
                 print(f"  Cluster: {cluster_id} ({len(cluster_entities)} nodes)")
                 # Filter data to this cluster's nodes
@@ -12350,12 +12347,11 @@ if __name__ == "__main__":
     standalone_metrics = None
     standalone_saved = False
     
-    # Worker function for unknown cluster processing (training mode)
     def _process_unknown_cluster_training(unknown_cluster_entities, df_hcpu_snapshot, df_hmem_snapshot,
                                           df_pcpu_snapshot, df_pmem_snapshot, entity_col_h, entity_col_p,
                                           force_training, show_backtest, csv_dump_dir, enable_plots,
                                           enable_forecast_plots, enable_backtest_plots):
-        """Process unknown cluster for training mode (designed for parallel execution)."""
+        """Process unknown cluster for training mode."""
         import warnings
         import logging
         warnings.simplefilter("ignore")
@@ -12410,11 +12406,10 @@ if __name__ == "__main__":
         except Exception as e:
             return {'type': 'unknown_cluster', 'forecast': None, 'metrics': None, 'saved': False, 'error': str(e)}
     
-    # Worker function for standalone processing (training mode)
     def _process_standalone_training(standalone_entities, df_hcpu_snapshot, df_hmem_snapshot, entity_col,
                                       force_training, show_backtest, csv_dump_dir, enable_plots,
                                       enable_forecast_plots, enable_backtest_plots):
-        """Process standalone nodes for training mode (designed for parallel execution)."""
+        """Process standalone nodes for training mode."""
         import warnings
         import logging
         warnings.simplefilter("ignore")

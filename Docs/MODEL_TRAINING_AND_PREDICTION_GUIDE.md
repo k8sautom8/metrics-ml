@@ -21,13 +21,14 @@ This document provides a comprehensive, step-by-step explanation of all models i
 
 ## System Overview
 
-The Metrics AI system trains **5 main model types**:
+The Metrics AI system trains **6 main model types**:
 
-1. **Host/Pod Ensemble Models** - CPU/Memory forecasting (Prophet + ARIMA + LSTM)
+1. **Host/Pod Ensemble Models** - CPU/Memory forecasting (Prophet + ARIMA + LSTM + LightGBM)
 2. **Disk Full Prediction Models** - Disk usage forecasting (Linear + Prophet)
 3. **I/O Network Crisis Models** - Crisis detection (Prophet-based)
-4. **I/O Network Ensemble Models** - Full ensemble forecasting (Prophet + ARIMA + LSTM)
-5. **Classification/Anomaly Models** - Anomaly detection (IsolationForest)
+4. **I/O Network Ensemble Models** - Full ensemble forecasting (Prophet + ARIMA + LSTM + LightGBM)
+5. **Unified Correlated Models** - Multi-metric ensemble using all 6 metrics as features (Prophet + LSTM + LightGBM, ARIMA skipped)
+6. **Classification/Anomaly Models** - Anomaly detection (IsolationForest)
 
 Each model type has distinct training, prediction, and backtesting flows.
 
@@ -39,10 +40,11 @@ Each model type has distinct training, prediction, and backtesting flows.
 
 | Model Type | Purpose | Algorithms | Scope | Storage |
 |------------|---------|------------|-------|---------|
-| **Host/Pod Ensemble** | CPU/Memory forecasting | Prophet + ARIMA + LSTM | Per-cluster or standalone | `k8s_cluster_{id}_forecast.pkl` |
+| **Host/Pod Ensemble** | CPU/Memory forecasting | Prophet + ARIMA + LSTM + LightGBM | Per-cluster or standalone | `k8s_cluster_{id}_forecast.pkl` |
 | **Disk Full** | Disk usage prediction | Linear trend + Prophet | Per node/mountpoint | Manifest: `disk_full_models.pkl` |
 | **I/O Network Crisis** | Crisis detection | Prophet | Per node/signal | Manifest: `io_net_models.pkl` |
-| **I/O Network Ensemble** | Full I/O/Net forecasting | Prophet + ARIMA + LSTM | Per node/signal | Manifest: `io_net_models.pkl` |
+| **I/O Network Ensemble** | Full I/O/Net forecasting | Prophet + ARIMA + LSTM + LightGBM | Per node/signal | Manifest: `io_net_models.pkl` |
+| **Unified Correlated** | Multi-metric ensemble | Prophet + LSTM + LightGBM (ARIMA skipped) | Per node (all 6 metrics) | `unified_correlated_{node}_forecast.pkl` |
 | **Classification** | Anomaly detection | IsolationForest | Per-cluster | `isolation_forest_anomaly.pkl` |
 
 ---
@@ -53,7 +55,7 @@ Each model type has distinct training, prediction, and backtesting flows.
 **Wrapper**: `train_or_load_ensemble()` (line 1490)
 
 ### Purpose
-Forecasts CPU and Memory usage for Kubernetes clusters and standalone nodes using an ensemble of Prophet, ARIMA, and LSTM models.
+Forecasts CPU and Memory usage for Kubernetes clusters and standalone nodes using an ensemble of Prophet, ARIMA, LSTM, and LightGBM models. LightGBM is enabled by default and can be disabled via the `LIGHTGBM_ENABLED` environment variable.
 
 ### Training Flow (Step-by-Step)
 
@@ -919,10 +921,11 @@ Backtest Metrics → {context}:
 
 #### MAPE (Mean Absolute Percentage Error)
 - **Definition**: Average percentage error relative to actual values
-- **Formula**: `mean(|actual - predicted| / |actual|) * 100`
+- **Formula**: Uses symmetric MAPE for better handling of small values: `mean(|actual - predicted| / ((|actual| + |predicted|) / 2)) * 100`
+- **Fallback**: Traditional MAPE `mean(|actual - predicted| / |actual|) * 100` when symmetric MAPE fails
 - **Units**: Percentage (%)
 - **Interpretation**: Lower is better. Provides a relative measure of error, useful for comparing models across different scales.
-- **Note**: For metrics with very small actual values (e.g., DISK_IO_WAIT ratios), MAPE can be misleadingly high. The system displays a note `(MAPE inflated by small actual values)` when MAPE > 50% and MAE < 0.01.
+- **Note**: For metrics with very small actual values (e.g., DISK_IO_WAIT ratios), MAPE can be misleadingly high. The system displays a note `(MAPE inflated by small actual values)` when MAPE > 50% and MAE < 0.01. The symmetric MAPE formula reduces this inflation by using the average of actual and predicted values as the denominator.
 - **Example**: `MAPE: 27.58%` means predictions are off by an average of 27.58% relative to actual values.
 
 #### Expected Error Rate (%)
@@ -991,6 +994,94 @@ When you see `(MAPE inflated by small actual values)`, this indicates:
 - High MAPE is misleading due to small actual values
 - Low MAE indicates good absolute accuracy
 - Focus on MAE rather than MAPE for evaluation
+
+---
+
+## Unified Correlated Models
+
+**Function**: `predict_io_and_network_ensemble()` (unified mode)  
+**Worker**: `_process_single_node_unified_correlated_model()`
+
+### Purpose
+Trains a single unified ensemble model per node that uses all 6 metrics (Host CPU, Host Memory, Pod CPU, Pod Memory, Disk I/O Wait, Network Transmit Bandwidth) as features to predict a composite system performance metric. This approach learns cross-correlations between metrics (e.g., high CPU → high I/O wait, network spikes → I/O pressure).
+
+### Key Characteristics
+- **Single model per node** using all available metrics as features
+- **Composite target**: Normalized weighted average of all 6 metrics (0-1 scale)
+- **Algorithms**: Prophet + LSTM + LightGBM (ARIMA is skipped for normalized composite targets)
+- **Crisis detection**: Predicts when composite metric will exceed threshold
+- **Anomaly detection**: Statistical deviation detection with metric contribution analysis
+- **Storage**: `unified_correlated_{node}_forecast.pkl`
+
+### Training Flow (Step-by-Step)
+
+#### Step 1: Data Collection
+```python
+# Fetch all 6 metrics for the node:
+1. Host CPU usage
+2. Host Memory usage
+3. Pod CPU usage
+4. Pod Memory usage
+5. Disk I/O Wait
+6. Network Transmit Bandwidth
+```
+
+#### Step 2: Data Merging
+```python
+# Create unified dataframe with all metrics:
+1. Start with timestamp index from all metrics
+2. Merge each metric as a feature column
+3. Handle missing timestamps via forward-fill
+4. Normalize each metric to 0-1 scale using min-max normalization
+```
+
+#### Step 3: Composite Target Creation
+```python
+# Create composite target metric:
+1. Weight each normalized metric equally (or by importance)
+2. Calculate: target = weighted_average(host_cpu, host_mem, pod_cpu, pod_mem, disk_io_wait, net_tx_bw)
+3. This composite target captures overall system health
+```
+
+#### Step 4: Feature Engineering
+```python
+# Add temporal features:
+1. hour: Hour of day (0-23)
+2. is_weekend: Weekend flag (0/1)
+3. All 6 metrics as features (excluding the target metric itself)
+```
+
+#### Step 5: Model Training
+```python
+# Train ensemble models:
+1. Prophet: With all metric features as regressors
+2. LSTM: Sequence model using all features
+3. LightGBM: Gradient boosting with early stopping (validation set)
+4. ARIMA: Skipped (performs poorly on normalized composite targets)
+```
+
+#### Step 6: Ensemble Averaging
+```python
+# Combine predictions:
+ensemble = (prophet_forecast + lstm_forecast + lightgbm_forecast) / 3
+# Only active models are included (disabled models excluded)
+```
+
+### Crisis Detection
+- **Purpose**: Predict when composite metric will exceed threshold
+- **Method**: Linear trend + Prophet forecast hybrid
+- **Output**: Days until threshold breach, severity level (CRITICAL/WARNING/SOON/OK)
+- **Details**: Includes primary contributing metric, top 3 contributors, current metric values
+
+### Anomaly Detection
+- **Purpose**: Detect statistical deviations in current system state
+- **Method**: Compare recent actual values against forecast baseline
+- **Output**: Anomaly score, severity, metric contributions, correlation insights
+- **Details**: Identifies which specific metrics are causing the anomaly
+
+### Backtesting
+- **Metrics**: MAE, MAPE (symmetric), Confidence for Prophet, LSTM, LightGBM, and Ensemble
+- **Note**: ARIMA metrics are not calculated (ARIMA is skipped for unified models)
 
 ---
 

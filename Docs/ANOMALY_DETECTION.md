@@ -6,7 +6,8 @@ Metrics AI detects anomalies at **multiple levels** across the entire Kubernetes
 1. **Unsupervised Machine Learning** (IsolationForest)
 2. **Rule-based Threshold Detection** (Golden Signals)
 3. **Statistical Anomaly Detection** (Ensemble Forecast Deviations)
-4. **Pattern-Based Detection** (Host/Pod Resource Misalignment)
+4. **Unified Correlated Model Anomaly Detection** (Multi-metric composite anomaly detection)
+5. **Pattern-Based Detection** (Host/Pod Resource Misalignment)
 
 ---
 
@@ -177,6 +178,52 @@ Metrics AI detects anomalies at **multiple levels** across the entire Kubernetes
 
 ---
 
+#### D. Unified Correlated Model Anomaly Detection
+- **Level**: Per-node (composite system health)
+- **Method**: Statistical deviation detection on unified correlated model with metric contribution analysis
+- **Status**: **Fully Implemented**
+
+- **How It Works**:
+  1. Uses unified correlated model that combines all 6 metrics (Host CPU, Host Memory, Pod CPU, Pod Memory, Disk I/O Wait, Network Transmit Bandwidth) into a single composite target
+  2. Compares recent actual composite values (last 24 hours) against forecast baseline
+  3. Calculates both absolute and percentage deviations from baseline
+  4. Identifies primary contributing metric (single metric contributing most to composite value)
+  5. Identifies top 3 contributing metrics by weighted contribution
+  6. Provides current unnormalized values for all metrics
+  7. Calculates deviations for each individual metric from its recent mean
+  8. Detects strong correlations between metrics in the last 24 hours
+  9. Applies threshold logic similar to I/O Network Anomaly Detection
+
+- **Anomaly Conditions**:
+  - Current composite deviation > 50% from forecast baseline
+  - Mean composite deviation > 30% over recent window
+  - Spike/drop > 100% from baseline
+  - High MAE indicating model struggling to fit pattern
+  - **AND** composite value exceeds concerning threshold
+
+- **Anomaly Scoring**:
+  - Score range: 0.0 to 1.0 (higher = more anomalous)
+  - Severity classification:
+    - `CRITICAL`: Score > 0.8
+    - `WARNING`: Score 0.5-0.8
+    - `INFO`: Score < 0.5
+
+- **Output**:
+  - Alert type: `unified_correlated_anomaly`
+  - Severity: `CRITICAL`, `WARNING`, or `INFO` (based on anomaly score)
+  - Includes:
+    - Node identifier
+    - Primary contributing metric (which metric is driving the anomaly)
+    - Top 3 contributing metrics with their contributions
+    - Current actual values for all 6 metrics (unnormalized)
+    - Metric deviations from recent mean
+    - Strong correlations detected between metrics
+    - Anomaly score, MAE, human-readable description
+
+- **Scope**: **All nodes** - evaluated per node using unified composite metric with detailed metric breakdown
+
+---
+
 ### 3. **Disk-Level Anomalies** (Per-Node, Per-Mountpoint)
 
 #### Disk Capacity Crisis Detection
@@ -213,6 +260,7 @@ Metrics AI detects anomalies at **multiple levels** across the entire Kubernetes
 | **Golden Signals** | Node + Signal | All nodes, 8 signal types | Prometheus query thresholds |
 | **I/O Network Crisis** | Node + Signal | All nodes, 2 signals | Ensemble forecast prediction |
 | **I/O Network Anomaly** | Node + Signal | All nodes, 2 signals | Statistical deviation (dual-threshold) |
+| **Unified Correlated Anomaly** | Node | All nodes | Statistical deviation with metric contribution analysis |
 | **Disk Crisis** | Node + Mountpoint | All nodes, all mountpoints | Hybrid forecast prediction |
 
 ---
@@ -315,7 +363,14 @@ When `metrics.py --forecast` runs, it:
      - Applies dual-threshold logic (absolute + percentage)
      - Considers model confidence (MAE)
      - Flags anomalies with severity (CRITICAL/WARNING/INFO) and human-readable descriptions
-8. **Disk Crisis**:
+8. **Unified Correlated Anomaly**:
+   - For each node:
+     - Uses unified correlated model (all 6 metrics as features)
+     - Compares recent composite values (24h) vs forecast baseline
+     - Calculates deviations and identifies contributing metrics
+     - Detects correlations between metrics
+     - Flags anomalies with detailed metric breakdown (primary contributor, top 3, current values, correlations)
+9. **Disk Crisis**:
    - For each node, for each mountpoint:
      - Loads or trains hybrid model
      - Forecasts 7 days ahead

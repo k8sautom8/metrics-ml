@@ -10,15 +10,16 @@ This document explains how each configuration variable is used in training and p
 
 ### Usage in Training:
 - **Prophet**: Creates future dataframe with `periods=HORIZON_MIN` for training
-- **ARIMA**: Forecasts `steps=HORIZON_MIN` future values
+- **ARIMA**: Forecasts `steps=HORIZON_MIN` future values (skipped for unified correlated models)
 - **LSTM**: 
   - Creates sequences where output length = `HORIZON_MIN`
   - Model architecture: `Dense(horizon_min)` output layer
   - Training data: `y.append(scaled[i:i+horizon_min])` - predicts next `HORIZON_MIN` values
+- **LightGBM**: Generates forecasts for `HORIZON_MIN` future values using gradient boosting
 
 ### Usage in Prediction:
-- All three models generate forecasts for exactly `HORIZON_MIN` minutes ahead
-- Ensemble combines the first `HORIZON_MIN` values from each model
+- All models (Prophet, ARIMA, LSTM, LightGBM) generate forecasts for exactly `HORIZON_MIN` minutes ahead
+- Ensemble combines the first `HORIZON_MIN` values from each active model
 - Used to determine how many future data points to generate
 
 ### Override Options:
@@ -35,7 +36,8 @@ This document explains how each configuration variable is used in training and p
 - `build_ensemble_forecast_model()`: `horizon_min=HORIZON_MIN` parameter
 - `generate_forecast_from_cached_model()`: Uses `horizon_min` to generate forecasts
 - LSTM training: `y.append(scaled[i:i+horizon_min])`
-- ARIMA: `arima.forecast(steps=horizon_min)`
+- ARIMA: `arima.forecast(steps=horizon_min)` (skipped for unified correlated models)
+- LightGBM: `lgb_model.predict(X_future)` where `X_future` contains `HORIZON_MIN` future points
 - Prophet: `future = prophet_model.make_future_dataframe(periods=HORIZON_MIN, freq='min')`
 - CLI: `--forecast-horizon` flag overrides `HORIZON_MIN` in forecast mode
 
@@ -287,7 +289,46 @@ The system uses a multi-tier approach to maximize data while avoiding query fail
 
 ---
 
-## 8. `TRAIN_FRACTION` (Default: 0.8 = 80%)
+## 8. `LIGHTGBM_ENABLED` (Default: True)
+
+**Purpose**: Enable or disable LightGBM model in ensemble forecasting.
+
+### Usage in Training:
+- **LightGBM Model**: 
+  - Enabled by default (`LIGHTGBM_ENABLED=True`)
+  - Can be disabled by setting `LIGHTGBM_ENABLED=False` environment variable
+  - Requires minimum 4 features to train (skipped if insufficient features)
+  - Uses early stopping with validation set to prevent overfitting
+  - Trains gradient boosting model with configurable number of trees (default: 1500)
+
+### Usage in Prediction:
+- **Ensemble Averaging**: 
+  - Only includes LightGBM if enabled and successfully trained
+  - Disabled models are excluded from ensemble calculation
+  - Fallback to other models if LightGBM fails
+
+### Model Behavior:
+- **Early Stopping**: Automatically stops training when validation performance stops improving
+- **Feature Requirements**: Requires minimum 4 features (skipped if only temporal features available)
+- **Unified Correlated Models**: LightGBM is used (ARIMA is skipped for these models)
+- **Storage**: LightGBM model saved in consolidated ensemble model file
+
+### Configuration:
+```bash
+export LIGHTGBM_ENABLED=True   # Enable LightGBM (default)
+export LIGHTGBM_ENABLED=False  # Disable LightGBM
+```
+
+**Code References**:
+- `build_ensemble_forecast_model()`: Checks `LIGHTGBM_ENABLED` before training
+- LightGBM training: `lgb.train(..., num_boost_round=n_estimators, callbacks=[early_stopping])`
+- Ensemble: Only includes LightGBM if `lightgbm_active == True`
+
+**Note**: LightGBM requires the `libomp` library on macOS. Install via `brew install libomp` if missing.
+
+---
+
+## 9. `TRAIN_FRACTION` (Default: 0.8 = 80%)
 
 **Purpose**: Fraction of data used for training vs testing in time-ordered split.
 
@@ -329,15 +370,16 @@ The system uses a multi-tier approach to maximize data while avoiding query fail
 2. **Data Splitting**: `TRAIN_FRACTION` → Split into train/test sets
 3. **Model Training**:
    - **Prophet**: Uses all training data, predicts `HORIZON_MIN` ahead
-   - **ARIMA**: Uses all training data, predicts `HORIZON_MIN` ahead
+   - **ARIMA**: Uses all training data, predicts `HORIZON_MIN` ahead (skipped for unified correlated models)
    - **LSTM**: Uses `LSTM_SEQ_LEN` sequences, trains for `LSTM_EPOCHS`, predicts `HORIZON_MIN` ahead
+   - **LightGBM**: Uses gradient boosting with early stopping, predicts `HORIZON_MIN` ahead (enabled by default)
 4. **Anomaly Detection**: Uses `LOOKBACK_HOURS` for features, `CONTAMINATION` for threshold
 
 ### Prediction Flow:
 1. **Data Fetching**: `START_HOURS_AGO` + `STEP` → Fetch latest data
 2. **Forecast Generation**: All models predict `HORIZON_MIN` minutes ahead
 3. **Anomaly Detection**: Uses `LOOKBACK_HOURS` window, `CONTAMINATION` rate
-4. **Ensemble**: Combines Prophet + ARIMA + LSTM forecasts
+4. **Ensemble**: Combines Prophet + ARIMA + LSTM + LightGBM forecasts (only active models included)
 
 ### Key Relationships:
 - **LSTM Requirements**: `len(data) >= LSTM_SEQ_LEN + HORIZON_MIN`
@@ -358,6 +400,7 @@ export STEP="60s"              # 1-minute resolution
 export START_HOURS_AGO=360     # 15 days of history
 export LSTM_SEQ_LEN=60         # 60-point sequences
 export LSTM_EPOCHS=10          # 10 training epochs
+export LIGHTGBM_ENABLED=True   # Enable LightGBM (default)
 export TRAIN_FRACTION=0.8       # 80/20 train/test split
 ```
 
